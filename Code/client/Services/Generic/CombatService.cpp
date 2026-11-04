@@ -142,6 +142,20 @@ void CombatService::OnNotifyProjectileLaunch(const NotifyProjectileLaunch& acMes
     const uint32_t cProjectileBaseId = modSystem.GetGameId(acMessage.ProjectileBaseID);
     launchData.pProjectileBase = TESForm::GetById(cProjectileBaseId);
 
+    // A form a mod made at run time has an id only its own game knows (mod id FFFFFFFF), and a mod this game lacks resolves to nothing.
+    // The game refuses a launch without a projectile.
+    if (!launchData.pProjectileBase)
+    {
+        static std::chrono::steady_clock::time_point s_nextSaid{};
+        if (std::chrono::steady_clock::now() >= s_nextSaid)
+        {
+            s_nextSaid = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            spdlog::info("Remote projectile from {:X} not launched: its projectile {:X}:{:X} of spell {:X}:{:X} does not exist here", formIdComponent.Id,
+                         acMessage.ProjectileBaseID.ModId, acMessage.ProjectileBaseID.BaseId, acMessage.SpellID.ModId, acMessage.SpellID.BaseId);
+        }
+        return;
+    }
+
     const uint32_t cFromWeaponId = modSystem.GetGameId(acMessage.WeaponID);
     launchData.pFromWeapon = Cast<TESObjectWEAP>(TESForm::GetById(cFromWeaponId));
 
@@ -177,8 +191,9 @@ void CombatService::OnNotifyProjectileLaunch(const NotifyProjectileLaunch& acMes
 
     Projectile::Launch(&result, launchData);
 
-    // Another player's projectile: its hit or miss here decides their ranged hit on this player (the defender's own copy).
-    if (m_world.all_of<PlayerComponent>(*remoteIt))
+    // Another player's arrow: its hit or miss here decides the hit their game reports on this player (the defender's own copy).
+    // A spell's hit is their game's alone: it is what the caster's game saw that counts, so a sword blow after it is not the spell.
+    if (result.handle.iBits != 0 && acMessage.SpellID.BaseId == 0 && m_world.all_of<PlayerComponent>(*remoteIt))
         PvpProjectiles::NoteLaunched(formIdComponent.Id);
 
     // Pairs with the sender's "Projectile launch" line: what this side actually launched for a remote shooter.

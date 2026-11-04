@@ -41,6 +41,9 @@ public:
 
     TP_NOCOPYMOVE(ActorValueService);
 
+    // Repeats a copy's revival until it lasts.
+    static void WatchCopyRevival(uint32_t aFormId) noexcept;
+
 private:
     enum ValueType : uint8_t
     {
@@ -128,6 +131,8 @@ private:
 
     //! @brief Server ids and collected health changes.
     Map<uint32_t, float> m_smallHealthChanges;
+    //! Those of spells, which go with no tick: no weapon can block them.
+    Map<uint32_t, float> m_smallSpellChanges;
     //! Other players' hits on this player, held until this game shows them (RunHeldHits).
     Vector<NotifyHealthChangeBroadcast> m_heldHits;
     //! This player's clashes: the other player's copy and when, on the server's clock.

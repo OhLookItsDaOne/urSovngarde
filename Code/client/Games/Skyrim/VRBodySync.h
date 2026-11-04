@@ -15,6 +15,10 @@ namespace VRBodySync
 {
 //! Renderer frame end (BSGraphics StopTimer). One thread, once per frame.
 void OnFrameEnd() noexcept;
+//! The start of a frame, on the main thread: weapon bodies found at the last frame end go in the world here.
+void AddPendingWeaponBodies() noexcept;
+//! How far a body's pelvis stands over its lower foot, and where the pelvis is. False for a body with no such bones.
+bool BodyPelvisHeight(Actor* apActor, float& aHeight, glm::vec3& aPelvis) noexcept;
 
 //! The other player's weapon (on their copy FormId, Side 0 left / 1 right) met one of this player's HIGGS bodies.
 struct Clash
@@ -90,6 +94,9 @@ bool PlayClashSound(const glm::vec3& acPoint) noexcept;
 //! Reads the player's VR pose in the body's frame; aOutHeading is the heading to send with it, the body's facing when known.
 bool CaptureLocalPose(PlayerCharacter* apPlayer, VRPose& aOutPose, float& aOutHeading) noexcept;
 
+//! The last pose CaptureLocalPose read, to send again while the game shows another body; false when it shows the same one.
+bool LastLocalPose(PlayerCharacter* apPlayer, VRPose& aOutPose) noexcept;
+
 
 
 //! The pose of a dead NPC this machine owns, so the other players see it slump and get dragged as it does here.
@@ -113,6 +120,12 @@ void EndWeaponTouch() noexcept;
 //! A pose without data clears the actor's pose.
 void SetRemotePose(Actor* apActor, const VRPose& acPose) noexcept;
 void ClearRemotePose(uint32_t aFormId) noexcept;
+
+//! Where this player's held spell goes now, in the game's angles.
+//! From any thread, each frame; it goes out with the pose while it keeps coming.
+void NoteSpellAim(float aZAngle, float aXAngle) noexcept;
+//! Where the held spell of another player's copy goes, if its owner sends that. From any thread.
+bool CopySpellAim(uint32_t aFormId, float& aZAngle, float& aXAngle) noexcept;
 
 //! A cheap fingerprint of the local transforms of the first nodes below an actor's 3D root; 0 when the actor has no 3D.
 //! Equal fingerprints across frames on a moving body mean its animation graph is not advancing.

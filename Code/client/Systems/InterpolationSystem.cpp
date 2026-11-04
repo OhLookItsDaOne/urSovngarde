@@ -148,6 +148,30 @@ void WatchQuietCopy(Actor* apActor) noexcept
 }
 } // namespace
 
+bool InterpolationSystem::OnFoot(const Actor* apActor) noexcept
+{
+    return IsOnFoot(apActor);
+}
+
+float InterpolationSystem::FootSpeed(Actor* apActor) noexcept
+{
+    return IsOnFoot(apActor) ? LegSpeed(apActor) : 0.f;
+}
+
+float InterpolationSystem::ReportedSpeed(const uint32_t aFormId, const InterpolationComponent& acInterpolationComponent) noexcept
+{
+    const auto& points = acInterpolationComponent.TimePoints;
+    if (points.size() < 2 || s_quietStopped.find(aFormId) != s_quietStopped.end())
+        return 0.f;
+
+    const auto& last = points.back();
+    const auto& before = *std::prev(points.end(), 2);
+    if (last.Tick <= before.Tick)
+        return 0.f;
+
+    return glm::distance(last.Position, before.Position) * 1000.f / static_cast<float>(last.Tick - before.Tick);
+}
+
 uint64_t InterpolationSystem::GetPlaybackTick(const InterpolationComponent& acInterpolationComponent) noexcept
 {
     const double cTick = acInterpolationComponent.Clock.GetRenderTick();
@@ -328,6 +352,7 @@ void InterpolationSystem::Update(Actor* apActor, InterpolationComponent& aInterp
     vrPose.HasScale = false;
     vrPose.HasRootPosition = false;
     vrPose.HasWeapons = false;
+    vrPose.HasSpellAim = false;
     {
         const InterpolationComponent::TimePoint* pBefore = nullptr;
         const InterpolationComponent::TimePoint* pAfter = nullptr;
@@ -447,6 +472,24 @@ void InterpolationSystem::Update(Actor* apActor, InterpolationComponent& aInterp
                 vrPose.WeaponHeld = weaponSource.WeaponHeld;
                 vrPose.WeaponRotation = weaponSource.WeaponRotation;
                 std::copy(&weaponSource.WeaponOffset[0][0], &weaponSource.WeaponOffset[0][0] + 6, &vrPose.WeaponOffset[0][0]);
+            }
+
+            // Where a held spell goes. Blended when both ends have it, as a flame sweeps with the hand; a turn across the wrap of the angle is taken the short way.
+            if (pBefore->VRPoseData.HasSpellAim && pAfter->VRPoseData.HasSpellAim)
+            {
+                vrPose.HasSpellAim = true;
+                const float cTurn = std::remainder(pAfter->VRPoseData.SpellAim[0] - pBefore->VRPoseData.SpellAim[0], glm::two_pi<float>());
+                vrPose.SpellAim[0] = pBefore->VRPoseData.SpellAim[0] + cTurn * poseDelta;
+                vrPose.SpellAim[1] = TiltedPhoques::Lerp(pBefore->VRPoseData.SpellAim[1], pAfter->VRPoseData.SpellAim[1], poseDelta);
+            }
+            else
+            {
+                const VRPose& spellSource = pAfter->VRPoseData.HasSpellAim ? pAfter->VRPoseData : pBefore->VRPoseData;
+                if (spellSource.HasSpellAim)
+                {
+                    vrPose.HasSpellAim = true;
+                    std::copy(std::begin(spellSource.SpellAim), std::end(spellSource.SpellAim), std::begin(vrPose.SpellAim));
+                }
             }
         }
     }
@@ -704,6 +747,10 @@ void InterpolationSystem::AddPoint(InterpolationComponent& aInterpolationCompone
         const float jump = glm::distance(previous, static_cast<glm::vec3>(acPoint.Position));
         if (jump > cImpossibleStep)
         {
+            // Movement arrives unreliably: a late point from before the jump would send the actor back to where it left.
+            if (acPoint.Tick < aInterpolationComponent.TimePoints.back().Tick)
+                return;
+
             aInterpolationComponent.TimePoints.clear();
             aInterpolationComponent.Position = acPoint.Position;
 

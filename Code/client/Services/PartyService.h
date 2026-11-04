@@ -10,6 +10,8 @@ struct NotifyPartyInfo;
 struct NotifyPartyInvite;
 struct NotifyPartyJoined;
 struct NotifyPartyLeft;
+struct NotifyPartyPlugin;
+struct NotifyPartyValue;
 
 /**
  * @brief Manages the party of the local player.
@@ -46,6 +48,8 @@ protected:
     void OnPartyInvite(const NotifyPartyInvite& acPartyInvite) noexcept;
     void OnPartyJoined(const NotifyPartyJoined& acPartyJoined) noexcept;
     void OnPartyLeft(const NotifyPartyLeft& acPartyLeft) noexcept;
+    void OnPartyPlugin(const NotifyPartyPlugin& acMessage) noexcept;
+    void OnPartyValue(const NotifyPartyValue& acMessage) noexcept;
 
 private:
     void DestroyParty() noexcept;
@@ -72,4 +76,6 @@ private:
     entt::scoped_connection m_partyInviteConnection;
     entt::scoped_connection m_partyJoinedConnection;
     entt::scoped_connection m_partyLeftConnection;
+    entt::scoped_connection m_partyPluginConnection;
+    entt::scoped_connection m_partyValueConnection;
 };

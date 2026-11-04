@@ -1,0 +1,44 @@
+# Another player's spell on this player: what counts is what the caster's game saw, as for a sword.
+#
+#   python Tools\VR\live-check.py live-pvp-projectile
+#
+# The bot's "launch" sends a Fireball (spell 1C789, projectile 10FBED) as a caster's game does, so the game replays it from the bot's copy.
+# That replay is only seen: its damage does not count here.
+# The bot's "hit ... spell" is the caster's game sending the hit, with no tick, so no weapon can block it.
+# This checks the defender's half only. The bot does not aim, cast or carry a pose, so it says nothing of what a real second game does.
+# A run counts only when (REQUIRE): the launch was replayed here.
+log live pvp projectile
+waitfor connected 45
+expect known me
+waitfor known other 40
+wait 3
+infront 300
+wait 3
+wait 2
+
+log -- the replayed projectile hits, and the caster's game sends nothing: it saw it miss
+log CHECK player mark
+wait 1
+launch 10FBED 1C789
+wait 7
+log REQUIRE logged Remote projectile launched: shooter \w+, base 10FBED, weapon 0, ammo 0, spell 1C789, handle true
+log CHECK player dropped 0
+log CHECK bot absent Effect 1CEA1 of spell 1C789 applied to \w+ by
+
+log -- the projectile flies past the player, and the caster's game saw a hit: it counts
+log CHECK player mark
+wait 1
+launch 10FBED 1C789 miss
+hit other -36 spell
+wait 4
+log CHECK player dropped 36
+
+log -- a launch whose forms this game cannot name is not made
+launch 10FBED 1C789 empty
+wait 2
+log CHECK logged Remote projectile from \w+ not launched: its projectile
+log CHECK absent No projectile found
+
+log CHECK game alive
+log done
+stop

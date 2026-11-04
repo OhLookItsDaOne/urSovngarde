@@ -5,6 +5,7 @@
 #include "immersive_launcher/stubs/DllBlocklist.h"
 
 #include <World.h>
+#include <CrashHandler.h>
 #include <PatchCheck.h>
 #include <Services/CalendarService.h>
 #include <Interface/Menus/SleepWaitMenu.h>
@@ -180,6 +181,38 @@ bool IsOptionalMenuOpenUnpaused() noexcept
     return false;
 }
 
+// The menus seen with the game's pause flag when queued, before it is cleared for play online.
+// Only ever added to, and the count is published after the name, so the pose send reads them with no lock.
+// A lock there could meet the UI's own: the game takes that one in GetMenuOpen, and may hold it when it queues a menu.
+static std::mutex s_pausingMenusLock;
+static std::array<const BSFixedString*, 32> s_pausingMenus{};
+static std::atomic<size_t> s_pausingMenuCount{0};
+
+static void RecordPausingMenu(const char* acpName) noexcept
+{
+    std::scoped_lock lock(s_pausingMenusLock);
+    const size_t cCount = s_pausingMenuCount.load();
+    for (size_t i = 0; i < cCount; ++i)
+        if (std::strcmp(s_pausingMenus[i]->AsAscii(), acpName) == 0)
+            return;
+    if (cCount == s_pausingMenus.size())
+        return;
+    s_pausingMenus[cCount] = new BSFixedString(acpName);
+    s_pausingMenuCount.store(cCount + 1);
+}
+
+bool IsPausingMenuOpen() noexcept
+{
+    const UI* pUI = UI::Get();
+    if (!pUI)
+        return false;
+    const size_t cCount = s_pausingMenuCount.load();
+    for (size_t i = 0; i < cCount; ++i)
+        if (pUI->GetMenuOpen(*s_pausingMenus[i]))
+            return true;
+    return false;
+}
+
 // Built on first use: the game's string table does not exist yet when static initializers run.
 static bool IsAllowListMenuOpenUnpaused()
 {
@@ -261,8 +294,15 @@ static void* UI_AddToActiveQueue_Hook(UI* apSelf, IMenu* apMenu, void* apFoundIt
             return UI_AddToActiveQueue(apSelf, apMenu, apFoundItem);
         const BSFixedString* pName = apSelf->LookupMenuNameByInstance(apMenu);
         spdlog::info("Menu queued: {}{} (connected {})", pName ? pName->AsAscii() : "?", apMenu->PausesGame() ? " [pauses]" : "", World::Get().GetTransport().IsConnected() ? "yes" : "no");
+#ifdef SKYRIMVR
+        if (pName && pName->AsAscii() && apMenu->PausesGame())
+            RecordPausingMenu(pName->AsAscii());
+#endif
         if (pName && pName->AsAscii() && strcmp(pName->AsAscii(), "Loading Menu") == 0)
+        {
             ++s_loadingScreensQueued;
+            FreezeWatchdog::NoteLoadingScreen();
+        }
         // A sleep fades out a couple of seconds before the clock moves; the party fades with it.
         if (pName && pName->AsAscii() && strcmp(pName->AsAscii(), "Fader Menu") == 0)
             CalendarService::OnFaderQueued();
@@ -366,6 +406,17 @@ void UnpausedMenusOnMainLoop() noexcept
 static bool s_sendingEnemyMeter = false;
 static std::chrono::steady_clock::time_point s_lastGameEnemyMeterTargetAt{};
 
+#ifdef SKYRIMVR
+// Set while the game closes all its menus, and cleared when the queue has been handled.
+// A load does this and handles the queue right after, so its hide has to be in the queue.
+static bool IsClosingAllMenus() noexcept
+{
+    constexpr size_t cClosingAllMenus = 0x1C9;
+    const auto* pUI = reinterpret_cast<const uint8_t*>(UI::Get());
+    return pUI && pUI[cClosingAllMenus];
+}
+#endif
+
 void UIMessageQueue__AddMessage(void* a1, const BSFixedString* a2, UIMessage::UI_MESSAGE_TYPE a3, void* a4)
 {
     // The other half of "Menu queued": a menu asked to close, so a report shows which menu was left open.
@@ -373,6 +424,10 @@ void UIMessageQueue__AddMessage(void* a1, const BSFixedString* a2, UIMessage::UI
     if ((a3 == UIMessage::kHide || a3 == UIMessage::kForceHide) && a2 && a2->AsAscii() && strncmp(a2->AsAscii(), "WS", 2) != 0)
         spdlog::info("Menu closing: {}{}", a2->AsAscii(), a3 == UIMessage::kForceHide ? " (forced)" : "");
 
+#ifdef SKYRIMVR
+    if (a3 == UIMessage::kHide && a2 && a2->AsAscii() && strcmp(a2->AsAscii(), "MapMenu") == 0 && !IsClosingAllMenus() && HoldMapHide(a1, a4))
+        return;
+#endif
 
     // An empty message box opens at the main menu and after every save load, pausing the world; that show is dropped.
     if (a2 && a2->AsAscii() && strcmp(a2->AsAscii(), "MessageBoxMenu") == 0)
@@ -407,6 +462,19 @@ void UIMessageQueue__AddMessage(void* a1, const BSFixedString* a2, UIMessage::UI
 
     UIMessageQueue__AddMessage_Real(a1, a2, a3, a4);
 }
+
+#ifdef SKYRIMVR
+void UI::RunMessageNow(void* apQueue, const BSFixedString& acMenu, UIMessage::UI_MESSAGE_TYPE aType, void* apData)
+{
+    TP_THIS_FUNCTION(TProcessMessages, void, UI);
+    POINTER_SKYRIMSE(TProcessMessages, s_processMessages, 79945, 82082);
+
+    UIMessageQueue__AddMessage_Real(apQueue, &acMenu, aType, apData);
+    // Without it the message stays queued, and the UI job takes it.
+    if (s_processMessages.Get())
+        TiltedPhoques::ThisCall(s_processMessages.Get(), this);
+}
+#endif
 
 void UI::SetEnemyMeterTarget(uint32_t aHandle, uint16_t aLevel)
 {

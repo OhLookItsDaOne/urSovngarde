@@ -15,10 +15,12 @@
 
 #include <Games/ActorExtension.h>
 #include <Games/Overrides.h>
+#include <Games/References.h>
 #include <PlayerCharacter.h>
 
 #include <Effects/ActiveEffect.h>
 #include <Forms/SpellItem.h>
+#include <Forms/EnchantmentItem.h>
 #include <Forms/ActorValueInfo.h>
 
 TP_THIS_FUNCTION(TAddTarget, bool, MagicTarget, MagicTarget::AddTargetData& arData);
@@ -61,6 +63,15 @@ static bool DamagesHealth(EffectItem* apEffect) noexcept
     const bool cModifiesValue = pSetting->eArchetype == EffectArchetypes::ArchetypeID::kValueModifier ||
                                 pSetting->eArchetype == EffectArchetypes::ArchetypeID::kDualValueModifier;
     return cModifiesValue && pSetting->primaryActorValue == ActorValueInfo::kHealth && (pSetting->flags & cDetrimental) != 0;
+}
+
+bool MagicTarget::IsCast(MagicItem* apSpell) noexcept
+{
+    if (const SpellItem* pSpell = Cast<SpellItem>(apSpell))
+        return pSpell->eDelivery != MagicSystem::TOUCH;
+
+    const EnchantmentItem* pEnchantment = Cast<EnchantmentItem>(apSpell);
+    return pEnchantment && (pEnchantment->eDelivery == MagicSystem::AIMED || pEnchantment->eDelivery == MagicSystem::TARGET_LOCATION);
 }
 
 void MagicTarget::DispelAllSpells(bool aNow) noexcept
@@ -164,6 +175,11 @@ bool TP_MAKE_THISCALL(HookAddTarget, MagicTarget, MagicTarget::AddTargetData& ar
 
         if (!arData.pSpell->IsHealingSpell() && !arData.pSpell->IsBuffSpell())
         {
+            // A spell's damage runs on the copy as it does on an NPC, with the caster's perks and its burn.
+            // Each of its hits goes to the other game as a health change (Actor::HookDamageActor), and the copy's health stays as it is.
+            if (World::Get().GetServerSettings().PvpEnabled && MagicTarget::IsCast(arData.pSpell) && DamagesHealth(arData.pEffectItem))
+                return TiltedPhoques::ThisCall(RealAddTarget, apThis, arData);
+
             // A damaging spell on the other player is sent as a health change, like a sword hit (Actor::HookDamageActor).
             // Only the caster's game reliably knows it landed. It is not applied locally: the other side owns that body.
             // Only an instant effect that damages health, not the spell's other effects: damage-over-time and concentration effects tick on their own.
@@ -186,7 +202,7 @@ bool TP_MAKE_THISCALL(HookAddTarget, MagicTarget, MagicTarget::AddTargetData& ar
                     return false;
                 }
 
-                const float cDamage = cBase * s_perkFactor;
+                const float cDamage = GameplayFormulas::CalculateRealDamage(pTargetActor, cBase * s_perkFactor, false, true);
                 spdlog::info("PvP: spell {:X} hit remote player {:X} for {:.0f} (base {:.0f}, the caster's perks {:.2f})", arData.pSpell->formID, pTargetActor->formID, cDamage,
                              cBase, s_perkFactor);
                 World::Get().GetRunner().Trigger(HealthChangeEvent(pTargetActor->formID, -cDamage));
@@ -226,6 +242,11 @@ bool TP_MAKE_THISCALL(HookAddTarget, MagicTarget, MagicTarget::AddTargetData& ar
                 // Heal and buff spells are already synced by the caster.
                 if (arData.pSpell->IsHealingSpell() || arData.pSpell->IsBuffSpell())
                     return false;
+
+                // A spell's damage comes from its caster's game, so this effect is only seen here (HookDamageActor).
+                // That game is not told of it, or it would report the hit again.
+                if (MagicTarget::IsCast(arData.pSpell) && DamagesHealth(arData.pEffectItem))
+                    return TiltedPhoques::ThisCall(RealAddTarget, apThis, arData);
             }
         }
 

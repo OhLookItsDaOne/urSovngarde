@@ -71,6 +71,25 @@ static void SayNpcCopyKeptUp(Actor* apActor, float aHealth) noexcept
         spdlog::info("Death sync: NPC copy {:X} kept at {:.0f} health instead of {:.0f}; its owner's game decides whether it dies", apActor->formID, kNpcCopyHealthFloor, aHealth);
 }
 
+// Another player's spell on this player, summed per second: a beam's hits are small, and come four times a second.
+static void SaySpellHits(const uint32_t aPlayerId, const float aDamage, const float aHealth) noexcept
+{
+    static float s_damage = 0.f;
+    static uint32_t s_hits = 0;
+    static std::chrono::steady_clock::time_point s_since = std::chrono::steady_clock::now();
+
+    s_damage += aDamage;
+    ++s_hits;
+    if (const auto cNow = std::chrono::steady_clock::now(); cNow - s_since >= 1s)
+    {
+        spdlog::info("PvP: spell hits from player {}: {} hit(s), {:.0f} damage in {} ms; health now {:.0f}", aPlayerId, s_hits, s_damage,
+                     std::chrono::duration_cast<std::chrono::milliseconds>(cNow - s_since).count(), aHealth);
+        s_damage = 0.f;
+        s_hits = 0;
+        s_since = cNow;
+    }
+}
+
 // The form id of player aPlayerId's copy in this game, or 0 when it has none.
 static uint32_t PlayerCopyFormId(uint32_t aPlayerId) noexcept
 {
@@ -137,6 +156,60 @@ void ActorValueService::OnActorRemoved(const ActorRemovedEvent& acEvent) noexcep
         m_world.remove<ActorValuesComponent>(*it);
 }
 
+namespace
+{
+// A copy revived on its owner's word can be dead again within 100 ms, with no kill and its health full.
+// The word comes only once, so each revival is checked a second later and repeated until it lasts.
+// Every copy's revival is watched (Actor::Respawn), whichever way the word reached it.
+struct CopyRevival
+{
+    std::chrono::steady_clock::time_point CheckAt{};
+    uint32_t TriesLeft{};
+};
+TiltedPhoques::Map<uint32_t, CopyRevival> s_copyRevivals;
+
+bool IsAliveAtOwner(const uint32_t aFormId) noexcept
+{
+    auto view = World::Get().view<FormIdComponent, RemoteComponent>();
+    const auto it = std::find_if(view.begin(), view.end(), [&view, aFormId](entt::entity aEntity) { return view.get<FormIdComponent>(aEntity).Id == aFormId; });
+    return it != view.end() && !view.get<RemoteComponent>(*it).DeadAtOwner;
+}
+
+void RunCopyRevivals() noexcept
+{
+    const auto cNow = std::chrono::steady_clock::now();
+    for (auto it = s_copyRevivals.begin(); it != s_copyRevivals.end();)
+    {
+        if (cNow < it->second.CheckAt)
+        {
+            ++it;
+            continue;
+        }
+
+        Actor* pActor = Cast<Actor>(TESForm::GetById(it->first));
+        const ActorExtension* pExtension = pActor ? pActor->GetExtension() : nullptr;
+        if (!pExtension || !pExtension->IsRemote() || !pActor->IsDead() || it->second.TriesLeft == 0 || !IsAliveAtOwner(pActor->formID))
+        {
+            it = s_copyRevivals.erase(it);
+            continue;
+        }
+
+        pActor->Respawn();
+        it.value().CheckAt = cNow + 1s;
+        --it.value().TriesLeft;
+        spdlog::info("Death sync: remote actor {:X} fell dead again after its revival; revived again, {} tries left", pActor->formID, it->second.TriesLeft);
+        ++it;
+    }
+}
+} // namespace
+
+void ActorValueService::WatchCopyRevival(const uint32_t aFormId) noexcept
+{
+    constexpr uint32_t cTries = 5;
+
+    s_copyRevivals.try_emplace(aFormId, CopyRevival{std::chrono::steady_clock::now() + 1s, cTries});
+}
+
 void ActorValueService::OnUpdate(const UpdateEvent& acEvent) noexcept
 {
     PerfScope perfScope("ActorValueService::OnUpdate");
@@ -145,6 +218,7 @@ void ActorValueService::OnUpdate(const UpdateEvent& acEvent) noexcept
     RunHeldHits();
     RunDeathStateUpdates();
     RunActorValuesUpdates();
+    RunCopyRevivals();
 }
 
 void ActorValueService::BroadcastActorValues() noexcept
@@ -274,17 +348,18 @@ void ActorValueService::OnHealthChange(const HealthChangeEvent& acEvent) noexcep
 
     if (acEvent.DeltaHealth > -1.0f && acEvent.DeltaHealth < 1.0f)
     {
-        if (m_smallHealthChanges.find(serverId) == m_smallHealthChanges.end())
-            m_smallHealthChanges[serverId] = acEvent.DeltaHealth;
+        auto& smallChanges = acEvent.FromSpell ? m_smallSpellChanges : m_smallHealthChanges;
+        if (smallChanges.find(serverId) == smallChanges.end())
+            smallChanges[serverId] = acEvent.DeltaHealth;
         else
-            m_smallHealthChanges[serverId] += acEvent.DeltaHealth;
+            smallChanges[serverId] += acEvent.DeltaHealth;
         return;
     }
 
     RequestHealthChangeBroadcast requestHealthChange;
     requestHealthChange.Id = serverId;
     requestHealthChange.DeltaHealth = acEvent.DeltaHealth;
-    requestHealthChange.Tick = m_transport.GetClock().GetCurrentTick();
+    requestHealthChange.Tick = acEvent.FromSpell ? 0 : m_transport.GetClock().GetCurrentTick();
 
     m_transport.Send(requestHealthChange);
 
@@ -318,6 +393,17 @@ void ActorValueService::RunSmallHealthUpdates() noexcept
 
         m_smallHealthChanges.clear();
     }
+
+    for (auto& value : m_smallSpellChanges)
+    {
+        RequestHealthChangeBroadcast requestHealthChange;
+        requestHealthChange.Id = value.first;
+        requestHealthChange.DeltaHealth = value.second;
+
+        m_transport.Send(requestHealthChange);
+    }
+
+    m_smallSpellChanges.clear();
 }
 
 void ActorValueService::RunDeathStateUpdates() noexcept
@@ -447,22 +533,37 @@ void ActorValueService::OnHealthChangeBroadcast(const NotifyHealthChangeBroadcas
 {
 #ifdef SKYRIMVR
     // Another player's hit on this player waits for the defender's rule (RunHeldHits).
-    if (acMessage.DeltaHealth < 0.f && acMessage.AttackerPlayerId)
+    // A spell's hit has no tick and goes straight on: no weapon can block it, and it is not an arrow's.
+    if (acMessage.DeltaHealth < 0.f && acMessage.AttackerPlayerId && acMessage.Tick)
     {
         Actor* pActor = Utils::GetByServerId<Actor>(acMessage.Id);
         if (pActor && pActor == PlayerCharacter::Get())
         {
-            // A ranged hit: that player's projectile is replayed here, and its hit or miss here decides (the defender's own copy).
-            if (const uint32_t cCopy = PlayerCopyFormId(acMessage.AttackerPlayerId); cCopy && PvpProjectiles::Recent(cCopy))
+            // An arrow: that player's arrow is replayed here, and its hit or miss here decides (the defender's own copy).
+            const uint32_t cCopy = PlayerCopyFormId(acMessage.AttackerPlayerId);
+            const Actor* pCopy = Cast<Actor>(TESForm::GetById(cCopy));
+            if (pCopy && PvpProjectiles::Recent(cCopy, glm::distance(glm::vec3(pCopy->position), glm::vec3(pActor->position))))
             {
-                spdlog::info("PvP: a hit of {:.0f} from player {} not taken: its projectile is replayed here, and that copy's hit decides", -acMessage.DeltaHealth,
-                             acMessage.AttackerPlayerId);
+                const float cTaken = PvpProjectiles::ArrowReported(cCopy, -acMessage.DeltaHealth);
+                if (cTaken <= 0.f)
+                {
+                    spdlog::info("PvP: a hit of {:.0f} from player {} not taken: its projectile is replayed here, and that copy's hit decides", -acMessage.DeltaHealth,
+                                 acMessage.AttackerPlayerId);
+                    return;
+                }
+
+                // The replayed arrow got here first and took what this game makes of it, so only the rest of its shooter's number is left.
+                spdlog::info("PvP: an arrow of player {} took {:.0f} here and its shooter's number is {:.0f}; the rest is taken", acMessage.AttackerPlayerId, cTaken,
+                             -acMessage.DeltaHealth);
+                if (-acMessage.DeltaHealth > cTaken)
+                {
+                    NotifyHealthChangeBroadcast rest = acMessage;
+                    rest.DeltaHealth = acMessage.DeltaHealth + cTaken;
+                    ApplyHealthChange(rest);
+                }
                 return;
             }
-            NotifyHealthChangeBroadcast held = acMessage;
-            if (!held.Tick)
-                held.Tick = m_transport.GetClock().GetCurrentTick();
-            m_heldHits.push_back(held);
+            m_heldHits.push_back(acMessage);
             return;
         }
     }
@@ -504,6 +605,9 @@ void ActorValueService::ApplyHealthChange(const NotifyHealthChangeBroadcast& acM
         DeathCause::RecordPlayerHit(acMessage.AttackerPlayerId);
 
     const float health = pActor->GetActorValue(ActorValueInfo::kHealth);
+
+    if (acMessage.DeltaHealth < 0.f && acMessage.AttackerPlayerId && !acMessage.Tick && pActor == PlayerCharacter::Get())
+        SaySpellHits(acMessage.AttackerPlayerId, -acMessage.DeltaHealth, health);
 
     // Another player's blow on an actor other than this player: what it did here, so that one that never kills can be told apart.
     if (acMessage.DeltaHealth < 0.f && acMessage.AttackerPlayerId && pActor != PlayerCharacter::Get())
@@ -663,6 +767,13 @@ void ActorValueService::OnActorValueChanges(const NotifyActorValueChanges& acMes
                     spdlog::info("NPC {:X} health corrected from {:.0f} to its owner's {:.0f}", pActor->formID, current, value);
                 }
 
+                // A number alone does not kill a copy (ApplyHealthChange): with no death played it would stay on its feet.
+                if (value < kNpcCopyHealthFloor)
+                {
+                    SayNpcCopyKeptUp(pActor, value);
+                    value = kNpcCopyHealthFloor;
+                }
+
                 pActor->ForceActorValue(ActorValueOwner::ForceMode::DAMAGE, ActorValueInfo::kHealth, value);
                 continue;
             }
@@ -766,12 +877,19 @@ void ActorValueService::OnDeathStateChange(const NotifyDeathStateChange& acMessa
         return;
     }
 
+    // Revived by its owner: from now on a body here from before is no reason to keep it dead.
+    // Only a placed reference: a temporary copy's id is given to another actor once it is gone.
+    auto& remote = view.get<RemoteComponent>(*it);
+    if (remote.DeadAtOwner && !acMessage.IsDead && remote.CachedRefId && remote.CachedRefId < 0xFF000000)
+        m_world.GetCharacterService().FollowOwnersLife(remote.CachedRefId);
+
     // Kept even when the copy is already in that state here: the corpse placement waits for this word.
-    view.get<RemoteComponent>(*it).DeadAtOwner = acMessage.IsDead;
+    remote.DeadAtOwner = acMessage.IsDead;
 
     // The copy is killed or brought back once it has its 3D, from its spawn request (CharacterService::RunRemoteUpdates).
     if (auto* pWaiting = m_world.try_get<WaitingFor3D>(*it))
     {
+        pWaiting->RevivedByOwner = pWaiting->SpawnRequest.IsDead && !acMessage.IsDead;
         pWaiting->SpawnRequest.IsDead = acMessage.IsDead;
         spdlog::info("Death sync: server id {:X} is {} at its owner while its copy waits to be made here; it will be made so", acMessage.Id,
                      acMessage.IsDead ? "dead" : "alive");
