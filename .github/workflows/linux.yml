@@ -156,3 +156,39 @@ jobs:
                   retention-days: 1
                   if-no-files-found: error
                   path: release-assets/urSovngardeServer-${{ env.ARTIFACT_VERSION }}-linux-${{ matrix.arch }}.tar.gz
+
+    # The server branch's build as a release, so that a server can fetch it without a token (an artifact needs one).
+    # Its tag is server-<version>; the official releases' v<version> tags (release.yml) are left alone.
+    publish-server:
+        needs: build
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/server' }}
+        runs-on: ubuntu-24.04
+        permissions:
+            contents: write
+        steps:
+            - uses: actions/download-artifact@v8
+              with:
+                  pattern: urSovngardeServer-*
+                  merge-multiple: true
+                  path: release-assets
+
+            - name: Publish the server build
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  cd release-assets
+                  ls -l
+                  amd64="$(ls urSovngardeServer-*-linux-amd64.tar.gz)"
+                  version="${amd64#urSovngardeServer-}"
+                  version="${version%-linux-amd64.tar.gz}"
+                  sha256sum urSovngardeServer-*.tar.gz > SHA256SUMS
+                  cat SHA256SUMS
+                  tag="server-$version"
+                  if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+                    echo "$tag is already published"
+                    exit 0
+                  fi
+                  gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+                    --title "Server build $version" --latest=false \
+                    --notes "The Linux server from this fork's server branch: upstream urSovngarde v${version%%-*} with the fork's server fixes (see the README). Not an official urSovngarde release; players use the official client." \
+                    urSovngardeServer-*.tar.gz SHA256SUMS
