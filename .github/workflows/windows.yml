@@ -44,6 +44,12 @@ jobs:
                   git submodule sync --recursive
                   git submodule update --init --force --recursive --depth=1
 
+            # A fork has no release tags of its own, so git describe (the build's version and the zip's name) would name
+            # an old one, such as v1.9.3 for v1.9.7. Upstream's tags come first.
+            - name: Upstream release tags in a fork
+              if: github.repository != 'Dosylia/urSovngarde'
+              run: git fetch --no-recurse-submodules --tags https://github.com/Dosylia/urSovngarde.git || true
+
             - name: Checkout main on tag push
               if: github.ref_type == 'tag'
               run: |
@@ -132,8 +138,8 @@ jobs:
             - name: Package build and organize directories
               if: ${{ inputs.upload-build-for-next-job }}
               run: |
-                  mkdir -p str-build/SkyrimTogetherReborn str-pdb
-                  mv "$STR_BUILD_DIR"/* str-build/SkyrimTogetherReborn/
+                  mkdir -p str-build/urSovngarde str-pdb
+                  mv "$STR_BUILD_DIR"/* str-build/urSovngarde/
                   cp -r GameFiles/Skyrim/* str-build/
 
             - name: Remove unnecessary build files, keep .pdb
@@ -141,40 +147,40 @@ jobs:
               run: |
                   # The client's and the server's symbols, under the names urSovngarde builds them with (SkyrimTogetherServer.pdb is gone).
                   for pdb in SkyrimTogether.pdb urSovngarde.pdb urSovngardeServer.pdb STServer.pdb; do
-                    if [ -f "str-build/SkyrimTogetherReborn/$pdb" ]; then mv "str-build/SkyrimTogetherReborn/$pdb" str-pdb/; fi
+                    if [ -f "str-build/urSovngarde/$pdb" ]; then mv "str-build/urSovngarde/$pdb" str-pdb/; fi
                   done
-                  rm -f str-build/SkyrimTogetherReborn/*.pdb str-build/SkyrimTogetherReborn/*.lib str-build/SkyrimTogetherReborn/*.exp
-                  rm -f str-build/SkyrimTogetherReborn/*Tests.exe
+                  rm -f str-build/urSovngarde/*.pdb str-build/urSovngarde/*.lib str-build/urSovngarde/*.exp
+                  rm -f str-build/urSovngarde/*Tests.exe
 
             - name: Create Windows release zips
               if: ${{ inputs.upload-build-for-next-job }}
               run: |
                   mkdir -p release-assets
                   (cd str-build && 7z a -tzip \
-                    "../release-assets/SkyrimTogether-${ARTIFACT_VERSION}-windows-${{ matrix.arch }}.zip" \
+                    "../release-assets/urSovngarde-${ARTIFACT_VERSION}-windows-${{ matrix.arch }}.zip" \
                     .)
                   (cd str-pdb && 7z a -tzip \
-                    "../release-assets/SkyrimTogether-${ARTIFACT_VERSION}-windows-${{ matrix.arch }}-debug-symbols.zip" \
+                    "../release-assets/urSovngarde-${ARTIFACT_VERSION}-windows-${{ matrix.arch }}-debug-symbols.zip" \
                     .)
 
             - name: Upload playable build
               if: ${{ inputs.upload-build-for-next-job }}
               uses: actions/upload-artifact@v7
               with:
-                  name: SkyrimTogether-${{ env.ARTIFACT_VERSION }}-windows-${{ matrix.arch }}
+                  name: urSovngarde-${{ env.ARTIFACT_VERSION }}-windows-${{ matrix.arch }}
                   # Direct downloads should receive the existing zip without another zip layer
                   archive: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
                   retention-days: 7
                   if-no-files-found: error
-                  path: release-assets/SkyrimTogether-${{ env.ARTIFACT_VERSION }}-windows-${{ matrix.arch }}.zip
+                  path: release-assets/urSovngarde-${{ env.ARTIFACT_VERSION }}-windows-${{ matrix.arch }}.zip
 
             - name: Upload debug symbols
               if: ${{ inputs.upload-build-for-next-job }}
               uses: actions/upload-artifact@v7
               with:
-                  name: SkyrimTogether-${{ env.ARTIFACT_VERSION }}-windows-${{ matrix.arch }}-debug-symbols
+                  name: urSovngarde-${{ env.ARTIFACT_VERSION }}-windows-${{ matrix.arch }}-debug-symbols
                   # Direct downloads should receive the existing zip without another zip layer
                   archive: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
                   retention-days: 7
                   if-no-files-found: error
-                  path: release-assets/SkyrimTogether-${{ env.ARTIFACT_VERSION }}-windows-${{ matrix.arch }}-debug-symbols.zip
+                  path: release-assets/urSovngarde-${{ env.ARTIFACT_VERSION }}-windows-${{ matrix.arch }}-debug-symbols.zip

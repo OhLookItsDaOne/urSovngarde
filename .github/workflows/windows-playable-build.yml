@@ -1,4 +1,4 @@
-name: Playable Skyrim Together Build
+name: Playable urSovngarde Build
 
 on:
   workflow_dispatch:
