@@ -6,6 +6,8 @@ on:
         branches:
             - main
             - dev
+            # The fork's server: the latest upstream release plus the fork's server fixes. Its pushes upload the server.
+            - server
     workflow_call:
         inputs:
             build-mode:
@@ -120,14 +122,30 @@ jobs:
                   grep -q "started on port" start.txt
 
             - name: Create Linux release archive
-              if: ${{ inputs.upload-build-for-next-job }}
+              if: ${{ inputs.upload-build-for-next-job || github.ref == 'refs/heads/server' }}
               run: |
                   version="${GITHUB_REF_NAME#v}"
+                  # On the server branch: the release it is built from and the fork's commits on top, such as 1.9.7-2-g75ad014.
+                  # The fork holds no tags (a tag push would publish a release), so they come from upstream.
+                  if [ "$GITHUB_REF" = "refs/heads/server" ]; then
+                    git fetch --no-recurse-submodules --tags https://github.com/Dosylia/urSovngarde.git || true
+                    version="$(git describe --tags --match 'v*' 2>/dev/null || git rev-parse --short HEAD)"
+                    version="${version#v}"
+                  fi
                   echo "ARTIFACT_VERSION=$version" >> "$GITHUB_ENV"
                   mkdir -p release-assets
                   tar -C release-stage -czf \
                     "release-assets/urSovngardeServer-${version}-linux-${{ matrix.arch }}.tar.gz" \
                     .
+
+            - name: Upload the server branch's build
+              if: ${{ github.ref == 'refs/heads/server' }}
+              uses: actions/upload-artifact@v7
+              with:
+                  name: urSovngardeServer-${{ env.ARTIFACT_VERSION }}-linux-${{ matrix.arch }}
+                  retention-days: 30
+                  if-no-files-found: error
+                  path: release-assets/urSovngardeServer-${{ env.ARTIFACT_VERSION }}-linux-${{ matrix.arch }}.tar.gz
 
             # Upload artifacts
             - name: Upload build files for the next job
