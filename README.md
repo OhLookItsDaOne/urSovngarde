@@ -3,6 +3,25 @@
 Co-op for Skyrim VR: a port of Skyrim Together Reborn (Tilted Online) to Skyrim VR 1.4.15. Playable, and played
 by the two of us; still early, and only ever tested with two players at once.
 
+## How this fork differs from Dosylia/urSovngarde
+
+This fork follows [Dosylia/urSovngarde](https://github.com/Dosylia/urSovngarde) `main` and is merged with it from
+time to time (last at upstream `d930658`). On top of it:
+
+- **The Linux server uses OpenSSL 3.5.7** (the long-term support release) instead of 1.1.1w, which has had no fixes
+  since 2023. GameNetworkingSockets used to be compiled against OpenSSL 3 headers but linked with 1.1.1w, which left
+  `EVP_DigestSignUpdate` undefined and crashed the server on the first connection. Upstream fixed the same crash by
+  staying on 1.1.1w everywhere; this fork keeps OpenSSL 3 on Linux, through the local recipes in
+  `xmake-repo/packages/g/gamenetworkingsockets` (with `cpp-httplib 0.15.3` on Linux). Windows stays on 1.1.1w for now,
+  as `openssl3` cannot build on the CI's shell there.
+- **The Linux build checks for this.** `.github/workflows/linux.yml` fails when `libSTServer.so` leaves any OpenSSL
+  symbol undefined, since starting the server does not catch it.
+- **Community Shaders works with the launcher.** The map freeze fix (`Code/client/Games/Skyrim/RenderPassWatch.cpp`)
+  hooked the game's list draw (`SkyrimVR+0x1349270`) before SKSE loads its plugins, so Community Shaders found
+  foreign bytes there and turned its VR shadow batch off ("Unexpected hook bytes at SkyrimVR+1349270"). The hook is
+  now installed the first time the map is open, after every plugin has loaded, on top of another plugin's hook if one
+  is there.
+
 ## What works
 
 - Playing together in Skyrim VR through a dedicated server, the world's NPCs, fights, deaths and items shared.
