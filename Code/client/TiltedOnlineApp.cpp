@@ -82,6 +82,11 @@ static void LogEngineFixes7() noexcept
     }
 }
 
+#ifdef SKYRIMVR
+// RenderPassWatch.cpp: hooks the list draw the first time the map is open, after every SKSE plugin has loaded.
+void InstallDrawListCheck() noexcept;
+#endif
+
 TiltedOnlineApp::TiltedOnlineApp()
 {
     // Set console code page to UTF-8 so console known how to interpret string data
@@ -172,6 +177,9 @@ void TiltedOnlineApp::Update()
         s_engineFixesLogged = true;
         LogEngineFixes7();
     }
+#ifdef SKYRIMVR
+    InstallDrawListCheck();
+#endif
 
     World::Get().Update();
 }
