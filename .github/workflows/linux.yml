@@ -46,6 +46,12 @@ jobs:
                   git submodule sync --recursive
                   git submodule update --init --force --recursive --depth=1
 
+            # The fork has no release tags (a tag push would publish a release), so the version the server reports
+            # (BuildInfo.h, from git describe) would name an old one. The server branch takes upstream's tags first.
+            - name: Upstream release tags for the server branch
+              if: github.ref == 'refs/heads/server'
+              run: git fetch --no-recurse-submodules --tags https://github.com/Dosylia/urSovngarde.git || true
+
             - name: Checkout main on tag push
               if: github.ref_type == 'tag'
               run: |
@@ -126,9 +132,8 @@ jobs:
               run: |
                   version="${GITHUB_REF_NAME#v}"
                   # On the server branch: the release it is built from and the fork's commits on top, such as 1.9.7-2-g75ad014.
-                  # The fork holds no tags (a tag push would publish a release), so they come from upstream.
+                  # Upstream's tags were fetched before the build (see above).
                   if [ "$GITHUB_REF" = "refs/heads/server" ]; then
-                    git fetch --no-recurse-submodules --tags https://github.com/Dosylia/urSovngarde.git || true
                     version="$(git describe --tags --match 'v*' 2>/dev/null || git rev-parse --short HEAD)"
                     version="${version#v}"
                   fi
