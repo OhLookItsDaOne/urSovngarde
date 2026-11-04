@@ -50,7 +50,10 @@ jobs:
             # (BuildInfo.h, from git describe) would name an old one. The server branch takes upstream's tags first.
             - name: Upstream release tags for the server branch
               if: github.ref == 'refs/heads/server'
-              run: git fetch --no-recurse-submodules --tags https://github.com/Dosylia/urSovngarde.git || true
+              # The server-<version> tags of this branch's own releases would be nearer than any release, so they go.
+              run: |
+                  git fetch --no-recurse-submodules --tags https://github.com/Dosylia/urSovngarde.git || true
+                  git tag -l 'server-*' 'client-*' | xargs -r git tag -d
 
             - name: Checkout main on tag push
               if: github.ref_type == 'tag'
