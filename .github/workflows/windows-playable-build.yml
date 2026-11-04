@@ -5,9 +5,11 @@ on:
   schedule:
     # Every Friday at 1:00 p.m. UTC
     - cron: '0 13 * * 5'
+  # The fork's test client builds. Not "master": xmake.lua builds a master branch as IS_MASTER, without the console,
+  # the full crash dumps and some debug tools that the official releases (built from main) have.
   push:
     branches:
-      - master
+      - client
   workflow_call:
 
 jobs:
