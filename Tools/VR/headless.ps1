@@ -2,6 +2,7 @@
 #
 #   powershell -ExecutionPolicy Bypass -File Tools\VR\headless.ps1 up        # SteamVR (null headset), server, game, last save, connected
 #   powershell -ExecutionPolicy Bypass -File Tools\VR\headless.ps1 up -NoConnect   # the same without a server: the game alone
+#   powershell -ExecutionPolicy Bypass -File Tools\VR\headless.ps1 up -ListServer  # the server in a mod's connect file, not connected yet: live-connect-default
 #   powershell -ExecutionPolicy Bypass -File Tools\VR\headless.ps1 status
 #   powershell -ExecutionPolicy Bypass -File Tools\VR\headless.ps1 down      # quit the game, stop what 'up' started, headset setting off
 #
@@ -21,7 +22,11 @@ param(
     [Parameter(Position = 0)][ValidateSet('up', 'down', 'status')][string]$Action = 'status',
     [string]$Save = '',                 # a save name; empty loads the fixed rig save below, or the most recent one if it is gone
     [switch]$NoConnect,                 # no server and no waiting for a connection: the game alone, mod loaded
+    [string]$ServerAddress = '',        # address:port of a test server elsewhere: this one is joined and no local server starts
+    [string]$ServerPassword = '',       # that server's password; it goes only into the connect file, which "down" puts back
+    [switch]$Twin,                      # the game starts through two-games-anchor.py, which can start a second one (two-games.py)
     [switch]$AutoConnect,               # the launcher's "connect automatically" setting on: the game connects by itself, F6 is not pressed
+    [switch]$ListServer,                # the player has no connect file: the test server is in a mod's, and the script connects
     [int]$LoadTimeout = 180,
     # Seconds the game has to reach the main menu: MGO takes about five and a half minutes, FUS under three.
     [int]$MenuTimeout = 600,
@@ -319,6 +324,8 @@ function Restore-Saves {
 # The player's file is put back by "down".
 $connectFile = Join-Path $env:LOCALAPPDATA 'SkyrimTogetherVR\connect.txt'
 $connectBackup = "$connectFile.before-rig"
+# A mod's connect file: what MO2's Overwrite holds, the game sees in Data, so the mod list is not touched.
+$listConnectFile = Join-Path $fusRoot 'overwrite\SKSE\Plugins\urSovngarde\connect.txt'
 
 function Set-RigConnect {
     if (Test-Path -LiteralPath $connectBackup) { Restore-Connect }
@@ -331,13 +338,26 @@ function Set-RigConnect {
         if ($line) { $port = [int]$line.Matches[0].Groups[1].Value }
     }
     New-Item -ItemType Directory -Force -Path (Split-Path $connectFile) | Out-Null
-    $text = "127.0.0.1:$port"
+    $text = if ($ServerAddress) { $ServerAddress } else { "127.0.0.1:$port" }
+    if ($ServerAddress -and $ServerPassword) { $text += "`r`n$ServerPassword" }
     if ($AutoConnect) { $text += "`r`nautoconnect=on" }
+    if ($ListServer) {
+        if (Test-Path -LiteralPath $listConnectFile) { throw "A connect file is already in Overwrite, and the rig does not replace it: $listConnectFile" }
+        # By force: a read-only file left here would send the test game to the player's real server.
+        if (Test-Path -LiteralPath $connectFile) { Remove-Item -LiteralPath $connectFile -Force }
+        New-Item -ItemType Directory -Force -Path (Split-Path $listConnectFile) | Out-Null
+        Set-Content -LiteralPath $listConnectFile -Value $text -Encoding ascii
+        Write-Host "The player's connect file is aside, and the local test server (127.0.0.1:$port) is in a mod's for this run."
+        return
+    }
     Set-Content -LiteralPath $connectFile -Value $text -Encoding ascii
-    Write-Host "Connect file set to the local test server (127.0.0.1:$port) for this run."
+    Write-Host "Connect file set to the test server ($($text.Split("`r")[0])) for this run."
 }
 
 function Restore-Connect {
+    # Only a file naming this PC is the rig's. Nothing here may stop the player's own file coming back.
+    $listServer = Get-Content -LiteralPath $listConnectFile -TotalCount 1 -ErrorAction SilentlyContinue
+    if ($listServer -match '^127\.0\.0\.1:\d+$') { Remove-Item -LiteralPath (Split-Path $listConnectFile) -Recurse -Force -ErrorAction SilentlyContinue }
     if (-not (Test-Path -LiteralPath $connectBackup)) { return }
     if ((Get-Item -LiteralPath $connectBackup).Length -eq 0) { Remove-Item -LiteralPath $connectFile -ErrorAction SilentlyContinue }
     else { Copy-Item -LiteralPath $connectBackup -Destination $connectFile -Force }
@@ -456,14 +476,19 @@ try {
     $loaded = Select-String -Path $vrLog -Pattern "Driver 'null' finished adding tracked device with serial number 'CTRL2Serial'" -Quiet
     if (-not $loaded) { throw "SteamVR is up, but the null driver did not add its controllers (see $vrLog). Is the built driver_null.dll still in place?" }
 
-    if (-not $NoConnect -and -not (Test-Running '^(urSovngardeServer|SkyrimTogetherServer)$')) {
+    if (-not $NoConnect -and -not $ServerAddress -and -not (Test-Running '^(urSovngardeServer|SkyrimTogetherServer)$')) {
         Start-Process -FilePath (Join-Path $release 'urSovngardeServer.exe') -WorkingDirectory $release -WindowStyle Hidden
         $startedServer = $true
         @{ startedServer = $true; save = $Save; profileDir = $profileDir } | ConvertTo-Json | Set-Content $stateFile
         Start-Sleep -Seconds 4
     }
 
-    Start-Process -FilePath $mo2 -ArgumentList "`"moshortcut://:$mo2Shortcut`""
+    if ($Twin) {
+        $python = (Get-Command python).Source
+        $anchor = Join-Path $PSScriptRoot 'two-games-anchor.py'
+        Start-Process -FilePath $mo2 -ArgumentList "run `"$python`" -a `"$anchor`""
+    }
+    else { Start-Process -FilePath $mo2 -ArgumentList "`"moshortcut://:$mo2Shortcut`"" }
     Wait-Until { Get-Health } 180 'DevBench to answer (the game to start)'
     Wait-Until { (Invoke-Tool 'menu' @{ action = 'list' }).openMenus -contains 'Main Menu' } $MenuTimeout 'the main menu' -NeedsGame
 
@@ -473,15 +498,33 @@ try {
 
     if ($StartCell) {
         Start-Sleep -Seconds 3
-        Invoke-Tool 'console' @{ action = 'exec'; command = "cow $StartCell" } | Out-Null
+        if ($StartCell -eq 'Tamriel 34 -9') {
+            # Console travel can crash the game as it loads (VR_TODO, "Console travel"), and this is the rig's most run trip.
+            # So it goes by Papyrus, to a persistent reference by Mistwatch. The fractions keep the offsets floats in PowerShell's JSON.
+            # A long load holds DevBench's answer: a timeout here is no failure, the position below says whether the trip happened.
+            $move = @{ action = 'call'; script = 'ObjectReference'; function = 'MoveTo'; self = @{ form = '0x14' }; args = @(@{ form = '0x4AFD9' }, -32.5, -911.5, 262.5, $false) }
+            try { Invoke-Tool 'papyrus' $move | Out-Null } catch { Write-Host "MoveTo gave no answer yet: $($_.Exception.Message)" }
+        } else {
+            Invoke-Tool 'console' @{ action = 'exec'; command = "cow $StartCell" } | Out-Null
+        }
         Start-Sleep -Seconds 3
         Wait-Until { -not ((Invoke-Tool 'menu' @{ action = 'list' }).openMenus -contains 'Loading Menu') } $LoadTimeout 'the start cell to load' -NeedsGame
         Start-Sleep -Seconds 5
-        Write-Host "Player put at the start: cow $StartCell"
+        if ($StartCell -eq 'Tamriel 34 -9') {
+            $y = (Invoke-Tool 'papyrus' @{ action = 'call'; script = 'ObjectReference'; function = 'GetPositionY'; self = @{ form = '0x14' } }).returned
+            if ([math]::Abs($y + 32896) -gt 600) { throw "The player is not at the start: y $y, wanted about -32896." }
+        }
+        Write-Host "Player put at the start: $StartCell"
     }
 
     if ($NoConnect) {
         Write-Host 'Up, not connected (no server was started).' -ForegroundColor Green
+        Show-Status
+        return
+    }
+
+    if ($ListServer) {
+        Write-Host 'Up, not connected: the script presses F6.' -ForegroundColor Green
         Show-Status
         return
     }

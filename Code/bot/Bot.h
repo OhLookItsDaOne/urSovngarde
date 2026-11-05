@@ -198,6 +198,7 @@ private:
     //! Shared by waitfor and expect. Returns nothing when the condition cannot be parsed.
     std::optional<bool> Evaluate(const std::vector<std::string>& acArgs, std::string& aOutWhy) const noexcept;
     void WriteReport(const std::string& acPath) const noexcept;
+    bool ReadListenFile() noexcept;
     bool StepCommand(const Command& acCommand, bool aFirstTick) noexcept;
     bool MoveTowards(const glm::vec3& acTarget, float aSpeed, float aDt) noexcept;
 
@@ -219,6 +220,10 @@ private:
 
     BotOptions m_options;
     std::vector<Command> m_script;
+    float m_reportEvery{};
+    std::chrono::steady_clock::time_point m_nextReport{};
+    size_t m_listenOffset{};
+    std::chrono::steady_clock::time_point m_listenNext{};
 
     Phase m_phase = Phase::Idle;
     Clock::time_point m_phaseStart{};
@@ -338,6 +343,7 @@ private:
     uint64_t m_lastClashTick{}; //!< when the last of them was seen, on the server's clock
     uint64_t m_firstClashTick{}; //!< and the first
     uint32_t m_objectMoves{}; //!< world-object moves relayed to this bot
+    std::map<uint32_t, uint32_t> m_objectMovesOf; //!< those moves per Skyrim.esm object, for "objectmoves <hex>"
     uint32_t m_activationsBack{}; //!< activations relayed to this bot in its own name: its own, sent back by a game
     uint32_t m_activations{}; //!< every activation relayed to this bot, whoever did it
     //! The latest switch relayed to this bot for each reference the party leader's scripts switched (Skyrim.esm base id), for "refenabled".
@@ -390,6 +396,9 @@ private:
     //! replay ends, so the copy stays posed (a stream without a pose hands the copy back to its animation).
     bool m_holdPose{false};
     VRPose m_lastReplayedPose{};
+    // A held spell whose aim goes out with each movement, as a VR player's does; heading, then pitch.
+    bool m_castAiming{false};
+    float m_castAim[2]{};
     //! Where the NPC this bot registered stands, which is where a replay for it starts from.
     glm::vec3 m_npcPosition{};
     //! The base form of the last character captured, as the server names it: what "npc captured" registers a

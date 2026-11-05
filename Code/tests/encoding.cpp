@@ -417,6 +417,7 @@ TEST_CASE("Packets", "[encoding.packets]")
         sendMessage.Position.z = 125452.4f;
         sendMessage.Rotation.x = -1.87f;
         sendMessage.Rotation.y = 45.35f;
+        sendMessage.IsFollower = true;
 
         Buffer::Writer writer(&buff);
         sendMessage.Serialize(writer);
@@ -556,6 +557,81 @@ TEST_CASE("Packets", "[encoding.packets]")
         }
     }
 
+    SECTION("RequestPartyPlugin and NotifyPartyPlugin")
+    {
+        {
+            RequestPartyPlugin sendMessage;
+            sendMessage.PluginFile = "Some Plugin.esp";
+
+            uint8_t storage[1 << 12];
+            Buffer buffer(storage, sizeof(storage));
+            Buffer::Writer writer(&buffer);
+            sendMessage.Serialize(writer);
+
+            Buffer::Reader reader(&buffer);
+            const ClientMessageFactory factory;
+            auto pMessage = factory.Extract(reader);
+
+            REQUIRE(pMessage);
+            REQUIRE(*CastUnique<RequestPartyPlugin>(std::move(pMessage)) == sendMessage);
+        }
+        {
+            NotifyPartyPlugin sendMessage;
+            sendMessage.PluginFile = "Some Plugin.esp";
+            sendMessage.PlayerWithout = "player 2";
+
+            uint8_t storage[1 << 12];
+            Buffer buffer(storage, sizeof(storage));
+            Buffer::Writer writer(&buffer);
+            sendMessage.Serialize(writer);
+
+            Buffer::Reader reader(&buffer);
+            const ServerMessageFactory factory;
+            auto pMessage = factory.Extract(reader);
+
+            REQUIRE(pMessage);
+            REQUIRE(*CastUnique<NotifyPartyPlugin>(std::move(pMessage)) == sendMessage);
+        }
+    }
+
+    SECTION("RequestPartyValue and NotifyPartyValue")
+    {
+        {
+            RequestPartyValue sendMessage;
+            sendMessage.Key = "courtyard";
+            sendMessage.Value = 0.625f;
+
+            uint8_t storage[1 << 12];
+            Buffer buffer(storage, sizeof(storage));
+            Buffer::Writer writer(&buffer);
+            sendMessage.Serialize(writer);
+
+            Buffer::Reader reader(&buffer);
+            const ClientMessageFactory factory;
+            auto pMessage = factory.Extract(reader);
+
+            REQUIRE(pMessage);
+            REQUIRE(*CastUnique<RequestPartyValue>(std::move(pMessage)) == sendMessage);
+        }
+        {
+            NotifyPartyValue sendMessage;
+            sendMessage.Key = "courtyard";
+            sendMessage.Value = -3.5f;
+
+            uint8_t storage[1 << 12];
+            Buffer buffer(storage, sizeof(storage));
+            Buffer::Writer writer(&buffer);
+            sendMessage.Serialize(writer);
+
+            Buffer::Reader reader(&buffer);
+            const ServerMessageFactory factory;
+            auto pMessage = factory.Extract(reader);
+
+            REQUIRE(pMessage);
+            REQUIRE(*CastUnique<NotifyPartyValue>(std::move(pMessage)) == sendMessage);
+        }
+    }
+
     SECTION("RequestReferenceEnable and NotifyReferenceEnable")
     {
         const ReferenceEnableState camp{GameId(0, 0x8680C), true};
@@ -590,6 +666,64 @@ TEST_CASE("Packets", "[encoding.packets]")
             // The order the switches happened in is kept.
             REQUIRE(pRecv->Changes[0].Id == barricade.Id);
             REQUIRE(pRecv->Changes[1].Enabled);
+        }
+    }
+
+    SECTION("RequestWarState and NotifyWarState")
+    {
+        WarState state{};
+        state.Owners[4] = 2;
+        state.Objectives[11] = WarState::kDisplayed | WarState::kCompleted;
+        state.Objectives.back() = WarState::kFailed;
+
+        {
+            Buffer buff(1000);
+            RequestWarState sendMessage;
+            sendMessage.State = state;
+
+            Buffer::Writer writer(&buff);
+            sendMessage.Serialize(writer);
+            Buffer::Reader reader(&buff);
+            auto pMessage = ClientMessageFactory{}.Extract(reader);
+            REQUIRE(pMessage);
+            REQUIRE(pMessage->GetOpcode() == sendMessage.GetOpcode());
+            REQUIRE(*CastUnique<RequestWarState>(std::move(pMessage)) == sendMessage);
+        }
+
+        {
+            Buffer buff(1000);
+            NotifyWarState sendMessage;
+            sendMessage.State = state;
+
+            Buffer::Writer writer(&buff);
+            sendMessage.Serialize(writer);
+            Buffer::Reader reader(&buff);
+            auto pMessage = ServerMessageFactory{}.Extract(reader);
+            REQUIRE(pMessage);
+            const auto pRecv = CastUnique<NotifyWarState>(std::move(pMessage));
+            REQUIRE(*pRecv == sendMessage);
+            REQUIRE(pRecv->State.Owners[4] == 2);
+            REQUIRE(pRecv->State.Objectives.back() == WarState::kFailed);
+        }
+    }
+
+    SECTION("NotifyRemoveCharacter")
+    {
+        for (const bool cGone : {false, true})
+        {
+            Buffer buff(100);
+            NotifyRemoveCharacter sendMessage;
+            sendMessage.ServerId = 0x100005;
+            sendMessage.Gone = cGone;
+
+            Buffer::Writer writer(&buff);
+            sendMessage.Serialize(writer);
+            Buffer::Reader reader(&buff);
+            auto pMessage = ServerMessageFactory{}.Extract(reader);
+            REQUIRE(pMessage);
+            const auto pRecv = CastUnique<NotifyRemoveCharacter>(std::move(pMessage));
+            REQUIRE(*pRecv == sendMessage);
+            REQUIRE(pRecv->Gone == cGone);
         }
     }
 }

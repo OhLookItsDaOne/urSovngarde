@@ -29,6 +29,7 @@
 #include <Messages/NotifyVoiceData.h>
 #include <Messages/NotifyPlayerWhereabouts.h>
 #include <Messages/RequestOwnershipClaim.h>
+#include <Messages/RequestFollowerState.h>
 #include <Messages/RequestPlayerHealthUpdate.h>
 #include <Messages/MountRequest.h>
 #include <Messages/NotifyClash.h>
@@ -49,11 +50,16 @@
 #include <Messages/NotifyPlayerJoined.h>
 #include <Messages/NotifyPlayerLeft.h>
 #include <Messages/NotifyRemoveCharacter.h>
+#include <Messages/DialogueRequest.h>
+#include <Messages/RequestSetWaypoint.h>
 #include <Messages/NotifyRespawn.h>
 #include <Messages/PlayerRespawnRequest.h>
 #include <Messages/PlayerDownedRequest.h>
 #include <Messages/ReviveRequest.h>
 #include <Messages/AddTargetRequest.h>
+#include <Messages/ProjectileLaunchRequest.h>
+#include <Messages/SpellCastRequest.h>
+#include <Messages/InterruptCastRequest.h>
 #include <Messages/NotifyAddTarget.h>
 #include <Messages/SafePointRequest.h>
 #include <Messages/NotifyDownedState.h>
@@ -745,6 +751,15 @@ void Bot::SendMovement() noexcept
     movement.Direction = 0.f;
     if (m_holdPose && m_lastReplayedPose.HasData)
         update.UpdatedVRPose = m_lastReplayedPose;
+    if (m_castAiming)
+    {
+        VRPose& pose = update.UpdatedVRPose;
+        pose.HasData = true;
+        pose.NoBones = pose.NoBones || !m_holdPose;
+        pose.HasSpellAim = true;
+        pose.SpellAim[0] = m_castAim[0];
+        pose.SpellAim[1] = m_castAim[1];
+    }
 
     // Unreliable, as the game's client sends movement: the next one, 50 ms later, makes good a lost one.
     SendMsg(message, MovementFlags());
@@ -1137,6 +1152,18 @@ void Bot::HandleMessage(const ServerMessage& acMessage) noexcept
             {
                 pPlayer->Position = FromNet(entry.second.UpdatedMovement.Position);
                 pPlayer->Rotation = glm::vec2(entry.second.UpdatedMovement.Rotation.x, entry.second.UpdatedMovement.Rotation.y);
+                // What a real client sends while it holds a spell, at most once a second.
+                if (const VRPose& pose = entry.second.UpdatedVRPose; pose.HasSpellAim)
+                {
+                    static Clock::time_point s_nextSaid{};
+                    if (const auto cNow = Clock::now(); cNow >= s_nextSaid)
+                    {
+                        s_nextSaid = cNow + std::chrono::seconds(1);
+                        const glm::vec3 cWay = m_position - pPlayer->Position;
+                        spdlog::info("Spell aim of the player at {:X}: heading {:.1f} degrees, pitch {:.1f}; this bot is at heading {:.1f}", entry.first,
+                                     glm::degrees(pose.SpellAim[0]), glm::degrees(pose.SpellAim[1]), glm::degrees(std::atan2(cWay.x, cWay.y)));
+                    }
+                }
                 pPlayer->MovedInCell = entry.second.UpdatedMovement.CellId;
                 pPlayer->MovedInWorldSpace = entry.second.UpdatedMovement.WorldSpaceId;
             }
@@ -1378,6 +1405,8 @@ void Bot::HandleMessage(const ServerMessage& acMessage) noexcept
     {
         const auto& message = static_cast<const NotifyWorldObjectMove&>(acMessage);
         ++m_objectMoves;
+        if (message.ObjectId.ModId == m_skyrimModId)
+            ++m_objectMovesOf[message.ObjectId.BaseId];
         const glm::vec3 cPlace(message.Position);
         spdlog::info("World object {:X}:{:X} moved to ({:.0f}, {:.0f}, {:.0f}){}", message.ObjectId.ModId, message.ObjectId.BaseId, cPlace.x, cPlace.y, cPlace.z,
                      message.Taken ? ", taken" : message.AtRest ? ", at rest" : "");
@@ -1586,6 +1615,13 @@ void Bot::HandleMessage(const ServerMessage& acMessage) noexcept
 
 bool Bot::RunScript() noexcept
 {
+    // "reportevery <seconds>": a report whatever the script is doing, for a play session that compares it with the game.
+    if (m_reportEvery > 0.f && Clock::now() >= m_nextReport)
+    {
+        m_nextReport = Clock::now() + std::chrono::milliseconds(static_cast<int>(m_reportEvery * 1000.f));
+        StepCommand(Command{"report", {}, 0}, false);
+    }
+
     if (m_pc >= m_script.size())
     {
         if (m_phase != Phase::Stopped)
@@ -1596,6 +1632,11 @@ bool Bot::RunScript() noexcept
         }
         return false;
     }
+
+    if (m_script[m_pc].Name == "listen" && !ReadListenFile())
+        return false;
+    if (m_pc >= m_script.size())
+        return false;
 
     const Command& command = m_script[m_pc];
 
@@ -1622,6 +1663,54 @@ bool Bot::RunScript() noexcept
         m_commandFresh = true;
     }
     return done;
+}
+
+// "listen <file>": runs the commands written to that file as they come, so a play session can steer this player.
+// The line "end" stops listening, and the script goes on after the listen line.
+// True when there is a command to run now.
+bool Bot::ReadListenFile() noexcept
+{
+    const auto cNow = Clock::now();
+    if (cNow < m_listenNext)
+        return false;
+    m_listenNext = cNow + std::chrono::milliseconds(100);
+
+    std::ifstream file(m_script[m_pc].Args.empty() ? std::string() : m_script[m_pc].Args[0], std::ios::binary);
+    if (!file)
+        return false;
+    file.seekg(static_cast<std::streamoff>(m_listenOffset));
+
+    std::vector<Command> commands;
+    bool ended = false;
+    std::string line;
+    while (std::getline(file, line))
+    {
+        // A line still being written waits for the next look.
+        if (file.eof())
+            break;
+        m_listenOffset += line.size() + 1;
+        std::istringstream stream(line);
+        Command command;
+        if (!(stream >> command.Name))
+            continue;
+        if (command.Name == "end")
+        {
+            ended = true;
+            break;
+        }
+        std::string token;
+        while (stream >> token)
+            command.Args.push_back(token);
+        commands.push_back(std::move(command));
+    }
+
+    if (ended)
+        m_script.erase(m_script.begin() + static_cast<std::ptrdiff_t>(m_pc));
+    if (!commands.empty())
+        m_script.insert(m_script.begin() + static_cast<std::ptrdiff_t>(m_pc), commands.begin(), commands.end());
+    if (ended || !commands.empty())
+        m_commandFresh = true;
+    return ended || !commands.empty();
 }
 
 bool Bot::StepCommand(const Command& acCommand, const bool aFirstTick) noexcept
@@ -1685,6 +1774,21 @@ bool Bot::StepCommand(const Command& acCommand, const bool aFirstTick) noexcept
     // "infront <distance>": straight to <distance> units in front of the host (its heading), at the host's height. The
     // bot never changes height otherwise (MoveTowards keeps z), so its copy can stand inside a hillside the host
     // walked up (live-blade, 2026-10-10: 156 units under the player, out of reach of a scripted swing).
+    // "moveto <x> <y> <z> [speed]": walks there, its height too, so that it stays on the ground it walks over.
+    if (name == "moveto")
+    {
+        if (aFirstTick)
+        {
+            m_walkTarget = glm::vec3(arg(0, m_position.x), arg(1, m_position.y), arg(2, m_position.z));
+            m_walkSpeed = arg(3, 220.f);
+        }
+        return MoveTowards(m_walkTarget, m_walkSpeed, dt);
+    }
+    if (name == "reportevery")
+    {
+        m_reportEvery = arg(0, 1.f);
+        return true;
+    }
     if (name == "infront")
     {
         if (const KnownPlayer* pHost = Host())
@@ -2151,6 +2255,16 @@ bool Bot::StepCommand(const Command& acCommand, const bool aFirstTick) noexcept
             const int64_t cOffset = args.size() > 3 ? std::strtoll(args[3].c_str(), nullptr, 10) : 0;
             tick = static_cast<uint64_t>(std::max<int64_t>(1, static_cast<int64_t>(m_firstClashTick) + cOffset));
         }
+        // "spell": a spell's hit, as a caster's game sends it: with no tick, since no weapon can block it.
+        if (args.size() > 2 && args[2] == "spell")
+        {
+            RequestHealthChangeBroadcast request{};
+            request.Id = target;
+            request.DeltaHealth = arg(1, -30.f);
+            SendMsg(request);
+            spdlog::info("Spell hit on {:X} for {:.1f}", target, request.DeltaHealth);
+            return true;
+        }
         SendHit(target, arg(1, -30.f), tick);
         return true;
     }
@@ -2236,6 +2350,104 @@ bool Bot::StepCommand(const Command& acCommand, const bool aFirstTick) noexcept
         return true;
     }
 
+    // "launch <projectile hex> <spell hex> [miss|empty|arrow|arrowmiss]": a projectile of a Skyrim.esm spell leaves this bot's character for the host, as a caster's game sends it.
+    // The host's game replays it from the bot's copy, so its own hit or miss can be tested.
+    // With "miss" it flies past the host.
+    // With "empty" its ids stay empty, as a form made at run time reaches another game.
+    if (name == "launch")
+    {
+        uint32_t projectile = 0;
+        uint32_t spell = 0;
+        const std::string cHow = args.size() > 2 ? args[2] : "";
+        const bool cMiss = cHow == "miss" || cHow == "arrowmiss";
+        const bool cArrow = cHow == "arrow" || cHow == "arrowmiss";
+        const KnownPlayer* pHost = Host();
+        if (args.size() < 2 || !ParseHex(args[0], projectile) || !ParseHex(args[1], spell) || !pHost)
+        {
+            spdlog::error("[script] launch needs a projectile, a spell and a host in the world");
+            return true;
+        }
+        // From chest height to chest height.
+        const glm::vec3 cFrom = m_position + glm::vec3(0.f, 0.f, 90.f);
+        const glm::vec3 cTo = pHost->Position + glm::vec3(0.f, 0.f, 90.f);
+        const glm::vec3 cWay = cTo - cFrom;
+
+        ProjectileLaunchRequest request{};
+        request.ShooterID = m_serverId;
+        request.OriginX = cFrom.x;
+        request.OriginY = cFrom.y;
+        request.OriginZ = cFrom.z;
+        // The game's angles: heading clockwise from north, and pitch with down positive.
+        constexpr float cMissBy = 0.6f;
+        request.ZAngle = std::atan2(cWay.x, cWay.y) + (cMiss ? cMissBy : 0.f);
+        request.XAngle = -std::atan2(cWay.z, glm::length(glm::vec2(cWay.x, cWay.y)));
+        request.ParentCellID = pHost->CellId;
+        if (cHow != "empty")
+        {
+            request.ProjectileBaseID = Skyrim(projectile);
+            request.SpellID = Skyrim(spell);
+        }
+        // "arrow": no spell, and the bow and arrow a client's launch of it names (an Imperial Bow and a Steel Arrow).
+        if (cArrow)
+        {
+            request.SpellID = GameId{};
+            request.WeaponID = Skyrim(0x13841);
+            request.AmmoID = Skyrim(0x1397F);
+        }
+        // A spell from the right hand, as the client's own launch event says.
+        request.CastingSource = 1;
+        request.Power = 1.f;
+        request.Scale = 1.f;
+        request.AutoAim = true;
+        SendMsg(request);
+        spdlog::info("[script] projectile {:X} of spell {:X} launched from ({:.0f}, {:.0f}, {:.0f}), the host {:.0f} units away {}", projectile, spell, cFrom.x, cFrom.y, cFrom.z,
+                     glm::length(cWay), cHow);
+        return true;
+    }
+
+    // "cast <spell hex> [stop|away [noaim]]": this bot's character casts that Skyrim.esm spell from its right hand at the host, or stops, as a client sends a concentration spell.
+    if (name == "cast")
+    {
+        uint32_t spell = 0;
+        const KnownPlayer* pHost = Host();
+        if (args.empty() || !ParseHex(args[0], spell) || !pHost)
+        {
+            spdlog::error("[script] cast needs a spell and a host in the world");
+            return true;
+        }
+        if (args.size() > 1 && args[1] == "stop")
+        {
+            InterruptCastRequest stop{};
+            stop.CasterId = m_serverId;
+            stop.CastingSource = 1;
+            SendMsg(stop);
+            m_castAiming = false;
+            spdlog::info("[script] cast of {:X} stopped", spell);
+            return true;
+        }
+        // A copy's spell goes where its body faces, or at a target if it has one.
+        // "away" turns the body from the host with no target, as a VR player's hand points where its body does not.
+        // Its aim then goes with the pose, unless "noaim".
+        const bool cAway = args.size() > 1 && args[1] == "away";
+        const glm::vec3 cWay = pHost->Position - m_position;
+        const float cHeading = std::atan2(cWay.x, cWay.y);
+        m_yaw = cAway ? cHeading + glm::pi<float>() : cHeading;
+        m_castAiming = cAway && !(args.size() > 2 && args[2] == "noaim");
+        m_castAim[0] = cHeading;
+        m_castAim[1] = 0.f;
+        SendMovement();
+
+        SpellCastRequest request{};
+        request.CasterId = m_serverId;
+        request.SpellFormId = Skyrim(spell);
+        request.CastingSource = 1;
+        request.IsDualCasting = false;
+        request.DesiredTarget = cAway ? 0 : pHost->ServerId;
+        SendMsg(request);
+        spdlog::info("[script] spell {:X} cast at the host{}", spell, cAway ? (m_castAiming ? ", the body turned away and the aim sent" : ", the body turned away and no aim sent") : "");
+        return true;
+    }
+
     // "revive other|<player id> [hold|letgo]": this bot held a hand on that downed player long enough, as a client asks then.
     // With hold or letgo, only that its hand went on or came off, as a client says while holding.
     if (name == "revive")
@@ -2310,6 +2522,25 @@ bool Bot::StepCommand(const Command& acCommand, const bool aFirstTick) noexcept
             SendCellEntry();
             SendMovement();
             spdlog::info("[script] back out into worldspace {:X}:{:X}", m_worldSpace.ModId, m_worldSpace.BaseId);
+            return true;
+        }
+
+        // "cell world <hex>": into that worldspace of Skyrim.esm, as through a city gate.
+        if (args[0] == "world")
+        {
+            uint32_t worldId = 0;
+            if (args.size() < 2 || !ParseHex(args[1], worldId))
+            {
+                spdlog::error("[script] cell world needs a hex worldspace id");
+                return true;
+            }
+            s_worldSpaceBeforeInterior = m_worldSpace;
+            m_cell = GameId{};
+            m_worldSpace = GameId{m_skyrimModId, worldId & 0x00FFFFFF};
+            m_standaloneCell = false;
+            SendCellEntry();
+            SendMovement();
+            spdlog::info("[script] through a gate into worldspace {:X}:{:X}", m_worldSpace.ModId, m_worldSpace.BaseId);
             return true;
         }
 
@@ -2467,15 +2698,27 @@ bool Bot::StepCommand(const Command& acCommand, const bool aFirstTick) noexcept
             update.UpdatedMovement.CellId = GameId{m_skyrimModId, interiorId & 0x00FFFFFF};
             update.UpdatedMovement.WorldSpaceId = GameId{};
         }
+        // "npcmove <dx> <dy> <dz> posed": with a position-only body pose, as an owner sends while it moves a body with no humanoid skeleton.
+        if (args.size() > 3 && args[3] == "posed")
+        {
+            VRPose& pose = update.UpdatedVRPose;
+            pose.HasData = true;
+            pose.NoBones = true;
+            pose.HasRootPosition = true;
+            pose.RootPosition[0] = m_npcPosition.x;
+            pose.RootPosition[1] = m_npcPosition.y;
+            pose.RootPosition[2] = m_npcPosition.z;
+        }
         // Reliable, unlike a stream of movement: this one step is all the test sends, and no later one would make it good.
         SendMsg(message);
         spdlog::info("[script] NPC {:X} moved to ({:.0f}, {:.0f}, {:.0f})", npcId, m_npcPosition.x, m_npcPosition.y, m_npcPosition.z);
         return true;
     }
 
-    // "activate <hex reference> by other|me|nobody [door state]": an activation of that reference of Skyrim.esm, in this bot's cell.
+    // "activate <hex reference> by other|me|npc|nobody [door state]": an activation of that reference of Skyrim.esm, in this bot's cell.
     // "by other" sends it in the name of the other player's character, as a game does when it sends on a door replayed on that player's copy.
     // "by me" sends it in this bot's own name; the game replays it on this bot's copy, and a game that sends the replay on sends it back here (see activationsback).
+    // "by npc" sends it in the name of the first NPC this bot owns; the game has a copy of it.
     // "by nobody" sends it in the name of an actor no game has, as a door opened by an NPC the receiving game has no copy of.
     // The server relays it to the players in that cell, the game among them.
     // "refenable <hex> on|off": as party leader, tells the server a script here switched that Skyrim.esm reference.
@@ -2497,17 +2740,23 @@ bool Bot::StepCommand(const Command& acCommand, const bool aFirstTick) noexcept
     if (name == "activate")
     {
         uint32_t refId = 0;
-        if (args.size() < 3 || !ParseHex(args[0], refId) || args[1] != "by" || (args[2] != "other" && args[2] != "me" && args[2] != "nobody"))
+        if (args.size() < 3 || !ParseHex(args[0], refId) || args[1] != "by" || (args[2] != "other" && args[2] != "me" && args[2] != "npc" && args[2] != "nobody"))
         {
-            spdlog::error("[script] activate needs a hex reference and 'by other', 'by me' or 'by nobody'");
+            spdlog::error("[script] activate needs a hex reference and 'by other', 'by me', 'by npc' or 'by nobody'");
             return true;
         }
         constexpr uint32_t cNobody = 0x7FFFFF0;
         uint32_t otherId = args[2] == "me" ? m_serverId : args[2] == "nobody" ? cNobody : kNoId;
         for (const auto& player : m_players)
-            if (otherId == kNoId && player.ServerId != m_serverId)
+            if (args[2] == "other" && otherId == kNoId && player.ServerId != m_serverId)
             {
                 otherId = player.ServerId;
+                break;
+            }
+        for (const auto& actor : m_actors)
+            if (args[2] == "npc" && otherId == kNoId && actor.OwnedByUs && !actor.IsPlayer && actor.ServerId != m_serverId)
+            {
+                otherId = actor.ServerId;
                 break;
             }
         if (otherId == kNoId)
@@ -2548,13 +2797,19 @@ bool Bot::StepCommand(const Command& acCommand, const bool aFirstTick) noexcept
             if (actor.IsPlayer)
                 continue;
             const std::string cRef = actor.Ref.ModId == m_skyrimModId && actor.Ref.BaseId ? fmt::format("{:X}", actor.Ref.BaseId) : std::string("none");
-            const std::string cAt = actor.PositionKnown ? fmt::format("{:.0f} {:.0f} {:.0f}", actor.Position.x, actor.Position.y, actor.Position.z) : std::string("unknown");
-            spdlog::info("[report] actor {:X} ref {} {} {} at {}", actor.ServerId, cRef, actor.Dead ? "dead" : "alive", actor.OwnedByUs ? "ours" : "theirs", cAt);
+            const glm::vec3 cPlace = actor.OwnedByUs ? m_npcPosition : actor.Position;
+            const std::string cAt = actor.PositionKnown || actor.OwnedByUs ? fmt::format("{:.0f} {:.0f} {:.0f}", cPlace.x, cPlace.y, cPlace.z) : std::string("unknown");
+            const std::string cHealth = actor.HealthKnown ? fmt::format("{:.0f}", actor.Health) : std::string("unknown");
+            spdlog::info("[report] actor {:X} ref {} {} {} at {} health {}", actor.ServerId, cRef, actor.Dead ? "dead" : "alive", actor.OwnedByUs ? "ours" : "theirs", cAt, cHealth);
         }
         for (const auto& [refId, state] : m_doorStates)
             spdlog::info("[report] door {:X} {}", refId, state == DoorState::kOpen || state == DoorState::kOpening ? "open" : "closed");
         for (const auto& [refId, locked] : m_locks)
             spdlog::info("[report] lock {:X} {}", refId, locked ? "locked" : "unlocked");
+        for (const auto& player : m_players)
+            if (player.ServerId != m_serverId)
+                spdlog::info("[report] player {:.0f} {:.0f} {:.0f}", player.Position.x, player.Position.y, player.Position.z);
+        spdlog::info("[report] me {:.0f} {:.0f} {:.0f}", m_position.x, m_position.y, m_position.z);
         spdlog::info("[report] end");
         return true;
     }
@@ -2925,6 +3180,23 @@ bool Bot::StepCommand(const Command& acCommand, const bool aFirstTick) noexcept
         return true;
     }
 
+    // "follower ref:<hex> on|off": say this bot's player gained or lost that follower, as a game does when her flag changes.
+    if (name == "follower" && args.size() > 1 && args[0].rfind("ref:", 0) == 0)
+    {
+        const KnownActor* pFound = ActorOfRef(args[0]);
+        if (!pFound)
+        {
+            spdlog::error("[script] follower: no actor of reference {} known", args[0].substr(4));
+            return true;
+        }
+        RequestFollowerState request{};
+        request.ServerId = pFound->ServerId;
+        request.IsFollower = args[1] == "on";
+        SendMsg(request);
+        spdlog::info("[script] actor {:X} (reference {:X}) reported as {} our follower", request.ServerId, pFound->Ref.BaseId & 0x00FFFFFF, request.IsFollower ? "now" : "no longer");
+        return true;
+    }
+
     // "party lead": if the server makes this bot the party leader (it joined first, after a server restart), it keeps
     // the leadership instead of leaving, so the host's game is a plain member -- what a game that does not lead does.
     if (name == "party" && !args.empty() && args[0] == "lead")
@@ -3045,18 +3317,22 @@ bool Bot::StepCommand(const Command& acCommand, const bool aFirstTick) noexcept
         request.WorldSpaceId = m_worldSpace;
         request.Position = ToNet(m_position);
         request.Rotation = ToNet(glm::vec2(0.f, m_yaw));
-        request.CurrentActorData.InitialActorValues.ActorValuesList[kHealth] = 100.f;
+        // "npc temp <base> dead": registered dead with no health left, as a creature killed while its game was offline.
+        const bool cDead = !args.empty() && args.back() == "dead";
+        request.CurrentActorData.InitialActorValues.ActorValuesList[kHealth] = cDead ? 0.f : 100.f;
         request.CurrentActorData.InitialActorValues.ActorMaxValuesList[kHealth] = 100.f;
-        request.CurrentActorData.IsDead = false;
+        request.CurrentActorData.IsDead = cDead;
         // "npc <reference> pick <hex base>": what a levelled spawn point rolled on this side. The other games then
         // conform their own actor at that point to it (live-levelled, 2026-10-03: a bear's point claimed as a goat).
+        // "npc <reference> base <hex base>": the base this side reports, as a real game reports the template of its pick.
         for (size_t i = 1; i + 1 < args.size(); ++i)
-            if (args[i] == "pick")
-            {
-                uint32_t pickId = 0;
-                if (ParseHex(args[i + 1], pickId))
-                    request.LeveledNpcPickId = Skyrim(pickId);
-            }
+        {
+            uint32_t hexId = 0;
+            if (args[i] == "pick" && ParseHex(args[i + 1], hexId))
+                request.LeveledNpcPickId = Skyrim(hexId);
+            else if (args[i] == "base" && ParseHex(args[i + 1], hexId))
+                request.FormId = Skyrim(hexId);
+        }
         SendMsg(request);
         m_npcPosition = m_position;
 
@@ -3090,10 +3366,66 @@ bool Bot::StepCommand(const Command& acCommand, const bool aFirstTick) noexcept
         return true;
     }
 
+    // "npchealth <value>": only the health of an NPC this bot owns, as an owner's value tick that gets there before its death.
+    if (name == "npchealth")
+    {
+        KnownActor* pNpc = nullptr;
+        for (auto& actor : m_actors)
+            if (actor.OwnedByUs && !actor.IsPlayer && actor.ServerId != m_serverId)
+                pNpc = &actor;
+        if (!pNpc)
+        {
+            spdlog::warn("[script] npchealth: this bot owns no NPC");
+            return true;
+        }
+        RequestActorValueChanges values{};
+        values.Id = pNpc->ServerId;
+        values.OwnershipEpoch = pNpc->OwnershipEpoch;
+        values.Values[kHealth] = arg(0, 0.f);
+        SendMsg(values);
+        spdlog::info("[script] NPC {:X} sent at health {:.0f}", pNpc->ServerId, arg(0, 0.f));
+        return true;
+    }
+
     // Hand an owned actor back, which starts the server's search for the next owner.
     // "release <server id|ref:<hex>|any> [at <x> <y> <z>]": with "at", the actor was last seen at that place in Skyrim's
     // worldspace, as a game says when it lets go of an actor it unloaded; the server then tells the other players to
     // move it there (NotifyActorTeleport).
+    // "say <voice file>": an NPC this bot owns speaks that line, which the server sends to the other players in range.
+    if (name == "say" && !args.empty())
+    {
+        for (const auto& actor : m_actors)
+        {
+            if (!actor.OwnedByUs || actor.IsPlayer || actor.ServerId == m_serverId)
+                continue;
+
+            DialogueRequest request{};
+            request.ServerId = actor.ServerId;
+            request.SoundFilename = args[0].c_str();
+            SendMsg(request);
+            return true;
+        }
+        spdlog::warn("[script] say: this bot owns no NPC to speak");
+        return true;
+    }
+
+    // "waypoint <hex form>": this player sets a waypoint on that world space or cell, which the server relays to the party.
+    if (name == "waypoint" && !args.empty())
+    {
+        uint32_t formId = 0;
+        if (!ParseHex(args[0], formId))
+        {
+            spdlog::error("[script] waypoint needs a hex form id, e.g. 'waypoint 133C6'");
+            return true;
+        }
+
+        RequestSetWaypoint request{};
+        request.Position = ToNet(m_position);
+        request.WorldSpaceFormID = Skyrim(formId);
+        SendMsg(request);
+        return true;
+    }
+
     if (name == "release")
     {
         KnownActor* pActor = nullptr;
@@ -3708,13 +4040,19 @@ std::optional<bool> Bot::Evaluate(const std::vector<std::string>& acArgs, std::s
 
     if (what == "objectmoves")
     {
-        // objectmoves <op> <n>: world-object moves the server relayed to this bot.
+        // objectmoves [<hex>] <op> <n>: world-object moves the server relayed to this bot. With a Skyrim.esm form id, only
+        // that object's: without it, anything rolling near the player can stand in for the object a script moved.
+        uint32_t objectId = 0;
+        const bool cOneObject = acArgs.size() >= 4 && ParseHex(acArgs[1], objectId);
+        const size_t cOp = cOneObject ? 2 : 1;
         float wanted = 0.f;
-        if (acArgs.size() < 3 || !ParseFloat(acArgs[2], wanted))
+        if (acArgs.size() < cOp + 2 || !ParseFloat(acArgs[cOp + 1], wanted))
             return std::nullopt;
-        const float value = static_cast<float>(m_objectMoves);
-        aOutWhy = fmt::format("{} world-object move(s) relayed", m_objectMoves);
-        const std::string& op = acArgs[1];
+        const auto cMoves = m_objectMovesOf.find(objectId);
+        const uint32_t cCount = !cOneObject ? m_objectMoves : cMoves != m_objectMovesOf.end() ? cMoves->second : 0;
+        const float value = static_cast<float>(cCount);
+        aOutWhy = cOneObject ? fmt::format("{} move(s) of {:X} relayed", cCount, objectId) : fmt::format("{} world-object move(s) relayed", cCount);
+        const std::string& op = acArgs[cOp];
         if (op == "==") return value == wanted;
         if (op == ">=") return value >= wanted;
         if (op == "<=") return value <= wanted;

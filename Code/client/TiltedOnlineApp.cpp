@@ -6,6 +6,7 @@
 #include <dinput.h>
 #include <WindowsHook.hpp>
 
+#include <PluginCalls.h>
 #include <World.h>
 #include <ScriptExtender.h>
 
@@ -105,6 +106,8 @@ TiltedOnlineApp::TiltedOnlineApp()
     auto logger = std::make_shared<spdlog::logger>("", spdlog::sinks_init_list{console, rotatingLogger});
     logger->set_pattern("%^[%Y-%m-%d %H:%M:%S.%e] [%l] [tid %t] %$ %v");
     spdlog::flush_every(std::chrono::seconds(1));
+    // A game that ends at once takes the last second of its log with it, unless what matters is already on disk.
+    logger->flush_on(spdlog::level::warn);
     set_default_logger(logger);
 
     spdlog::info("Skyrim Together client, build " BUILD_BRANCH "@" BUILD_COMMIT);
@@ -182,6 +185,7 @@ void TiltedOnlineApp::Update()
 #endif
 
     World::Get().Update();
+    RunPluginCalls();
 }
 
 bool TiltedOnlineApp::Attach()

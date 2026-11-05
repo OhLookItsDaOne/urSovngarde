@@ -1,4 +1,6 @@
 #include <Games/References.h>
+#include <atomic>
+#include <intrin.h>
 #include <Games/Skyrim/EquipManager.h>
 #include <AI/AIProcess.h>
 #include <Misc/MiddleProcess.h>
@@ -22,6 +24,7 @@
 #include <Events/HitEvent.h>
 #ifdef SKYRIMVR
 #include <Games/Skyrim/VRBodySync.h>
+#include <Services/ActorValueService.h>
 #include <Services/CalendarService.h>
 #endif
 #include <Events/RemoveSpellEvent.h>
@@ -36,6 +39,7 @@
 #include <Forms/TESRace.h>
 
 #include <Effects/ValueModifierEffect.h>
+#include <Forms/MagicItem.h>
 
 #include <Games/Skyrim/Misc/InventoryEntry.h>
 #include <Games/Skyrim/ExtraData/ExtraCount.h>
@@ -201,6 +205,30 @@ void* s_gameSetPosition = nullptr;
 
 #ifdef SKYRIMVR
 constexpr size_t kSetPositionSlot = 0xAB;
+// TESForm::Save, which writes the form flags a load restores.
+constexpr size_t kSaveSlot = 0xE;
+
+using TCharacterSave = void(TESForm*, BGSSaveFormBuffer*);
+TCharacterSave* s_realCharacterSave = nullptr;
+
+// A hidden reference goes into the save as enabled, so a save made while connected keeps that reference for a game without the connection.
+// The flag is taken off for the write only: nothing loads or moves.
+void HookCharacterSave(TESForm* apThis, BGSSaveFormBuffer* apBuffer)
+{
+    auto* pActor = Cast<Actor>(apThis);
+    const ActorExtension* pExtension = pActor ? pActor->GetExtension() : nullptr;
+    const bool cHidden = pExtension && pExtension->IsHiddenHere() && apThis->IsDisabled();
+    if (cHidden)
+        apThis->flags &= ~TESForm::DISABLED;
+
+    s_realCharacterSave(apThis, apBuffer);
+
+    if (cHidden)
+    {
+        apThis->flags |= TESForm::DISABLED;
+        spdlog::info("SaveGuard: reference {:X}, hidden here, written to the save as enabled", apThis->formID);
+    }
+}
 
 TiltedPhoques::Initializer s_gameSetPositionCapture(
     []()
@@ -210,7 +238,19 @@ TiltedPhoques::Initializer s_gameSetPositionCapture(
         {
             s_characterVtable = pVtable;
             s_gameSetPosition = pVtable[kSetPositionSlot];
+
+            // The slot and not the function: a plugin that detours the function then finds it as the game has it.
+            auto* const pSlot = const_cast<void**>(&pVtable[kSaveSlot]);
+            DWORD oldProtect = 0;
+            if (*pSlot && VirtualProtect(pSlot, sizeof(void*), PAGE_READWRITE, &oldProtect))
+            {
+                s_realCharacterSave = reinterpret_cast<TCharacterSave*>(*pSlot);
+                *pSlot = reinterpret_cast<void*>(&HookCharacterSave);
+                VirtualProtect(pSlot, sizeof(void*), oldProtect, &oldProtect);
+            }
         }
+        if (!s_realCharacterSave)
+            spdlog::error("SaveGuard: Character's vtable not found; another player's follower is shown on this game's own reference");
     });
 
 // Once: whether a plugin replaced Character::SetPosition, and which one.
@@ -748,6 +788,37 @@ Factions Actor::GetFactions() const noexcept
     return result;
 }
 
+bool Actor::IsPlayerFollower() const noexcept
+{
+    if (!IsPlayerTeammate() || IsTemporary())
+        return false;
+
+    constexpr uint32_t cCurrentFollowerFaction = 0x5C84E;
+
+    // A rank below zero is not a member: followers' own records list the faction at -1 until they are recruited.
+    if (const auto* pChanges = Cast<ExtraFactionChanges>(extraData.GetByType(ExtraDataType::Faction)))
+    {
+        for (auto i = 0u; i < pChanges->entries.length; ++i)
+        {
+            const auto& cEntry = pChanges->entries[i];
+            if (cEntry.faction && cEntry.faction->formID == cCurrentFollowerFaction)
+                return cEntry.rank >= 0;
+        }
+    }
+
+    if (const auto* pNpc = Cast<TESNPC>(baseForm))
+    {
+        const auto& cFactions = pNpc->actorData.factions;
+        for (auto i = 0u; i < cFactions.length; ++i)
+        {
+            if (cFactions[i].faction && cFactions[i].faction->formID == cCurrentFollowerFaction)
+                return cFactions[i].rank >= 0;
+        }
+    }
+
+    return false;
+}
+
 ActorValues Actor::GetEssentialActorValues() const noexcept
 {
     ActorValues actorValues;
@@ -999,20 +1070,18 @@ bool Actor::IsDead() const noexcept
     return s_pIsDead(this);
 }
 
-bool Actor::IsDragon() const noexcept
+bool Actor::HasLoadedProcess() const noexcept
 {
-    const ActorExtension* pExtension = const_cast<Actor*>(this)->GetExtension();
-    if (BehaviorVar::IsDragon(pExtension->GraphDescriptorHash))
-        return true;
+    return currentProcess && currentProcess->middleProcess;
+}
 
-    // A modded dragon behavior is only recognized after the actor is sent to the server, which then gives it too small a range.
-    // The race keyword ActorTypeDragon is known right away.
-    // TESRace: BGSKeywordForm at +0x70 (keywords +0x78, count +0x80).
+// TESRace: BGSKeywordForm at +0x70 (keywords +0x78, count +0x80).
+static bool RaceHasKeyword(const TESRace* apRace, const uint32_t aKeywordId) noexcept
+{
     constexpr uint8_t cRaceFormType = 14;
     constexpr uint8_t cKeywordFormType = 4;
-    constexpr uint32_t cActorTypeDragon = 0x35D59;
 
-    const TESForm* pRace = reinterpret_cast<const TESForm*>(race);
+    const TESForm* pRace = reinterpret_cast<const TESForm*>(apRace);
     if (!pRace || static_cast<uint8_t>(pRace->formType) != cRaceFormType)
         return false;
 
@@ -1024,11 +1093,38 @@ bool Actor::IsDragon() const noexcept
     for (uint32_t i = 0; i < count; ++i)
     {
         const TESForm* pKeyword = ppKeywords[i];
-        if (pKeyword && static_cast<uint8_t>(pKeyword->formType) == cKeywordFormType && pKeyword->formID == cActorTypeDragon)
+        if (pKeyword && static_cast<uint8_t>(pKeyword->formType) == cKeywordFormType && pKeyword->formID == aKeywordId)
             return true;
     }
 
     return false;
+}
+
+bool Actor::IsDragon() const noexcept
+{
+    const ActorExtension* pExtension = const_cast<Actor*>(this)->GetExtension();
+    if (BehaviorVar::IsDragon(pExtension->GraphDescriptorHash))
+        return true;
+
+    // A modded dragon behavior is only recognized after the actor is sent to the server, which then gives it too small a range.
+    // The race keyword ActorTypeDragon is known right away.
+    constexpr uint32_t cActorTypeDragon = 0x35D59;
+    return RaceHasKeyword(race, cActorTypeDragon);
+}
+
+bool Actor::IsSaveGuarded() noexcept
+{
+#ifdef SKYRIMVR
+    return s_realCharacterSave != nullptr;
+#else
+    return false;
+#endif
+}
+
+bool Actor::IsPersonRace(const TESRace* apRace) noexcept
+{
+    constexpr uint32_t cActorTypeNPC = 0x13794;
+    return RaceHasKeyword(apRace, cActorTypeNPC);
 }
 
 #ifdef SKYRIMVR
@@ -1109,10 +1205,12 @@ void Actor::Respawn() noexcept
 {
 #ifdef SKYRIMVR
     // Resurrect(resetInventory, attach3D) = SE 36331, by address like KillImpl above.
+    // No Reset here: it unloads the actor, and a copy announced again that way comes back dead.
     TP_THIS_FUNCTION(TResurrect, void, Actor, bool aResetInventory, bool aAttach3D);
     POINTER_SKYRIMSE(TResurrect, s_resurrect, 0, 36331);
     TiltedPhoques::ThisCall(s_resurrect, this, false, true);
-    Reset();
+    if (const ActorExtension* pExtension = GetExtension(); pExtension && pExtension->IsRemote())
+        ActorValueService::WatchCopyRevival(formID);
     return;
 #endif
     Resurrect(false);
@@ -1216,6 +1314,10 @@ bool TP_MAKE_THISCALL(HookSpawnActorInWorld, Actor)
 TP_THIS_FUNCTION(TDamageActor, bool, Actor, float aDamage, Actor* apHitter, bool aKillMove);
 static TDamageActor* RealDamageActor = nullptr;
 
+// The spell whose effect is doing its damage right now, or 0.
+// On another player's copy that is the hit sent to their game; on this player, from their copy, it is only seen.
+static thread_local uint32_t s_damagingSpell = 0;
+
 #ifdef SKYRIMVR
 TP_THIS_FUNCTION(THitTarget, void, Actor, Actor* apTarget, void* apProjectile, bool aIsOffhand);
 static THitTarget* RealHitTarget = nullptr;
@@ -1270,7 +1372,10 @@ bool TP_MAKE_THISCALL(HookDamageActor, Actor, float aDamage, Actor* apHitter, bo
             aDamage *= GameplayFormulas::PartyEnemyDamage(cPlayersNearby);
     }
 
-    float realDamage = GameplayFormulas::CalculateRealDamage(apThis, aDamage, aKillMove);
+    // Every hit of this player on another player, by weapon or by spell, is as strong as an NPC's hit on a player.
+    const ActorExtension* pExPlayerHitter = apHitter ? apHitter->GetExtension() : nullptr;
+    const bool cOnOtherPlayer = pExHittee->IsRemotePlayer() && pExPlayerHitter && pExPlayerHitter->IsLocalPlayer();
+    float realDamage = GameplayFormulas::CalculateRealDamage(apThis, aDamage, aKillMove, cOnOtherPlayer);
 
     float currentHealth = apThis->GetActorValue(ActorValueInfo::kHealth);
     bool wouldKill = (currentHealth - realDamage) <= 0.f;
@@ -1285,12 +1390,12 @@ bool TP_MAKE_THISCALL(HookDamageActor, Actor, float aDamage, Actor* apHitter, bo
         }
 
         // Another player's copy hitting this player here.
-        // Their arrows and spells are replayed here, and the replayed projectile's hit decides (the defender's own copy).
-        // Their melee is their game's report, weighed by the defender's rule; their weapon body touching this player here is not a hit.
+        // Their arrows are replayed here, and the replayed arrow's hit decides (the defender's own copy).
+        // Their melee and spells are their game's report; their weapon body touching this player here is not a hit, and their spell's effect here is only seen.
         // Summed per second, because a concentration spell hits each frame and a resting blade touches each second.
         if (const ActorExtension* pHitterExtension = apHitter ? apHitter->GetExtension() : nullptr; pHitterExtension && pHitterExtension->IsRemotePlayer())
         {
-            const bool cRanged = PvpProjectiles::Recent(apHitter->formID);
+            const bool cRanged = !s_damagingSpell && PvpProjectiles::Recent(apHitter->formID, glm::distance(glm::vec3(apHitter->position), glm::vec3(apThis->position)));
             static float s_damage[2]{};
             static uint32_t s_hits[2]{};
             static std::chrono::steady_clock::time_point s_since[2]{std::chrono::steady_clock::now(), std::chrono::steady_clock::now()};
@@ -1301,13 +1406,21 @@ bool TP_MAKE_THISCALL(HookDamageActor, Actor, float aDamage, Actor* apHitter, bo
             {
                 spdlog::info("PvP: player copy {:X} hit this player here: {} hit(s), {:.0f} damage since the last such line {} ms ago; {}", apHitter->formID, s_hits[cKind],
                              s_damage[cKind], std::chrono::duration_cast<std::chrono::milliseconds>(cNow - s_since[cKind]).count(),
-                             cRanged ? "taken, its projectile decides here" : "not taken, melee is its own game's report");
+                             cRanged ? "taken, its projectile decides here" : "not taken, melee and spells are its own game's report");
                 s_damage[cKind] = 0.f;
                 s_hits[cKind] = 0;
                 s_since[cKind] = cNow;
             }
             if (!cRanged)
                 return false;
+
+            // This game decides that the arrow hit, and its shooter's game says how hard: the copy has none of its owner's skill or perks.
+            if (const float cReported = realDamage > 0.f ? PvpProjectiles::ArrowHitHere(apHitter->formID, realDamage) : 0.f; cReported > 0.f)
+            {
+                spdlog::info("PvP: an arrow from copy {:X} takes {:.0f}, its shooter's number; {:.0f} here", apHitter->formID, cReported, realDamage);
+                aDamage *= cReported / realDamage;
+                realDamage = cReported;
+            }
         }
 
         World::Get().GetRunner().Trigger(HealthChangeEvent(apThis->formID, -realDamage));
@@ -1325,14 +1438,15 @@ bool TP_MAKE_THISCALL(HookDamageActor, Actor, float aDamage, Actor* apHitter, bo
             // The other player's sword is a body in this world (VRBodySync), and PLANCK counts a swing into any such body as a hit.
             // PLANCK stores where the hit landed in the player (+0x6BC, its VR offset) right before this runs.
             // A hit where his weapon body was just touched landed on the weapon, so it is not sent.
+            // A spell's hit is no swing: that point is then an older swing's.
             const auto* pLastHit = reinterpret_cast<const float*>(reinterpret_cast<const uint8_t*>(apHitter) + 0x6BC);
-            if (VRBodySync::IsWeaponTouchAt(glm::vec3{pLastHit[0], pLastHit[1], pLastHit[2]}))
+            if (!s_damagingSpell && VRBodySync::IsWeaponTouchAt(glm::vec3{pLastHit[0], pLastHit[1], pLastHit[2]}))
             {
                 spdlog::info("PvP: a hit of {:.0f} on remote player {:X}'s weapon, not on {:X}; not sent", realDamage, apThis->formID, apThis->formID);
                 return false;
             }
             // The blade stop: the blade that landed it is drawn resting on his, so on neither screen does it reach him.
-            if (VRBodySync::IsBladeStoppedAt(apThis->formID, glm::vec3{pLastHit[0], pLastHit[1], pLastHit[2]}))
+            if (!s_damagingSpell && VRBodySync::IsBladeStoppedAt(apThis->formID, glm::vec3{pLastHit[0], pLastHit[1], pLastHit[2]}))
             {
                 spdlog::info("PvP: a hit of {:.0f} on remote player {:X} by a blade resting on his; not sent", realDamage, apThis->formID);
                 return false;
@@ -1340,7 +1454,26 @@ bool TP_MAKE_THISCALL(HookDamageActor, Actor, float aDamage, Actor* apHitter, bo
 #endif
             if (realDamage >= 1.f)
                 spdlog::info("PvP: hit remote player {:X} for {:.0f}", apThis->formID, realDamage);
-            World::Get().GetRunner().Trigger(HealthChangeEvent(apThis->formID, -realDamage));
+
+            // Summed per second, because a beam hits each frame.
+            if (s_damagingSpell)
+            {
+                static float s_damage = 0.f;
+                static uint32_t s_hits = 0;
+                static std::chrono::steady_clock::time_point s_since = std::chrono::steady_clock::now();
+                s_damage += realDamage;
+                ++s_hits;
+                if (const auto cNow = std::chrono::steady_clock::now(); cNow - s_since >= std::chrono::seconds(1))
+                {
+                    spdlog::info("PvP: spell {:X} hits on remote player {:X}: {} hit(s), {:.0f} damage in {} ms", s_damagingSpell, apThis->formID, s_hits, s_damage,
+                                 std::chrono::duration_cast<std::chrono::milliseconds>(cNow - s_since).count());
+                    s_damage = 0.f;
+                    s_hits = 0;
+                    s_since = cNow;
+                }
+            }
+
+            World::Get().GetRunner().Trigger(HealthChangeEvent(apThis->formID, -realDamage, s_damagingSpell != 0));
         }
 
         // Never "killed", or the game would put the copy down here on its stale health while the real player is fine.
@@ -1364,8 +1497,9 @@ bool TP_MAKE_THISCALL(HookDamageActor, Actor, float aDamage, Actor* apHitter, bo
                 spdlog::info("Death sync: this player's blow on NPC copy {:X} sent to its owner; the copy is kept at 1 health until its owner says it died", apThis->formID);
                 // A protected NPC dies only by its own game's player, so its owner's game only puts it down.
                 // This game asks for it instead, and kills it once it owns it, with this player as the killer.
+                // Hits arrive on job threads, and the claim reads the world, so it runs with the world's update.
                 if (apThis->IsProtected() && !apThis->IsEssential())
-                    World::Get().GetCharacterService().ClaimForKillingBlow(apThis);
+                    World::Get().GetRunner().Queue([cFormId = apThis->formID] { World::Get().GetCharacterService().ClaimForKillingBlow(cFormId); });
                 return false;
             }
             return TiltedPhoques::ThisCall(RealDamageActor, apThis, aDamage, apHitter, aKillMove);
@@ -1411,7 +1545,9 @@ void TP_MAKE_THISCALL(HookApplyActorEffect, ActiveEffect, Actor* apTarget, float
         }
     }
 
-    return TiltedPhoques::ThisCall(RealApplyActorEffect, apThis, apTarget, aEffectValue, unk1);
+    s_damagingSpell = MagicTarget::IsCast(apThis->pSpell) ? apThis->pSpell->formID : 0;
+    TiltedPhoques::ThisCall(RealApplyActorEffect, apThis, apTarget, aEffectValue, unk1);
+    s_damagingSpell = 0;
 }
 
 TP_THIS_FUNCTION(TRegenAttributes, void*, Actor, int aId, float regenValue);
@@ -1643,11 +1779,14 @@ float TP_MAKE_THISCALL(HookSpeakSoundFunction, Actor, const char* apName, uint32
     return TiltedPhoques::ThisCall(RealSpeakSoundFunction, apThis, apName, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
 }
 
-float Actor::SpeakSound(const char* pFile)
+float Actor::SpeakSound(const char* pFile, uint32_t* apSoundHandle)
 {
     uint32_t handle[3]{};
     handle[0] = -1;
-    return TiltedPhoques::ThisCall(RealSpeakSoundFunction, this, pFile, handle, 0, 0x32, 0, 0, 0, 0, 0, 0, 0, 1, 1);
+    const float cAnswer = TiltedPhoques::ThisCall(RealSpeakSoundFunction, this, pFile, handle, 0, 0x32, 0, 0, 0, 0, 0, 0, 0, 1, 1);
+    if (apSoundHandle)
+        std::memcpy(apSoundHandle, handle, sizeof(handle));
+    return cAnswer;
 }
 
 char TP_MAKE_THISCALL(HookActorProcess, Actor, float aDeltaTime)
@@ -1663,6 +1802,19 @@ char TP_MAKE_THISCALL(HookActorProcess, Actor, float aDeltaTime)
     // So is an NPC copy knocked to the floor: its get-up runs here, once its ragdoll has come to rest.
     const ActorExtension* pExtension = apThis->GetExtension();
     const bool cKnockedNpc = pExtension && !pExtension->IsRemotePlayer() && apThis->actorState.IsKnockedDown();
+
+    // TEMPORARY: whether this hook ever sees an actor, or only the address of a local smart pointer, and whether it ever skips.
+    static std::atomic<uint32_t> s_calls{0};
+    static std::atomic<uint32_t> s_onStack{0};
+    static std::atomic<uint32_t> s_actors{0};
+    static std::atomic<uint32_t> s_skips{0};
+    const auto cFromHere = reinterpret_cast<intptr_t>(apThis) - reinterpret_cast<intptr_t>(&pExtension);
+    s_onStack += cFromHere > -0x10000 && cFromHere < 0x10000 ? 1 : 0;
+    s_actors += pExtension ? 1 : 0;
+    s_skips += pExtension && pExtension->IsRemote() && !apThis->actorState.IsDeadOrDying() && !apThis->actorState.IsBleedingOut() && !cKnockedNpc ? 1 : 0;
+    if (const uint32_t cCalls = ++s_calls; cCalls <= 5 || cCalls % 1000 == 0)
+        spdlog::info("ActorProcessDiag: of {} calls, {} had their argument on the stack, {} saw an actor, {} skipped it", cCalls, s_onStack.load(), s_actors.load(), s_skips.load());
+
     if (pExtension && pExtension->IsRemote() && !apThis->actorState.IsDeadOrDying() && !apThis->actorState.IsBleedingOut() && !cKnockedNpc)
     {
         if (apThis->currentProcess)
@@ -1736,6 +1888,87 @@ void TP_MAKE_THISCALL(HookStealAlarm, Actor, TESObjectREFR* apRef, TESForm* apOb
         spdlog::warn("Crime alarm walked a null actor and was skipped: offender {:X}, witness {:X}, object {:X}, count {} of {}. The blow still landed, the crime was not reported.",
                      apThis ? apThis->formID : 0, apRef ? apRef->formID : 0, apObject ? apObject->formID : 0, aNum, aTotal);
 }
+
+#ifdef SKYRIMVR
+// Whether a second has passed since this said true last. The game's movement jobs run on several threads.
+static bool SecondPassed(std::atomic<uint64_t>& aNext) noexcept
+{
+    const uint64_t cNow = GetTickCount64();
+    uint64_t next = aNext.load(std::memory_order_relaxed);
+    return cNow >= next && aNext.compare_exchange_strong(next, cNow + 1000);
+}
+
+// NiPoint3::GetPolarAngle (VR 0x140C97030) wraps its angle into range in a loop that a NaN never leaves, so an infinite vector would hang the game for good.
+constexpr uintptr_t kGetPolarAngle = 0xC97030;
+using TGetPolarAngle = float(const NiPoint3*);
+static TGetPolarAngle* RealGetPolarAngle = nullptr;
+
+static float HookGetPolarAngle(const NiPoint3* apThis)
+{
+    if (std::isfinite(apThis->x) && std::isfinite(apThis->y))
+        return RealGetPolarAngle(apThis);
+
+    static std::atomic<uint64_t> s_next{0};
+    if (SecondPassed(s_next))
+        spdlog::warn("NonFinite: the angle of ({}, {}) asked for at {:X}; 0 given, as the game would never answer", apThis->x, apThis->y,
+                     reinterpret_cast<uintptr_t>(_ReturnAddress()));
+    return 0.f;
+}
+
+// A movement planner's target. Kinds 2 and 3 are a place in the world.
+struct MovementTarget
+{
+    int32_t Kind;
+    NiPoint3 Position;
+};
+
+// The direction from an actor to its movement target (VR 0x141189710).
+constexpr uintptr_t kMovementDirection = 0x1189710;
+using TMovementDirection = void(const MovementTarget*, const NiPoint3*, const NiPoint3*, float, NiPoint3*);
+static TMovementDirection* RealMovementDirection = nullptr;
+
+static void HookMovementDirection(const MovementTarget* apTarget, const NiPoint3* apPosition, const NiPoint3* apAngles, float aHeight, NiPoint3* apDirection)
+{
+    const auto cFinite = [](const NiPoint3& acPoint) { return std::isfinite(acPoint.x) && std::isfinite(acPoint.y) && std::isfinite(acPoint.z); };
+    const bool cPlace = apTarget->Kind == 2 || apTarget->Kind == 3;
+    if (!cPlace || (cFinite(apTarget->Position) && cFinite(*apPosition)))
+    {
+        RealMovementDirection(apTarget, apPosition, apAngles, aHeight, apDirection);
+        return;
+    }
+
+    // What the game answers for a target it cannot use: no turn.
+    apDirection->x = 0.f;
+    apDirection->y = 0.f;
+    apDirection->z = apAngles->z;
+
+    static std::atomic<uint64_t> s_next{0};
+    if (SecondPassed(s_next))
+        spdlog::warn("NonFinite: a movement target at ({}, {}, {}) for the actor at ({}, {}, {}), facing ({:.2f}, {:.2f}), not followed", apTarget->Position.x,
+                     apTarget->Position.y, apTarget->Position.z, apPosition->x, apPosition->y, apPosition->z, apAngles->x, apAngles->z);
+}
+
+static void HookNonFiniteGuards() noexcept
+{
+    const auto cExe = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+
+    if (const auto cPolarAngle = cExe + kGetPolarAngle; *reinterpret_cast<const uint32_t*>(cPolarAngle) == 0x58EC8348)
+    {
+        RealGetPolarAngle = reinterpret_cast<TGetPolarAngle*>(cPolarAngle);
+        TP_HOOK(&RealGetPolarAngle, HookGetPolarAngle);
+    }
+    else
+        spdlog::error("Actor: GetPolarAngle is not the expected code; an infinite vector can hang the game there");
+
+    if (const auto cDirection = cExe + kMovementDirection; *reinterpret_cast<const uint32_t*>(cDirection) == 0x245C8948)
+    {
+        RealMovementDirection = reinterpret_cast<TMovementDirection*>(cDirection);
+        TP_HOOK(&RealMovementDirection, HookMovementDirection);
+    }
+    else
+        spdlog::error("Actor: the movement direction function is not the expected code; an infinite target is not caught there");
+}
+#endif
 
 static TiltedPhoques::Initializer s_actorHooks(
     []()
@@ -1812,6 +2045,7 @@ static TiltedPhoques::Initializer s_actorHooks(
 #ifdef SKYRIMVR
         TP_HOOK(&RealHitTarget, HookHitTarget);
         TP_HOOK(&RealCanBeKilledBy, HookCanBeKilledBy);
+        HookNonFiniteGuards();
 #endif
         TP_HOOK(&RealApplyActorEffect, HookApplyActorEffect);
         TP_HOOK(&RealRegenAttributes, HookRegenAttributes);

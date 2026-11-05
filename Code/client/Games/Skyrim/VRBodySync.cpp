@@ -9,6 +9,7 @@
 #include <PlayerCharacter.h>
 #include <BSAnimationGraphManager.h>
 #include <Components/BGSBipedObjectForm.h>
+#include <Forms/TESObjectCELL.h>
 #include <Forms/TESObjectARMO.h>
 #include <NetImmerse/NiNode.h>
 #include <NetImmerse/NiTransform.h>
@@ -18,6 +19,7 @@
 #include <PerfScope.h>
 
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <tlhelp32.h>
 #include <cwctype>
@@ -348,21 +350,38 @@ int16_t ReadEntryIndex(const uint8_t* apEntry, int aField) noexcept
     return *reinterpret_cast<const int16_t*>(apEntry + kBoneEntryIndices + aField * sizeof(int16_t));
 }
 
+// Whether following one index field up from an entry reaches an index within that many hops.
+bool LeadsUpTo(const BoneArrayInfo& acInfo, const uint8_t* apEntry, const int16_t aAncestor, const int aField, const int aHops) noexcept
+{
+    for (int hop = 0; hop < aHops; ++hop)
+    {
+        const int16_t cParent = ReadEntryIndex(apEntry, aField);
+        if (cParent == aAncestor)
+            return true;
+        if (cParent < 0 || static_cast<uint32_t>(cParent) >= acInfo.Count)
+            return false;
+        apEntry = acInfo.pArray + cParent * kBoneEntrySize;
+    }
+    return false;
+}
+
 BoneArrayInfo ResolveBoneArray(void* apRoot, const BoneNodes& acNodes, bool aLog) noexcept
 {
     BoneArrayInfo info;
     info.pArray = GetBoneArray(FindByRtti(apRoot, "BSFlattenedBoneTree"), info.Count);
 
     // The parent index is the one that maps the left forearm to the upper arm and the hand to the forearm.
+    // Some skeletons put twist bones between them, so a longer way up is tried only when no field does it directly.
     const uint8_t* pUpper = FindBoneEntry(info.pArray, info.Count, acNodes[VRPose::kLeftUpperArm]);
     const uint8_t* pFore = FindBoneEntry(info.pArray, info.Count, acNodes[VRPose::kLeftForearm]);
     const uint8_t* pHand = FindBoneEntry(info.pArray, info.Count, acNodes[VRPose::kLeftHand]);
     if (pUpper && pFore && pHand)
     {
         const auto indexOf = [&info](const uint8_t* apEntry) { return static_cast<int16_t>((apEntry - info.pArray) / kBoneEntrySize); };
-        for (int field = 0; field < 4 && info.ParentField < 0; ++field)
-            if (ReadEntryIndex(pFore, field) == indexOf(pUpper) && ReadEntryIndex(pHand, field) == indexOf(pFore))
-                info.ParentField = field;
+        for (int hops = 1; hops <= 3 && info.ParentField < 0; ++hops)
+            for (int field = 0; field < 4 && info.ParentField < 0; ++field)
+                if (LeadsUpTo(info, pFore, indexOf(pUpper), field, hops) && LeadsUpTo(info, pHand, indexOf(pFore), field, hops))
+                    info.ParentField = field;
     }
 
     if (!info.pArray || info.ParentField < 0)
@@ -491,6 +510,10 @@ struct RemotePose
     std::array<bool, 2> WeaponHeld{};
     std::array<glm::quat, 2> WeaponRotation{};
     std::array<glm::vec3, 2> WeaponOffset{};
+    // Where the owner's held spells go (see VRPose::HasSpellAim).
+    // Not kept, so a copy's spell goes back to following its body when the owner stops sending.
+    bool HasSpellAim = false;
+    float SpellAim[2]{};
 };
 
 std::shared_mutex s_posesLock;
@@ -1664,8 +1687,22 @@ struct WeaponBody
     bool Listening = false;    // our contact listener is on it
     uint8_t GameMaxAngularVelocity = 0; // the game's limit, put back when the body is let go
 };
-// Per copy and side (left, right). Touched only from the renderer's frame end.
+// Per copy and side (left, right). Touched only from the renderer's frame end and the start of a frame, both on the main thread.
 std::unordered_map<uint64_t, WeaponBody> s_weaponBodies;
+std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> s_weaponBodyRetryAt;
+
+// A weapon body found at the frame end, waiting for the start of the next frame.
+struct PendingWeaponBody
+{
+    uint64_t Key = 0;
+    uint32_t FormId = 0;
+    uint32_t Side = 0;
+    WeaponBody Body{};
+    void* pWorld = nullptr;
+    alignas(16) float Position[4]{};
+    alignas(16) float Rotation[4]{};
+};
+TiltedPhoques::Vector<PendingWeaponBody> s_pendingWeaponBodies;
 
 // What the weapon bodies touch, from Havok's own contact callbacks on each of them.
 // Havok raises them during its step, possibly on worker threads, so they only record what touched what.
@@ -2110,11 +2147,10 @@ void UpdateWeaponBodies(const uint32_t aFormId, Actor* apActor, const Rig& acRig
                 continue;
             }
             // A failed add is tried again after five seconds, not every frame: the checks below are slow ones.
-            static std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> s_retryAt;
             const auto cNowAdd = std::chrono::steady_clock::now();
-            if (const auto retry = s_retryAt.find(key); retry != s_retryAt.end() && cNowAdd < retry->second)
+            if (const auto retry = s_weaponBodyRetryAt.find(key); retry != s_weaponBodyRetryAt.end() && cNowAdd < retry->second)
                 continue;
-            s_retryAt[key] = cNowAdd + std::chrono::seconds(5);
+            s_weaponBodyRetryAt[key] = cNowAdd + std::chrono::seconds(5);
             void* pBhkWorld = BhkWorldOf(pCopyWorld);
             if (!pBhkWorld)
             {
@@ -2137,42 +2173,17 @@ void UpdateWeaponBodies(const uint32_t aFormId, Actor* apActor, const Rig& acRig
                 continue;
             }
             WeaponBodyTarget(body, havokScale, position, rotation);
-            {
-                WorldWriteLock lock(pBhkWorld);
-                if (!lock.Held() || At<void*>(pHavok, kHkWorldOffset) != nullptr)
-                    continue;
-                static_cast<NiRefObject*>(body.pNode)->IncRef();
-                static_cast<NiRefObject*>(body.pWrapper)->IncRef();
-                s_setPositionAndRotation.Get()(pHavok, position, rotation);
-                // The game caps its weapon body at 31.6 rad/s, slower than a swung sword, so the keyframe never catches up.
-                // HIGGS gives its own weapon bodies 500 rad/s; so does this while the body is ours.
-                body.GameMaxAngularVelocity = pHavok[kMaxAngularVelocityOffset];
-                POINTER_SKYRIMSE(THkRealToUFloat8, s_toUFloat8, 9000010, 9000010);
-                if (s_toUFloat8.Get())
-                {
-                    constexpr float cMaxAngularVelocity = 500.f;
-                    s_toUFloat8.Get()(pHavok[kMaxAngularVelocityOffset], cMaxAngularVelocity);
-                }
-                s_addEntity.Get()(pCopyWorld, pHavok, 1); // HK_ENTITY_ACTIVATION_DO_ACTIVATE
-                if (s_addContactListener.Get())
-                {
-                    s_addContactListener.Get()(pHavok, &s_contactListener);
-                    body.Listening = true;
-                }
-            }
-            body.Seen = true;
-            s_weaponBodies[key] = body;
-            s_retryAt.erase(key);
-            const uint32_t filter = At<uint32_t>(pHavok, kFilterInfoOffset);
-            const char* pName = GetName(pNode);
-            const char* pClass = RttiNameOf(body.pWrapper);
-            // Read back from where Havok keeps it: 0 here says the transform is read at the right offset.
-            const float placedOff = glm::length(BodyPosition(pHavok, havokScale) - glm::vec3{position[0], position[1], position[2]} / havokScale);
-            if (ShouldLogWeaponBody(key, true))
-                spdlog::info("VRWeaponBody: actor {:X} {} weapon '{}' ({}) is a body in the world now: layer {}, group {}, motion type {}; placed, it reads {:.1f} units from where it was put; "
-                             "hkpRigidBody at {}",
-                             aFormId, side ? "right" : "left", pName && IsReadable(pName, 1) ? pName : "?", pClass ? pClass : "?", filter & 0x7F, filter >> 16,
-                             At<uint8_t>(pHavok, kMotionTypeOffset), placedOff, fmt::ptr(pHavok));
+            PendingWeaponBody pending{};
+            pending.Key = key;
+            pending.FormId = aFormId;
+            pending.Side = side;
+            pending.Body = body;
+            pending.pWorld = pCopyWorld;
+            std::copy_n(position, 4, pending.Position);
+            std::copy_n(rotation, 4, pending.Rotation);
+            static_cast<NiRefObject*>(body.pNode)->IncRef();
+            static_cast<NiRefObject*>(body.pWrapper)->IncRef();
+            s_pendingWeaponBodies.push_back(pending);
             continue;
         }
 
@@ -2199,6 +2210,77 @@ void UpdateWeaponBodies(const uint32_t aFormId, Actor* apActor, const Rig& acRig
                          side ? "right" : "left", glm::length(BodyPosition(body.pHavok, havokScale) - wanted), centre.x, centre.y, centre.z);
         }
     }
+}
+
+// Puts the weapon bodies of the last frame in the world, at the start of a frame, when no job is running.
+// PLANCK answers an add with an SKSE task, and adding at the frame end could not get its lock: a running task that reads the world waits for this thread's world lock.
+// A job can change the weapon after the frame end, so each is looked at again here, and the references taken then are the ones the body keeps.
+void AddPendingBodies() noexcept
+{
+    if (s_pendingWeaponBodies.empty())
+        return;
+
+    POINTER_SKYRIMSE(float, s_havokScale, 231896, 231896);
+    POINTER_SKYRIMSE(THkpWorldAddEntity, s_addEntity, 9000001, 9000001);
+    POINTER_SKYRIMSE(THkpEntitySetPositionAndRotation, s_setPositionAndRotation, 9000002, 9000002);
+    POINTER_SKYRIMSE(THkpEntityContactListener, s_addContactListener, 60094, 60094);
+    POINTER_SKYRIMSE(THkRealToUFloat8, s_toUFloat8, 9000010, 9000010);
+    const float havokScale = *s_havokScale.Get();
+
+    for (PendingWeaponBody& pending : s_pendingWeaponBodies)
+    {
+        WeaponBody& body = pending.Body;
+        uint8_t* pHavok = body.pHavok;
+        void* pCollision = At<void*>(body.pNode, kCollisionObjectOffset);
+        const bool cSameBody = pCollision && At<void*>(pCollision, kCollisionBodyOffset) == body.pWrapper;
+        bool added = false;
+        if (cSameBody && BhkWorldOf(pending.pWorld) == body.pBhkWorld)
+        {
+            WorldWriteLock lock(body.pBhkWorld);
+            if (!lock.Held() || At<void*>(pHavok, kHkWorldOffset) != nullptr)
+            {
+                static_cast<NiRefObject*>(body.pWrapper)->DecRef();
+                static_cast<NiRefObject*>(body.pNode)->DecRef();
+                continue;
+            }
+            s_setPositionAndRotation.Get()(pHavok, pending.Position, pending.Rotation);
+            // The game caps its weapon body at 31.6 rad/s, slower than a swung sword, so the keyframe never catches up.
+            // HIGGS gives its own weapon bodies 500 rad/s; so does this while the body is ours.
+            body.GameMaxAngularVelocity = pHavok[kMaxAngularVelocityOffset];
+            if (s_toUFloat8.Get())
+            {
+                constexpr float cMaxAngularVelocity = 500.f;
+                s_toUFloat8.Get()(pHavok[kMaxAngularVelocityOffset], cMaxAngularVelocity);
+            }
+            s_addEntity.Get()(pending.pWorld, pHavok, 1); // HK_ENTITY_ACTIVATION_DO_ACTIVATE
+            if (s_addContactListener.Get())
+            {
+                s_addContactListener.Get()(pHavok, &s_contactListener);
+                body.Listening = true;
+            }
+            added = true;
+        }
+        if (!added)
+        {
+            static_cast<NiRefObject*>(body.pWrapper)->DecRef();
+            static_cast<NiRefObject*>(body.pNode)->DecRef();
+            continue;
+        }
+        body.Seen = true;
+        s_weaponBodies[pending.Key] = body;
+        s_weaponBodyRetryAt.erase(pending.Key);
+        const uint32_t filter = At<uint32_t>(pHavok, kFilterInfoOffset);
+        const char* pName = GetName(body.pNode);
+        const char* pClass = RttiNameOf(body.pWrapper);
+        // Read back from where Havok keeps it: 0 here says the transform is read at the right offset.
+        const float placedOff = glm::length(BodyPosition(pHavok, havokScale) - glm::vec3{pending.Position[0], pending.Position[1], pending.Position[2]} / havokScale);
+        if (ShouldLogWeaponBody(pending.Key, true))
+            spdlog::info("VRWeaponBody: actor {:X} {} weapon '{}' ({}) is a body in the world now: layer {}, group {}, motion type {}; placed, it reads {:.1f} units from where it was put; "
+                         "hkpRigidBody at {}",
+                         pending.FormId, pending.Side ? "right" : "left", pName && IsReadable(pName, 1) ? pName : "?", pClass ? pClass : "?", filter & 0x7F, filter >> 16,
+                         At<uint8_t>(pHavok, kMotionTypeOffset), placedOff, fmt::ptr(pHavok));
+    }
+    s_pendingWeaponBodies.clear();
 }
 
 // Right before Havok steps a world, wakes every weapon body in it and keyframes it to where its weapon was last drawn.
@@ -2789,7 +2871,16 @@ void ReleaseUnseenWeaponBodies() noexcept
 TiltedPhoques::Vector<uint32_t> s_touchCandidates;
 
 // When the owner's bones last moved a dead body here (ApplyRemotePoses). See IsRemoteBodyGrabbedHere.
+// Written at the frame's end and read from the world's update, which can be different threads.
+std::mutex s_bodyPosedLock;
 std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> s_bodyPosedByOwnerAt;
+
+std::optional<std::chrono::steady_clock::time_point> BodyPosedAt(const uint32_t aFormId) noexcept
+{
+    std::scoped_lock lock(s_bodyPosedLock);
+    const auto cPosed = s_bodyPosedByOwnerAt.find(aFormId);
+    return cPosed != s_bodyPosedByOwnerAt.end() ? std::optional(cPosed->second) : std::nullopt;
+}
 
 // Where PlaceCorpse last put each copy's body, and how its moves went.
 struct PlacedCorpse
@@ -2800,6 +2891,9 @@ struct PlacedCorpse
     glm::vec3 WantedAt{};
     float ApartBeforeMove = -1.f; // how far it lay when last moved for this place; -1: not moved yet
     uint32_t Fruitless = 0;
+    uint32_t Streak = 0; // moves in a row
+    bool SaidInView = false;
+    std::chrono::steady_clock::time_point PosedAt{}; // the end of the owner's last drag this has seen
 };
 std::unordered_map<uint32_t, PlacedCorpse> s_placedCorpses;
 
@@ -2932,6 +3026,36 @@ std::vector<CopyBlade> s_copyBlades;
 
 namespace VRBodySync
 {
+void AddPendingWeaponBodies() noexcept
+{
+    AddPendingBodies();
+}
+
+bool BodyPelvisHeight(Actor* apActor, float& aHeight, glm::vec3& aPelvis) noexcept
+{
+    // A body a hand is on, in this game or its owner's, is held up, not standing.
+    constexpr auto cPosedLately = std::chrono::seconds(5);
+    constexpr float cHandReach = 150.f;
+    if (const auto cPosedAt = BodyPosedAt(apActor->formID); cPosedAt && std::chrono::steady_clock::now() - *cPosedAt < cPosedLately)
+        return false;
+
+    void* pRoot = apActor->GetNiNode();
+    void* pPelvis = pRoot ? FindShallowest(pRoot, "NPC Pelvis [Pelv]") : nullptr;
+    void* pLeft = pPelvis ? FindShallowest(pRoot, "NPC L Foot [Lft ]") : nullptr;
+    void* pRight = pPelvis ? FindShallowest(pRoot, "NPC R Foot [Rft ]") : nullptr;
+    if (!pLeft || !pRight)
+        return false;
+
+    const NiPoint3& pelvis = At<NiTransform>(pPelvis, kWorldOffset).translate;
+    aPelvis = glm::vec3{pelvis.x, pelvis.y, pelvis.z};
+    for (uint8_t side = 0; side < 2; ++side)
+        if (glm::vec3 hand{}; LocalHandPosition(side, hand) && glm::distance(hand, aPelvis) < cHandReach)
+            return false;
+
+    aHeight = pelvis.z - std::min(At<NiTransform>(pLeft, kWorldOffset).translate.z, At<NiTransform>(pRight, kWorldOffset).translate.z);
+    return true;
+}
+
 // The blade stop, after HandParries below; OnFrameEnd calls these.
 std::array<BladeExtent, 2> MeasureCopyBlades(const Rig& acRig) noexcept;
 void RecordCopyBlades(uint32_t aFormId, Actor* apActor, const std::array<BladeExtent, 2>& acExtents) noexcept;
@@ -3344,7 +3468,10 @@ void OnFrameEnd() noexcept
             if (!pActor->actorState.IsDead())
                 continue;
             isBody = true;
-            s_bodyPosedByOwnerAt[formId] = now;
+            {
+                std::scoped_lock lock(s_bodyPosedLock);
+                s_bodyPosedByOwnerAt[formId] = now;
+            }
 
             // The other half of the sender's line, so one log shows the whole chain.
             static std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> s_nextSaid;
@@ -3525,6 +3652,10 @@ void OnFrameEnd() noexcept
                 const glm::vec3 rootAt = ToGlm(rootWorld.translate);
                 const glm::vec3 copyLeft = inverseRoot * (ToGlm(rig.Bones[VRPose::kLeftHand].World().translate) - rootAt);
                 const glm::vec3 copyRight = inverseRoot * (ToGlm(rig.Bones[VRPose::kRightHand].World().translate) - rootAt);
+                // How high the body is drawn against where the reference stands: a lying or sinking copy shows here.
+                spdlog::info("VRBodySync: actor {:X} body -- reference z {:.0f}, 3D root z {:.0f}, head {:.0f} above the root, knock state {}", formId, pActor->position.z, rootAt.z,
+                             rig.Bones[VRPose::kHead].pNode || rig.Bones[VRPose::kHead].pEntry ? ToGlm(rig.Bones[VRPose::kHead].World().translate).z - rootAt.z : 0.f,
+                             (pActor->actorState.flags1 >> 25) & 0x7);
                 spdlog::info("VRBodySync: actor {:X} hands -- owner L({:.1f}, {:.1f}, {:.1f}) R({:.1f}, {:.1f}, {:.1f}); copy L({:.1f}, {:.1f}, {:.1f}) R({:.1f}, {:.1f}, {:.1f})", formId,
                              pose.HandOffsets[0].x, pose.HandOffsets[0].y, pose.HandOffsets[0].z, pose.HandOffsets[1].x, pose.HandOffsets[1].y, pose.HandOffsets[1].z, copyLeft.x, copyLeft.y,
                              copyLeft.z, copyRight.x, copyRight.y, copyRight.z);
@@ -4149,6 +4280,7 @@ void PulseClashHaptics(const uint8_t aSide) noexcept
 void ForgetCorpse(const uint32_t aFormId) noexcept
 {
     s_placedCorpses.erase(aFormId);
+    std::scoped_lock lock(s_bodyPosedLock);
     s_bodyPosedByOwnerAt.erase(aFormId);
 }
 
@@ -4163,12 +4295,23 @@ bool PlaceCorpse(Actor* apActor, const glm::vec3& acWanted) noexcept
     const auto cNow = std::chrono::steady_clock::now();
 
     // Not while its owner is moving it: its bones arrive (ApplyRemotePoses) and place it, and moving the ragdoll too would fight them.
-    // Once the bones stop, the ragdoll is put where the owner left the body.
-    if (const auto cPosed = s_bodyPosedByOwnerAt.find(apActor->formID);
-        cPosed != s_bodyPosedByOwnerAt.end() && cNow - cPosed->second < std::chrono::milliseconds(1500))
-        return false;
+    // The ragdoll stays behind meanwhile, so the moment the bones stop it is put where the owner left the body, or it would flash back.
+    const auto cPosedAt = BodyPosedAt(apActor->formID);
+    if (cPosedAt)
+    {
+        std::shared_lock lock(s_posesLock);
+        if (s_poses.find(apActor->formID) != s_poses.end())
+            return false;
+    }
 
     auto& placed = s_placedCorpses[apActor->formID];
+    // A drag that just ended starts over: the moves before it say nothing about this one.
+    if (cPosedAt && *cPosedAt != placed.PosedAt)
+    {
+        placed.PosedAt = *cPosedAt;
+        placed.MovedAt = {};
+        placed.Streak = 0;
+    }
     if (cNow < placed.NextAt)
         return false;
     placed.NextAt = cNow + std::chrono::milliseconds(500);
@@ -4180,9 +4323,6 @@ bool PlaceCorpse(Actor* apActor, const glm::vec3& acWanted) noexcept
     void* pRoot = apActor->GetNiNode();
     if (!(cScale > 0.f) || !pRoot || !s_setPositionAndRotation.Get())
         return false;
-
-    // TEMPORARY: the walk and the move are timed for the "moved there" line, against the 20-47 ms frames seen with it in play.
-    const auto cWalkStart = std::chrono::steady_clock::now();
 
     // The ragdoll's bodies: a live tree, so only null checks, no IsReadable (it costs milliseconds per call here).
     // Only dynamic bodies in a world count; the first found from the root is the ragdoll's root (pelvis or centre of mass).
@@ -4233,7 +4373,25 @@ bool PlaceCorpse(Actor* apActor, const glm::vec3& acWanted) noexcept
         placed.WantedAt = acWanted;
         placed.ApartBeforeMove = -1.f;
         placed.Fruitless = 0;
+        placed.SaidInView = false;
     }
+    // A player would see the move as a jump, so it waits until they see neither end of it.
+    // Not a body whose owner's bones just stopped: the player sees it where its owner left it, and its ragdoll must be there too.
+    const bool cJustPosed = cPosedAt && cNow - *cPosedAt < std::chrono::seconds(10);
+    if (!cJustPosed && HeadsetTransform() && (IsInView(cRagdollRoot) || IsInView(acWanted)))
+    {
+        if (!placed.SaidInView)
+            spdlog::info("CorpseDiag: {:X}'s ragdoll lies {:.0f} units from where its owner's corpse is, in the player's view; it waits until the player looks away",
+                         apActor->formID, cApart);
+        placed.SaidInView = true;
+        return false;
+    }
+    // Each move is a jump on screen, so a body that keeps moving is not pulled after it twice a second.
+    // Moves in a row wait 1, 2, 4, 8, then 16 s, and 30 s without one start over.
+    if (cNow - placed.MovedAt >= std::chrono::seconds(30))
+        placed.Streak = 0;
+    else if (cNow - placed.MovedAt < std::chrono::seconds(1ll << std::min(placed.Streak - 1, 4u)))
+        return false;
     // A move that did not bring it nearer means the body settles back as far off, and repeating it makes the corpse jump.
     // After two such moves it is left where it lies until the owner's corpse moves.
     if (placed.ApartBeforeMove >= 0.f && cApart >= placed.ApartBeforeMove - 16.f && ++placed.Fruitless >= 2)
@@ -4249,11 +4407,9 @@ bool PlaceCorpse(Actor* apActor, const glm::vec3& acWanted) noexcept
     const glm::vec3 cOffset{acWanted.x - cRagdollRoot.x, acWanted.y - cRagdollRoot.y, acWanted.z + cLift - cRagdollRoot.z};
     const glm::vec3 cHavokOffset = cOffset * cScale;
 
-    const auto cMoveStart = std::chrono::steady_clock::now();
     WorldWriteLock lock(BhkWorldOf(pHkpWorld));
     if (!lock.Held())
         return false;
-    const auto cLockedAt = std::chrono::steady_clock::now();
     uint32_t moved = 0;
     for (uint8_t* pBody : bodies)
     {
@@ -4275,10 +4431,11 @@ bool PlaceCorpse(Actor* apActor, const glm::vec3& acWanted) noexcept
     placed.ApartBeforeMove = cApart;
     placed.MovedAt = cNow;
     placed.SayAfter = true;
-    const auto cMoveEnd = std::chrono::steady_clock::now();
-    spdlog::info("CorpseDiag: {:X}'s ragdoll lay {:.0f} units from where its owner's corpse is; moved there ({} bodies; walk {:.2f} ms, lock {:.2f} ms, move {:.2f} ms)",
-                 apActor->formID, cApart, moved, std::chrono::duration<double, std::milli>(cMoveStart - cWalkStart).count(),
-                 std::chrono::duration<double, std::milli>(cLockedAt - cMoveStart).count(), std::chrono::duration<double, std::milli>(cMoveEnd - cLockedAt).count());
+    ++placed.Streak;
+    spdlog::info("CorpseDiag: {:X}'s ragdoll lay {:.0f} units from where its owner's corpse is; moved there ({} bodies); "
+                 "from ({:.0f}, {:.0f}, {:.0f}) to ({:.0f}, {:.0f}, {:.0f}); its cell {:X}, attached {}",
+                 apActor->formID, cApart, moved, cRagdollRoot.x, cRagdollRoot.y, cRagdollRoot.z, acWanted.x, acWanted.y, acWanted.z,
+                 apActor->parentCell ? apActor->parentCell->formID : 0, apActor->parentCell && apActor->parentCell->IsAttached());
     return moved > 0;
 }
 
@@ -4678,6 +4835,18 @@ void CaptureWeapons(PlayerCharacter* apPlayer, void* apRoot, const BoneNodes& ac
             aOutPose.WeaponOffset[side][axis] = offset[side][axis];
 }
 
+// What LastLocalPose sends again, without the fields sent only when they change, which the receiver keeps, or only while a spell is held.
+static VRPose s_lastLocalPose{};
+static void* s_lastLocalRoot = nullptr;
+
+bool LastLocalPose(PlayerCharacter* apPlayer, VRPose& aOutPose) noexcept
+{
+    if (!s_lastLocalPose.HasData || apPlayer->GetNiNode() == s_lastLocalRoot)
+        return false;
+    aOutPose = s_lastLocalPose;
+    return true;
+}
+
 // The arrow the local player holds in a hand, as CaptureArrowHold last found it.
 std::mutex s_arrowHoldLock;
 ArrowHold s_arrowHold;
@@ -4733,6 +4902,44 @@ ArrowHold LocalArrowHold() noexcept
 {
     std::scoped_lock lock(s_arrowHoldLock);
     return s_arrowHold;
+}
+
+// Where this player's held spell went last.
+// A held spell turns to its hand each frame, so one that has not for this long has ended.
+constexpr auto kSpellAimLasts = std::chrono::milliseconds(400);
+
+std::mutex s_spellAimLock;
+float s_spellAim[2]{};
+std::chrono::steady_clock::time_point s_spellAimAt{};
+
+void NoteSpellAim(const float aZAngle, const float aXAngle) noexcept
+{
+    if (!std::isfinite(aZAngle) || !std::isfinite(aXAngle))
+        return;
+    std::scoped_lock lock(s_spellAimLock);
+    s_spellAim[0] = aZAngle;
+    s_spellAim[1] = aXAngle;
+    s_spellAimAt = std::chrono::steady_clock::now();
+}
+
+// The pose's spell aim, from the last moments.
+void FillSpellAim(VRPose& aOutPose, const std::chrono::steady_clock::time_point aNow) noexcept
+{
+    std::scoped_lock lock(s_spellAimLock);
+    aOutPose.HasSpellAim = s_spellAimAt != std::chrono::steady_clock::time_point{} && aNow - s_spellAimAt <= kSpellAimLasts;
+    aOutPose.SpellAim[0] = s_spellAim[0];
+    aOutPose.SpellAim[1] = s_spellAim[1];
+}
+
+bool CopySpellAim(const uint32_t aFormId, float& aZAngle, float& aXAngle) noexcept
+{
+    std::shared_lock lock(s_posesLock);
+    const auto it = s_poses.find(aFormId);
+    if (it == s_poses.end() || !it->second.HasSpellAim)
+        return false;
+    aZAngle = it->second.SpellAim[0];
+    aXAngle = it->second.SpellAim[1];
+    return true;
 }
 
 bool CaptureLocalPose(PlayerCharacter* apPlayer, VRPose& aOutPose, float& aOutHeading) noexcept
@@ -4917,6 +5124,8 @@ bool CaptureLocalPose(PlayerCharacter* apPlayer, VRPose& aOutPose, float& aOutHe
         }
     }
 
+    FillSpellAim(aOutPose, now);
+
     // Hips: where the pelvis sits relative to the 3D root, in root space.
     // Crouching, leaning and hip sway move it without changing any rotation.
     // Sent always: VRIK stands the body some way back from the headset, and the receiver uses the horizontal part to match.
@@ -4984,6 +5193,12 @@ bool CaptureLocalPose(PlayerCharacter* apPlayer, VRPose& aOutPose, float& aOutHe
     }
 
     aOutPose.HasData = true;
+    s_lastLocalRoot = pRoot;
+    s_lastLocalPose = aOutPose;
+    s_lastLocalPose.HasWeapons = false;
+    s_lastLocalPose.HasFingers = false;
+    s_lastLocalPose.HasScale = false;
+    s_lastLocalPose.HasSpellAim = false;
     return true;
 }
 
@@ -5054,9 +5269,12 @@ bool IsRemoteBodyGrabbedHere(Actor* apActor, const glm::vec3& acOwnerPosition) n
     if (glm::distance(acOwnerPosition, watch.OwnerLast) >= 4.f)
         watch.OwnerMovedAt = now;
     watch.OwnerLast = acOwnerPosition;
-    const auto posed = s_bodyPosedByOwnerAt.find(apActor->formID);
+    // Our own placing of it (PlaceCorpse) counts too: it settles from there, and no hand here moved it.
+    const auto placed = s_placedCorpses.find(apActor->formID);
+    const auto cPosedAt = BodyPosedAt(apActor->formID);
     const bool cOwnerMovesIt = now - watch.OwnerMovedAt < std::chrono::milliseconds(1500) ||
-                               (posed != s_bodyPosedByOwnerAt.end() && now - posed->second < std::chrono::milliseconds(1500));
+                               (cPosedAt && now - *cPosedAt < std::chrono::milliseconds(1500)) ||
+                               (placed != s_placedCorpses.end() && now - placed->second.MovedAt < std::chrono::milliseconds(1500));
     if (cOwnerMovesIt)
     {
         watch.LastMoved = {};
@@ -5342,6 +5560,13 @@ void SetRemotePose(Actor* apActor, const VRPose& acPose) noexcept
             pose.WeaponRotation[side] = acPose.WeaponRotation[side];
             pose.WeaponOffset[side] = glm::vec3{acPose.WeaponOffset[side][0], acPose.WeaponOffset[side][1], acPose.WeaponOffset[side][2]};
         }
+    }
+
+    pose.HasSpellAim = acPose.HasSpellAim;
+    if (acPose.HasSpellAim)
+    {
+        pose.SpellAim[0] = acPose.SpellAim[0];
+        pose.SpellAim[1] = acPose.SpellAim[1];
     }
 }
 

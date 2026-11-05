@@ -1,0 +1,28 @@
+# Another player's concentration spell on this player: the beam replayed here is only seen.
+#
+#   python Tools\VR\live-check.py live-pvp-concentration
+#
+# The bot's "cast" sends Flames (spell 12FCD) and turns its copy to the player, which a real caster's copy is not: in play the beam here touches the player only now and then.
+# Its damage comes from the caster's game, as small hits with no tick.
+# This checks the defender's half only, and says nothing of what a real second game does.
+# A run counts only when (REQUIRE): the copy cast it and the beam reached the player.
+log live pvp concentration
+waitfor connected 45
+expect known me
+waitfor known other 40
+wait 3
+infront 150
+wait 3
+wait 2
+log CHECK player mark
+wait 1
+cast 12FCD
+wait 4
+cast 12FCD stop
+wait 2
+log REQUIRE logged Remote spell cast: caster \w+, spell 12FCD
+log REQUIRE logged PvP: player copy \w+ hit this player here
+log CHECK player dropped 0
+log CHECK game alive
+log done
+stop

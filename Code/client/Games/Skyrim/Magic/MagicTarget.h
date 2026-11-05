@@ -63,6 +63,9 @@ struct MagicTarget
 
     virtual ~MagicTarget();
 
+    // A spell or a staff's enchantment, as opposed to what a hand or a weapon delivers, which travels as the hit.
+    static bool IsCast(MagicItem* apSpell) noexcept;
+
     Actor* GetTargetAsActor();
 
     bool AddTarget(AddTargetData& arData, float aCasterPerkFactor, bool aApplyStaminaPerkBonus) noexcept;

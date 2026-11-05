@@ -52,6 +52,11 @@ public:
     bool GetMenuOpen(const BSFixedString& acName) const;
     void CloseAllMenus();
     void DebugLogAllMenus();
+#ifdef SKYRIMVR
+    //! Queues a message and handles the queue at once, as the main thread does in a paused frame.
+    //! Only on the main thread at the start of a frame, while none of the frame's jobs run.
+    void RunMessageNow(void* apQueue, const BSFixedString& acMenu, UIMessage::UI_MESSAGE_TYPE aType, void* apData);
+#endif
 
     IMenu* FindMenuByName(const BSFixedString& acName);
     BSFixedString* LookupMenuNameByInstance(IMenu* apMenu);
@@ -109,6 +114,9 @@ bool IsMenuOpenUnpaused(const BSFixedString& acName) noexcept;
 
 // Whether one of those menus is currently open without pausing, whatever the current server setting.
 bool IsOptionalMenuOpenUnpaused() noexcept;
+
+// Whether a menu that pauses by its own flag is open, whether or not it was unpaused for play online.
+bool IsPausingMenuOpen() noexcept;
 
 // Called by the main loop on the main thread at the start of each frame: records that thread and counts the frame.
 void UnpausedMenusOnMainLoop() noexcept;
