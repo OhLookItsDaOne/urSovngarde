@@ -433,15 +433,6 @@ void TESObjectREFR::SetMotionType(const int32_t aMotionType) const noexcept
     s_pSetMotionType(this, aMotionType, true);
 }
 
-void TESObjectREFR::Enable() const noexcept
-{
-    using ObjectReference = TESObjectREFR;
-
-    PAPYRUS_FUNCTION(void, ObjectReference, Enable, bool);
-
-    s_pEnable(this, true);
-}
-
 // Skyrim: MoveTo() can fail, causing the object to be deleted
 void TESObjectREFR::MoveTo(TESObjectCELL* apCell, const NiPoint3& acPosition) const noexcept
 {
@@ -998,11 +989,14 @@ void TESObjectREFR::AddOrRemoveItem(const Inventory::Entry& arEntry, bool aIsSet
         spdlog::debug("Adding item {:X}, count {}", pObject->formID, arEntry.Count);
         AddObjectToContainer(pObject, pExtraDataList, arEntry.Count, nullptr);
 
-        // TODO: check Actor cast first?
-        if (isWorn)
-            EquipManager::Get()->Equip(Cast<Actor>(this), pObject, nullptr, arEntry.Count, DefaultObjectManager::Get().rightEquipSlot, false, true, false, false);
-        else if (isWornLeft)
-            EquipManager::Get()->Equip(Cast<Actor>(this), pObject, nullptr, arEntry.Count, DefaultObjectManager::Get().leftEquipSlot, false, true, false, false);
+        // The game's equip code reads the actor's AI process, and an actor not loaded here has none.
+        if (Actor* pWearer = Cast<Actor>(this); pWearer && pWearer->HasLoadedProcess())
+        {
+            if (isWorn)
+                EquipManager::Get()->Equip(pWearer, pObject, nullptr, arEntry.Count, DefaultObjectManager::Get().rightEquipSlot, false, true, false, false);
+            else if (isWornLeft)
+                EquipManager::Get()->Equip(pWearer, pObject, nullptr, arEntry.Count, DefaultObjectManager::Get().leftEquipSlot, false, true, false, false);
+        }
     }
     else if (arEntry.Count < 0)
     {
@@ -1129,7 +1123,7 @@ bool TP_MAKE_THISCALL(HookActivate, TESObjectREFR, TESObjectREFR* apActivator, u
 
     // A copy of another game's actor never goes through a load door on its own here: its owner's game reports where it went.
     // Otherwise this game's AI takes the copy to a cell its owner never entered, where it is removed and spawned again.
-    // The owner's own use of the door is replayed with TESObjectREFR::Activate, which calls the game's function directly (live-door-copy-load).
+    // The owner's own use of the door is replayed with TESObjectREFR::Activate, and stops here too when the game carries it out (live-door-copy-replay).
     const ActorExtension* pActivatorExtension = pActivator ? pActivator->GetExtension() : nullptr;
     if (pActivatorExtension && pActivatorExtension->IsRemote() && apThis->baseForm && apThis->baseForm->formType == FormType::Door &&
         apThis->extraData.Contains(ExtraDataType::Teleport))
@@ -1141,6 +1135,17 @@ bool TP_MAKE_THISCALL(HookActivate, TESObjectREFR, TESObjectREFR* apActivator, u
         if (cNowMs - lastMs >= 5000 && s_lastRefusalLogMs.compare_exchange_strong(lastMs, cNowMs))
             spdlog::info("DoorCopy: load door {:X} not used by {:X}, a copy of another game's actor; its owner's game reports where it goes", apThis->formID, pActivator->formID);
         return false;
+    }
+
+    // A living copy of another player's follower is not this player's to talk to, recruit or steal from: her own game runs her.
+    if (Actor* pTarget = apActivator == PlayerCharacter::Get() ? Cast<Actor>(apThis) : nullptr)
+    {
+        const ActorExtension* pTargetExtension = pTarget->GetExtension();
+        if (pTargetExtension && pTargetExtension->IsFollowerCopy() && !pTarget->IsDead())
+        {
+            spdlog::info("Follower: copy {:X} is another player's follower; activating her does nothing here", pTarget->formID);
+            return false;
+        }
     }
 
     // Exclude books from activation since only reading them removes them from the cell
@@ -1191,6 +1196,7 @@ TP_MAKE_THISCALL(HookRemoveInventoryItem, TESObjectREFR, BSPointerHandle<TESObje
     // The player dropping an item from the inventory comes here, as RemoveItem with the "dropping" reason.
     // It does not pass through Actor::DropObject, the only other place drops are announced to the other players.
     const bool cOwnDrop = aReason == ITEM_REMOVE_REASON::kDropping && !ScopedInventoryOverride::IsOverriden() && apThis == PlayerCharacter::Get();
+    bool takenOffBody = false;
     Inventory::Entry dropped{};
 
     if (!ScopedInventoryOverride::IsOverriden())
@@ -1219,6 +1225,10 @@ TP_MAKE_THISCALL(HookRemoveInventoryItem, TESObjectREFR, BSPointerHandle<TESObje
             event.ServerId = cTaken->ServerId;
             event.OwnershipEpoch = cTaken->OwnershipEpoch;
             World::Get().GetRunner().Trigger(std::move(event));
+            takenOffBody = true;
+            // What lies in the world is worn by nobody.
+            dropped.ExtraWorn = false;
+            dropped.ExtraWornLeft = false;
         }
         else
             QueueReferenceInventoryChange(apThis, InventoryChangeEvent(apThis->formID, std::move(item)), apMoveToRef);
@@ -1228,7 +1238,7 @@ TP_MAKE_THISCALL(HookRemoveInventoryItem, TESObjectREFR, BSPointerHandle<TESObje
 
     ScopedEquipOverride _;
 
-    if (!cOwnDrop)
+    if (!cOwnDrop && !takenOffBody)
         return TiltedPhoques::ThisCall(RealRemoveInventoryItem, apThis, apResult, apItem, aCount, aReason, apExtraList, apMoveToRef, apDropLoc, apRotate);
 
     // Held while the game drops it, so a DropObject hook on the way neither re-announces the drop nor queues the change twice.

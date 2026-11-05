@@ -167,7 +167,7 @@ namespace
 // Another player's game dresses her in its own save's outfit and sends that as a re-equip; it is ignored here.
 bool IsMyFollower(const Actor* apActor, const uint32_t aServerId, const char* apWhat) noexcept
 {
-    if (!apActor || !apActor->IsPlayerTeammate() || apActor->IsTemporary())
+    if (!apActor || !apActor->IsPlayerFollower())
         return false;
     static std::chrono::steady_clock::time_point s_nextNote{};
     const auto now = std::chrono::steady_clock::now();
@@ -262,6 +262,14 @@ void InventoryService::OnNotifyEquipmentChanges(const NotifyEquipmentChanges& ac
         return;
     if (IsMyFollower(pActor, acMessage.ServerId, "an equipment change"))
         return;
+
+    // The game's equip code reads the actor's AI process, and an actor not loaded here has none.
+    // What it wears comes with its next assignment.
+    if (!pActor->HasLoadedProcess())
+    {
+        spdlog::info("Equipment sync: remote actor {:X} has no AI process here; change not applied", pActor->formID);
+        return;
+    }
 
     // No item: an equipment snapshot (see RunEquipmentSnapshotUpdates).
     if (!acMessage.ItemId)
@@ -379,6 +387,9 @@ void InventoryService::RunWeaponStateUpdates() noexcept
     {
         const auto& formIdComponent = view.get<FormIdComponent>(entity);
         Actor* const pActor = Cast<Actor>(TESForm::GetById(formIdComponent.Id));
+        // Gone from the game, for instance in a load, before discovery has noticed.
+        if (!pActor)
+            continue;
         auto& localComponent = view.get<LocalComponent>(entity);
 
         bool isWeaponDrawn = pActor->actorState.IsWeaponDrawn();

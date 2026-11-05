@@ -25,8 +25,10 @@ CHECKS = [
      'you dragged a dead body and its bones went out'),
     ('Corpse dragging, receiving', r'posing body [0-9A-F]+ from its owner',
      'you saw a body the other player was moving'),
-    ('Spell damage to a player',   r'PvP: spell [0-9A-F]+ hit remote player',
-     'a damaging spell of yours was sent as damage rather than left to their game'),
+    ('Spell damage to a player',   r'PvP: spell [0-9A-F]+ hits on remote player',
+     'a damaging spell of yours landed on the other player here and was sent as damage'),
+    ('Spell damage from a player', r'PvP: spell hits from player',
+     "the other player's spell took your health"),
     ('Melee damage to a player',   r'PvP: hit remote player',
      'a sword or arrow of yours was sent as damage'),
     ('NPC health corrected',       r'health corrected from .* to its owner',
@@ -389,9 +391,14 @@ def copies(lines):
     list_full = sum(1 for _f, _w, _i, _h, why in freed_held if 'full' in why)
 
     if freed_held:
-        verdict = ('FORCED: %d copies were freed while something still held a handle to them. That is exactly '
-                   'the use-after-free condition the wait exists to prevent, so the protection is only partly '
-                   'engaged -- kMaxWaiting or kMaxWaitMs is what needs raising.' % len(freed_held))
+        parts = []
+        if waited_out:
+            parts.append("%d still had more than the game's own two holds after the wait. Those objects live on until "
+                         'the other holders let go; what holds them is not known yet.' % waited_out)
+        if list_full:
+            parts.append('%d were deleted at once because the waiting list was full, which is what the wait exists to '
+                         'prevent, so kMaxWaiting needs raising.' % list_full)
+        verdict = ' '.join(parts)
     elif legacy:
         verdict = ('this log predates the per-outcome lines (2026-09-28), so it cannot say which copies were '
                    'freed while still held. Read it as unknown, not as clean.')
@@ -419,9 +426,8 @@ def copies(lines):
     if freed_held:
         waits = [int(w) for _f, w, _imm, _h, _why in freed_held if w]
         handles = [int(h) for _f, _w, _imm, h, _why in freed_held]
-        out.append(('Copies freed while still held',
-                    '%d of them, %d handle(s) outstanding on average%s. Each one is a pointer the game still '
-                    'holds to memory that has just been released.'
+        out.append(('Copies deleted while something else held them',
+                    '%d of them, %d handle(s) outstanding on average%s.'
                     % (len(freed_held), sum(handles) / float(len(handles)),
                        ', waited %d to %d ms' % (min(waits), max(waits)) if waits else '')))
 

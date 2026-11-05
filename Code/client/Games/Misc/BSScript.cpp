@@ -3,12 +3,15 @@
 
 #include <World.h>
 #include <Events/PapyrusFunctionRegisterEvent.h>
+#include <Events/ScriptDoorEvent.h>
 #include <Forms/TESForm.h>
 #include <Misc/GameVM.h>
 #include <Actor.h>
 #include <PlayerCharacter.h>
 #include <Games/ActorExtension.h>
 #include <Games/PapyrusFunctions.h>
+#include <Games/Memory.h>
+#include <Structs/DoorState.h>
 
 TP_THIS_FUNCTION(TRegisterPapyrusFunction, void, BSScript::IVirtualMachine, NativeFunction*);
 TP_THIS_FUNCTION(TBindEverythingToScript, void, BSScript::IVirtualMachine*);
@@ -18,6 +21,23 @@ TRegisterPapyrusFunction* RealRegisterPapyrusFunction = nullptr;
 TBindEverythingToScript* RealBindEverythingToScript = nullptr;
 TCompareVariables* RealCompareVariables = nullptr;
 
+using TSetOpen = void(__fastcall*)(BSScript::IVirtualMachine*, uint32_t, TESObjectREFR*, bool);
+static TSetOpen RealSetOpen = nullptr;
+
+// What the game's scripts reach when they call SetOpen.
+// TESObjectREFR::SetOpen calls the game's own function, so a door set from another game does not come through here.
+static void __fastcall HookSetOpen(BSScript::IVirtualMachine* apVirtualMachine, uint32_t aStackId, TESObjectREFR* apRef, bool aOpen)
+{
+    const bool cDoor = apRef && apRef->baseForm && apRef->baseForm->formType == FormType::Door;
+    const uint8_t cBefore = cDoor ? static_cast<uint8_t>(apRef->GetOpenState()) : static_cast<uint8_t>(DoorState::kNone);
+
+    RealSetOpen(apVirtualMachine, aStackId, apRef, aOpen);
+
+    // A door already there, or on its way, did not move.
+    if (DoorState::AfterActivation(cBefore) == (aOpen ? DoorState::kOpen : DoorState::kClosed) && !apRef->IsTemporary() && !IsProcessExiting())
+        World::Get().GetRunner().Trigger(ScriptDoorEvent(apRef->formID, aOpen));
+}
+
 void TP_MAKE_THISCALL(HookRegisterPapyrusFunction, BSScript::IVirtualMachine, NativeFunction* apFunction)
 {
     auto& runner = World::Get().GetRunner();
@@ -26,8 +46,58 @@ void TP_MAKE_THISCALL(HookRegisterPapyrusFunction, BSScript::IVirtualMachine, Na
 
     runner.Trigger(std::move(event));
 
+    // Scripts call a native through this entry; PapyrusService keeps the game's own address from the event above.
+    if (_stricmp(apFunction->functionName.AsAscii(), "SetOpen") == 0 && _stricmp(apFunction->typeName.AsAscii(), "ObjectReference") == 0 &&
+        apFunction->functionAddress && apFunction->functionAddress != reinterpret_cast<void*>(&HookSetOpen))
+    {
+        RealSetOpen = reinterpret_cast<TSetOpen>(apFunction->functionAddress);
+        apFunction->functionAddress = reinterpret_cast<void*>(&HookSetOpen);
+    }
+
     TiltedPhoques::ThisCall(RealRegisterPapyrusFunction, apThis, apFunction);
 }
+
+#ifdef SKYRIMVR
+TP_THIS_FUNCTION(THandleIsType, bool, BSScript::IObjectHandlePolicy, uint32_t aType, uint64_t aHandle);
+TP_THIS_FUNCTION(THandleCall, uint64_t, BSScript::IObjectHandlePolicy, uint64_t aHandle);
+TP_THIS_FUNCTION(THandleToString, void, BSScript::IObjectHandlePolicy, uint64_t aHandle, void* apString);
+static THandleIsType* RealHandleIsType = nullptr;
+static THandleToString* RealHandleToString = nullptr;
+static THandleCall* RealIsHandleObjectAvailable = nullptr;
+static THandleCall* RealHandleSlot6 = nullptr;
+static THandleCall* RealHandleSlot7 = nullptr;
+
+// The game reaches a form through a script handle and calls through the form's vtable: SkyrimVR.exe+0x93CE11, +0x93F0F9, +0x93DB7E.
+// A stale lookup gives it a freed form or reused memory, and that call jumps into nothing.
+// So a handle whose form the lookup has stale reaches the game as the invalid handle, which each of these functions answers safely.
+// The low 32 bits name the form in a form's own handle, and in an alias's or an active effect's.
+static uint64_t WithoutStaleForm(BSScript::IObjectHandlePolicy* apPolicy, const uint64_t aHandle) noexcept
+{
+    if (!IsStaleFormId(static_cast<uint32_t>(aHandle)))
+        return aHandle;
+
+    static std::atomic<uint32_t> s_stale{0};
+    const uint32_t cCount = ++s_stale;
+    if (cCount <= 20 || cCount % 500 == 0)
+        spdlog::warn("FormGuard: script handle {:X} names a form the lookup has stale; answered as no such form ({} so far)", aHandle, cCount);
+    return apPolicy->GetInvalidHandle();
+}
+
+bool TP_MAKE_THISCALL(HookHandleIsType, BSScript::IObjectHandlePolicy, uint32_t aType, uint64_t aHandle)
+{
+    return TiltedPhoques::ThisCall(RealHandleIsType, apThis, aType, WithoutStaleForm(apThis, aHandle));
+}
+
+void TP_MAKE_THISCALL(HookHandleToString, BSScript::IObjectHandlePolicy, uint64_t aHandle, void* apString)
+{
+    TiltedPhoques::ThisCall(RealHandleToString, apThis, WithoutStaleForm(apThis, aHandle), apString);
+}
+
+template <THandleCall** cppReal> uint64_t TP_MAKE_THISCALL(HookHandleCall, BSScript::IObjectHandlePolicy, uint64_t aHandle)
+{
+    return TiltedPhoques::ThisCall(*cppReal, apThis, WithoutStaleForm(apThis, aHandle));
+}
+#endif
 
 void TP_MAKE_THISCALL(HookBindEverythingToScript, BSScript::IVirtualMachine*)
 {
@@ -40,6 +110,23 @@ void TP_MAKE_THISCALL(HookBindEverythingToScript, BSScript::IVirtualMachine*)
         auto** ppVTable = *reinterpret_cast<void***>(*apThis);
         RealRegisterPapyrusFunction = static_cast<TRegisterPapyrusFunction*>(ppVTable[0x18]);
         TP_HOOK_IMMEDIATE(&RealRegisterPapyrusFunction, HookRegisterPapyrusFunction);
+
+        // Every slot of SkyrimScript::HandlePolicy that looks a form up (its VR vtable, 0x141755C68).
+        // GetObjectForHandle needs no hook of its own: it asks HandleIsType first.
+        if (auto* pPolicy = (*apThis)->GetObjectHandlePolicy())
+        {
+            auto** ppPolicy = *reinterpret_cast<void***>(pPolicy);
+            RealHandleIsType = static_cast<THandleIsType*>(ppPolicy[1]);
+            RealIsHandleObjectAvailable = static_cast<THandleCall*>(ppPolicy[2]);
+            RealHandleSlot6 = static_cast<THandleCall*>(ppPolicy[6]);
+            RealHandleSlot7 = static_cast<THandleCall*>(ppPolicy[7]);
+            RealHandleToString = static_cast<THandleToString*>(ppPolicy[11]);
+            TP_HOOK_IMMEDIATE(&RealHandleIsType, HookHandleIsType);
+            TP_HOOK_IMMEDIATE(&RealIsHandleObjectAvailable, HookHandleCall<&RealIsHandleObjectAvailable>);
+            TP_HOOK_IMMEDIATE(&RealHandleSlot6, HookHandleCall<&RealHandleSlot6>);
+            TP_HOOK_IMMEDIATE(&RealHandleSlot7, HookHandleCall<&RealHandleSlot7>);
+            TP_HOOK_IMMEDIATE(&RealHandleToString, HookHandleToString);
+        }
         s_registerHookInstalled = true;
     }
 #endif

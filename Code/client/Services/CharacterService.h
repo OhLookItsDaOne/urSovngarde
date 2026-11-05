@@ -61,7 +61,20 @@ struct CharacterService
 
     bool RequestOwnership(uint32_t aFormId, uint32_t aServerId, entt::entity aEntity, bool aKillingBlow = false) const noexcept;
     // This player's killing blow on another player's protected NPC: asks for it, and kills it once it is this game's.
-    void ClaimForKillingBlow(Actor* apActor) noexcept;
+    void ClaimForKillingBlow(uint32_t aFormId) noexcept;
+    // Revives a dead actor for every game: a copy here is asked for first, and revived once this game owns it.
+    void ReviveActor(uint32_t aFormId) noexcept;
+    // An actor switched back on soon after it left the server: discovery still knows it and will not find it again.
+    void AnnounceAgain(uint32_t aFormId) noexcept;
+    // Its life follows its owner's from now on, even where this game's save has it dead.
+    void FollowOwnersLife(uint32_t aFormId) noexcept;
+    // The leader's game switched this actor on here: that game announces it, and this one waits a few seconds for it.
+    void LeaderSwitchedOn(uint32_t aFormId) noexcept;
+    // Revives the bodies that asked to while switched off, once they are on and have their 3D.
+    void RunRevivalsOnSwitchOn() noexcept;
+    // A loaded game has each reference as its save has it, so what is disabled now is not this game's hiding.
+    // One still enabled is hidden again by the ghost checks, and enabling one the save disabled would be wrong.
+    void OnGameLoaded() noexcept;
     // Brings the server's copy of an actor's inventory in line with this game's, one entry at a time.
     void SendInventoryDifference(Actor* apActor, uint32_t aServerId, uint32_t aOwnershipEpoch, const Inventory& acServerInventory) const noexcept;
 
@@ -98,11 +111,16 @@ struct CharacterService
 
     void ProcessNewEntity(entt::entity aEntity) const noexcept;
 
+#ifdef SKYRIMVR
+    void LayDownStandingBodies() noexcept;
+#endif
+
 private:
     //! False when the cell to move to could not be found.
     bool MoveActor(const Actor* apActor, const GameId& acWorldSpaceId, const GameId& acCellId, const Vector3_NetQuantize& acPosition) const noexcept;
 
     void RequestServerAssignment(entt::entity aEntity) const noexcept;
+    void RunNotAnnounced() const noexcept;
     void CancelServerAssignment(entt::entity aEntity, uint32_t aFormId, Actor* apActor) const noexcept;
     void DeleteRemoteEntityComponents(entt::entity aEntity) const noexcept;
     void ClaimCopyId(entt::entity aEntity, uint32_t aFormId) const noexcept;
@@ -116,6 +134,10 @@ private:
     void RestoreConformedWeapons(Actor* apActor) noexcept;
     // This player's followers owned by another player, asked for back once they are near this player.
     void RunFollowerReclaims() const noexcept;
+    // Tells the server who became, or stopped being, this player's follower.
+    void RunFollowerReports() const noexcept;
+    // Announces references that a stand-in stopped hiding, which discovery may not find again.
+    void RunReleasedGhosts() const noexcept;
     void ProcessLeveledConforms() noexcept;
 
     void RunLocalUpdates() const noexcept;
@@ -137,6 +159,8 @@ private:
 
     // Protected NPCs this player landed a killing blow on, by server id, until when they are killed once this game owns them.
     TiltedPhoques::Map<uint32_t, std::chrono::steady_clock::time_point> m_killingBlows;
+    // Bodies asked for to be revived, by server id, until when they are revived once this game owns them.
+    TiltedPhoques::Map<uint32_t, std::chrono::steady_clock::time_point> m_revivals;
 
     float m_cachedExperience = 0.f;
 
