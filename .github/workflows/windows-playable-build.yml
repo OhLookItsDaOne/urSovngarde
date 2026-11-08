@@ -10,6 +10,8 @@ on:
   push:
     branches:
       - client
+      # The test client for the Testbuild server (upstream main, new protocol), published as testbuild-client-<version>
+      - test-build
   workflow_call:
 
 jobs:
@@ -19,3 +21,39 @@ jobs:
     with:
       build-mode: release
       upload-build-for-next-job: true
+
+  # test-build: the client as a pre-release next to testbuild-server-<version> of the same commit (linux.yml).
+  # Never marked Latest, so the client-<version> release stays the one people find first.
+  publish-test-client:
+    needs: build-windows
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/test-build' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: urSovngarde-*-windows-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Publish the test client
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd release-assets
+          ls -l
+          main="$(ls urSovngarde-*-windows-x64.zip)"
+          version="${main#urSovngarde-}"
+          version="${version%-windows-x64.zip}"
+          sha256sum *.zip > SHA256SUMS
+          cat SHA256SUMS
+          tag="testbuild-client-$version"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "$tag is already published"
+            exit 0
+          fi
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Test build client $version" --latest=false --prerelease \
+            --notes "TEST BUILD from this fork's test-build branch: upstream urSovngarde main after v${version%%-*} (new protocol) with the fork's fixes. For the Testbuild server (testbuild-server-$version) only; it cannot join servers on the official release." \
+            *.zip SHA256SUMS
