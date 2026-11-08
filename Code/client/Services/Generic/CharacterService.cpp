@@ -69,6 +69,7 @@
 #include <Messages/NotifyOwnershipTransfer.h>
 #include <Messages/RequestOwnershipClaim.h>
 #include <Messages/RequestFollowerState.h>
+#include <Messages/RequestActorPresence.h>
 #include <Messages/MountRequest.h>
 #include <Messages/NotifyMount.h>
 #include <Messages/NewPackageRequest.h>
@@ -272,6 +273,11 @@ TiltedPhoques::Map<uint32_t, PendingLine> s_pendingLines;
 
 bool StartLine(Actor* apActor, const char* acpFile) noexcept
 {
+    // The game's speak call reads the speaker's AI process for its lip sync without checking it.
+    // An actor switched on or rebuilt a moment ago can have none yet, so its line waits.
+    if (!apActor->currentProcess)
+        return false;
+
     constexpr uint32_t cNoSound = 0xFFFFFFFF;
     uint32_t soundHandle[3]{};
     apActor->SpeakSound(acpFile, soundHandle);
@@ -1484,6 +1490,7 @@ void CharacterService::OnUpdate(const UpdateEvent& acUpdateEvent) noexcept
     SpawnReveal::Tick();
     RunFollowerReclaims();
     RunFollowerReports();
+    RunPresenceReports();
     RunReleasedGhosts();
     RunGainedMoving();
     RunPendingLines();
@@ -2321,6 +2328,9 @@ void CharacterService::OnReferencesMoveRequest(const ServerReferencesMoveRequest
         point.Variables = movement.Variables;
         point.Direction = movement.Direction;
         point.VRPoseData = update.UpdatedVRPose;
+#ifdef SKYRIMVR
+        VRBodySync::NoteReceivedPose(view.get<RemoteComponent>(*itor).CachedRefId, acMessage.Tick, update.UpdatedVRPose);
+#endif
 
         InterpolationSystem::AddPoint(interpolationComponent, point, m_transport.GetMessageReceiveTime());
     }
@@ -2691,6 +2701,49 @@ void CharacterService::RunFollowerReports() const noexcept
 
     for (auto it = s_followerReports.begin(); it != s_followerReports.end();)
         it = it->second.Visit == s_visit ? std::next(it) : s_followerReports.erase(it);
+}
+
+void CharacterService::RunPresenceReports() const noexcept
+{
+    // The whole list each time, so a lost or late report is put right by the next one.
+    // Only once the server has accepted this player: it kicks a connection that sends anything before.
+    static std::chrono::steady_clock::time_point s_next;
+    const auto cNow = std::chrono::steady_clock::now();
+    if (cNow < s_next || !m_transport.IsOnline())
+        return;
+    s_next = cNow + std::chrono::seconds(2);
+
+    TiltedPhoques::Set<uint32_t> standIns;
+    for (const auto& [ghost, copy] : s_ghosts)
+        if (copy)
+            standIns.insert(copy);
+
+    RequestActorPresence request{};
+    const auto add = [this, &request, &standIns](const entt::entity aEntity, const uint32_t aServerId, const bool aOwn)
+    {
+        const auto* pFormId = m_world.try_get<FormIdComponent>(aEntity);
+        Actor* pActor = pFormId ? Cast<Actor>(TESForm::GetById(pFormId->Id)) : nullptr;
+        const ActorExtension* pExtension = pActor ? pActor->GetExtension() : nullptr;
+        // Only what is drawn here: a disabled copy waiting to be freed, or one without 3D, is not seen.
+        if (!pExtension || pExtension->IsPlayer() || pActor->IsDisabled() || !pActor->GetNiNode())
+            return;
+
+        ActorPresence presence{};
+        presence.ServerId = aServerId;
+        presence.Kind = aOwn ? ActorPresenceKind::Own : standIns.contains(pActor->formID) ? ActorPresenceKind::StandIn : ActorPresenceKind::Copy;
+        presence.Dead = pActor->IsDead();
+        request.Actors.push_back(presence);
+    };
+
+    const auto localView = m_world.view<LocalComponent>();
+    for (const auto cEntity : localView)
+        add(cEntity, localView.get<LocalComponent>(cEntity).Id, true);
+    const auto remoteView = m_world.view<RemoteComponent>();
+    for (const auto cEntity : remoteView)
+        add(cEntity, remoteView.get<RemoteComponent>(cEntity).Id, false);
+
+    if (!request.Actors.empty())
+        m_transport.Send(request);
 }
 
 void CharacterService::RunReleasedGhosts() const noexcept
@@ -3195,7 +3248,8 @@ void CharacterService::OnNotifyDialogue(const NotifyDialogue& acMessage) noexcep
     // How it was played, so that a line the player did not hear can be told apart from one never started.
     const UI* pUI = UI::Get();
     spdlog::info("Dialogue: {:X} (server id {:X}) says {}; {} ({:.0f} units from the player, 3D {}, pause counter {})", pActor->formID, acMessage.ServerId,
-                 acMessage.SoundFilename.c_str(), cStarted ? "started here" : cWaits ? "waiting for its lip file" : "not started, too far away", cDistance, pActor->GetNiNode() ? "yes" : "no", pUI ? pUI->numPausesGame : 0);
+                 acMessage.SoundFilename.c_str(), cStarted ? "started here" : !cWaits ? "not started, too far away" : pActor->currentProcess ? "waiting for its lip file" : "waiting for its AI process",
+                 cDistance, pActor->GetNiNode() ? "yes" : "no", pUI ? pUI->numPausesGame : 0);
 }
 
 void CharacterService::OnSubtitleEvent(const SubtitleEvent& acEvent) noexcept
@@ -3749,6 +3803,14 @@ void CharacterService::CancelServerAssignment(const entt::entity aEntity, const 
         request.OwnershipEpoch = localComponent.OwnershipEpoch;
         request.Reason = OwnershipReleaseReason::Relinquish;
 
+        // A temporary actor marked deleted while its cell is still loaded was deleted on purpose, as by a script.
+        // Handed to another player it would live on there, so it is released as deleted instead.
+        // One already freed is let go as before: the game also frees those of a cell left by a door or a teleport, for a player still there to take on.
+        const TESObjectCELL* pCell = apActor ? apActor->GetParentCellEx() : nullptr;
+        const bool cDeletedHere = cTemporaryId && apActor && apActor->IsDeleted() && pCell && pCell->IsAttached() && !IsProcessExiting();
+        if (cDeletedHere)
+            request.Reason = OwnershipReleaseReason::Deleted;
+
         if (Actor* pActor = apActor)
         {
             if (!pActor->IsTemporary())
@@ -3771,16 +3833,19 @@ void CharacterService::CancelServerAssignment(const entt::entity aEntity, const 
             }
         }
 
-        spdlog::info(
-            "Transferring ownership of local actor, server id: {:X}, epoch: {}, worldspace: {:X}, cell: {:X}, position: "
-            "({}, {}, {})",
-            request.ServerId, request.OwnershipEpoch, request.WorldSpaceId.BaseId, request.CellId.BaseId, request.Position.x, request.Position.y, request.Position.z);
+        if (cDeletedHere)
+            spdlog::info("Deleted: local actor {:X}, server id {:X}, was deleted here; released as deleted", aFormId, request.ServerId);
+        else
+            spdlog::info(
+                "Transferring ownership of local actor, server id: {:X}, epoch: {}, worldspace: {:X}, cell: {:X}, position: "
+                "({}, {}, {})",
+                request.ServerId, request.OwnershipEpoch, request.WorldSpaceId.BaseId, request.CellId.BaseId, request.Position.x, request.Position.y, request.Position.z);
 
         m_transport.Send(request);
 
         // One of this game's own temporary actors, given up because its cell unloaded (see s_handedAway).
         // If another player is there, the server gives it to them under this same server id.
-        if (cTemporaryId && cGameMade && !IsProcessExiting())
+        if (cTemporaryId && cGameMade && !cDeletedHere && !IsProcessExiting())
         {
             const Actor* pOwn = Cast<Actor>(TESForm::GetById(aFormId));
             s_handedAway[request.ServerId] = HandedAway{aFormId, pOwn && pOwn->baseForm ? pOwn->baseForm->formID : 0};
