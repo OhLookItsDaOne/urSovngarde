@@ -1,4 +1,5 @@
 
+#include <cstdlib>
 #include <TiltedCore/Filesystem.hpp>
 #include <chrono>
 #include <filesystem>
@@ -80,11 +81,13 @@ struct LogInstance
     ~LogInstance() { spdlog::shutdown(); }
 };
 
-// The logger is made before the settings are loaded, so sLogLevel from STServer.ini only takes effect from here
-// (DediRunner::LoadSettings calls it once they are in).
+// The logger is made before the settings are loaded, so the level is set again from here (DediRunner::LoadSettings
+// calls it once they are in). sLogLevel is the runner's setting, which the server's registry never binds (it is not
+// in STServer.ini), so the URSOVNGARDE_LOG_LEVEL environment variable (trace, debug, info, ...) comes first.
 void ApplyLogLevel()
 {
-    const auto cLevel = spdlog::level::from_str(sLogLevel.value());
+    const char* cpEnv = std::getenv("URSOVNGARDE_LOG_LEVEL");
+    const auto cLevel = spdlog::level::from_str(cpEnv && *cpEnv ? cpEnv : sLogLevel.value());
     spdlog::default_logger()->set_level(cLevel);
     spdlog::info("Log level {}", spdlog::level::to_string_view(cLevel));
 }
