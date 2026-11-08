@@ -80,6 +80,15 @@ struct LogInstance
     ~LogInstance() { spdlog::shutdown(); }
 };
 
+// The logger is made before the settings are loaded, so sLogLevel from STServer.ini only takes effect from here
+// (DediRunner::LoadSettings calls it once they are in).
+void ApplyLogLevel()
+{
+    const auto cLevel = spdlog::level::from_str(sLogLevel.value());
+    spdlog::default_logger()->set_level(cLevel);
+    spdlog::info("Log level {}", spdlog::level::to_string_view(cLevel));
+}
+
 static bool RegisterQuitHandler()
 {
 #if defined(_WIN32)

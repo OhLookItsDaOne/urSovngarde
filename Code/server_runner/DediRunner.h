@@ -38,6 +38,7 @@ private:
     static void PrintExecutorArrowHack();
 
     void LoadSettings(int argc, char** argv);
+    void LoadSettingsFrom(int argc, char** argv);
 
     static void ReadStdin(uv_stream_t* apStream, ssize_t aRead, const uv_buf_t* acpBuffer);
     static void AllocateBuffer(uv_handle_t* apHandle, size_t aSuggestedSize, uv_buf_t* apBuffer);

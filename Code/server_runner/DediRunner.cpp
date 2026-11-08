@@ -16,6 +16,7 @@ DediRunner* s_pRunner{nullptr};
 
 // imports
 GS_IMPORT TiltedPhoques::UniquePtr<IGameServerInstance> CreateGameServer(Console::ConsoleRegistry& conReg, const std::function<void()>& aCallback);
+void ApplyLogLevel(); // main.cpp
 // needs to be global
 Console::Setting bConsole{"bConsole", "Enable the console", true};
 
@@ -46,6 +47,12 @@ DediRunner::~DediRunner()
 }
 
 void DediRunner::LoadSettings(int argc, char** argv)
+{
+    LoadSettingsFrom(argc, argv);
+    ApplyLogLevel();
+}
+
+void DediRunner::LoadSettingsFrom(int argc, char** argv)
 {
     // If we have line args load, don't use the ini
     if (argc > 1)
