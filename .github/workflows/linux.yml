@@ -6,6 +6,11 @@ on:
         branches:
             - main
             - dev
+            # The fork's server: the latest upstream release plus the fork's server fixes. Its pushes upload the server.
+            - server
+            # The fork's test build: upstream main (new protocol) plus the fork's server fixes, for the test server only.
+            # Its releases are tagged testbuild-server-<version>, which the VPS updater (server-*) does not install.
+            - test-build
     workflow_call:
         inputs:
             build-mode:
@@ -43,6 +48,15 @@ jobs:
               run: |
                   git submodule sync --recursive
                   git submodule update --init --force --recursive --depth=1
+
+            # The fork has no release tags (a tag push would publish a release), so the version the server reports
+            # (BuildInfo.h, from git describe) would name an old one. The server branch takes upstream's tags first.
+            - name: Upstream release tags for the server branch
+              if: github.ref == 'refs/heads/server' || github.ref == 'refs/heads/test-build'
+              # The server-<version> tags of this branch's own releases would be nearer than any release, so they go.
+              run: |
+                  git fetch --no-recurse-submodules --tags https://github.com/Dosylia/urSovngarde.git || true
+                  git tag -l 'server-*' 'client-*' 'testbuild-*' | xargs -r git tag -d
 
             - name: Checkout main on tag push
               if: github.ref_type == 'tag'
@@ -136,14 +150,29 @@ jobs:
                   kill "$server"
 
             - name: Create Linux release archive
-              if: ${{ inputs.upload-build-for-next-job }}
+              if: ${{ inputs.upload-build-for-next-job || github.ref == 'refs/heads/server' || github.ref == 'refs/heads/test-build' }}
               run: |
                   version="${GITHUB_REF_NAME#v}"
+                  # On the server branch: the release it is built from and the fork's commits on top, such as 1.9.7-2-g75ad014.
+                  # Upstream's tags were fetched before the build (see above).
+                  if [ "$GITHUB_REF" = "refs/heads/server" ] || [ "$GITHUB_REF" = "refs/heads/test-build" ]; then
+                    version="$(git describe --tags --match 'v*' 2>/dev/null || git rev-parse --short HEAD)"
+                    version="${version#v}"
+                  fi
                   echo "ARTIFACT_VERSION=$version" >> "$GITHUB_ENV"
                   mkdir -p release-assets
                   tar -C release-stage -czf \
                     "release-assets/urSovngardeServer-${version}-linux-${{ matrix.arch }}.tar.gz" \
                     .
+
+            - name: Upload the server branch's build
+              if: ${{ github.ref == 'refs/heads/server' || github.ref == 'refs/heads/test-build' }}
+              uses: actions/upload-artifact@v7
+              with:
+                  name: urSovngardeServer-${{ env.ARTIFACT_VERSION }}-linux-${{ matrix.arch }}
+                  retention-days: 30
+                  if-no-files-found: error
+                  path: release-assets/urSovngardeServer-${{ env.ARTIFACT_VERSION }}-linux-${{ matrix.arch }}.tar.gz
 
             # Upload artifacts
             - name: Upload build files for the next job
@@ -154,3 +183,49 @@ jobs:
                   retention-days: 1
                   if-no-files-found: error
                   path: release-assets/urSovngardeServer-${{ env.ARTIFACT_VERSION }}-linux-${{ matrix.arch }}.tar.gz
+
+    # The server branch's build as a release, so that a server can fetch it without a token (an artifact needs one).
+    # Its tag is server-<version>; the official releases' v<version> tags (release.yml) are left alone.
+    publish-server:
+        needs: build
+        if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/server' || github.ref == 'refs/heads/test-build') }}
+        runs-on: ubuntu-24.04
+        permissions:
+            contents: write
+        steps:
+            - uses: actions/download-artifact@v8
+              with:
+                  pattern: urSovngardeServer-*
+                  merge-multiple: true
+                  path: release-assets
+
+            - name: Publish the server build
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  cd release-assets
+                  ls -l
+                  amd64="$(ls urSovngardeServer-*-linux-amd64.tar.gz)"
+                  version="${amd64#urSovngardeServer-}"
+                  version="${version%-linux-amd64.tar.gz}"
+                  sha256sum urSovngardeServer-*.tar.gz > SHA256SUMS
+                  cat SHA256SUMS
+                  tag="server-$version"
+                  title="Server build $version"
+                  notes="The Linux server from this fork's server branch: upstream urSovngarde v${version%%-*} with the fork's server fixes (see the README). Not an official urSovngarde release; players use the official client."
+                  prerelease=()
+                  # test-build: never server-*, so the VPS updater leaves it alone; a pre-release, as it does not talk to the official client
+                  if [ "$GITHUB_REF" = "refs/heads/test-build" ]; then
+                    tag="testbuild-server-$version"
+                    title="Test build server $version"
+                    notes="TEST BUILD from this fork's test-build branch: upstream urSovngarde main after v${version%%-*} (new protocol) with the fork's server fixes. Only the matching testbuild-client release can join it."
+                    prerelease=(--prerelease)
+                  fi
+                  if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+                    echo "$tag is already published"
+                    exit 0
+                  fi
+                  gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+                    --title "$title" --latest=false "${prerelease[@]}" \
+                    --notes "$notes" \
+                    urSovngardeServer-*.tar.gz SHA256SUMS
