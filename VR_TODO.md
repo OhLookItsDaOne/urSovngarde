@@ -27,6 +27,38 @@ to do, what you should see, and what to read in the log if you don't. "It looked
 Before you start: don't play the vanilla Helgen intro together. Player 2 stays tied, because Ralof is a copy in that game and
 his scene never finishes. Use an alternate start, or connect after the intro.
 
+- **NPC presence report, step 1 (a protocol change: every player and the server need the same new build).** Nothing to do in play: fight NPCs as usual, ideally three or four players at a bandit camp.
+  Each game tells the server every 2 s which NPCs it has loaded, as its own, a copy or a stand-in; nothing about ownership changes yet. Afterwards read the server log:
+  `Presence: removing actor X after ... while another game still has it loaded` is a drop that step 2 (server only: never remove an NPC a game still has, hand it only to a game that has it) would have prevented;
+  every 30 s `Presence: N characters on the server, ... removed in the last 30 s, M of them while another game still had them loaded` gives the share, and the per-player lines count
+  `it runs that the server gives to another game` and `it shows as a copy that the server gives to it`, two games disagreeing about the same NPC; `N of these two kinds already so at the last census` are the ones that lasted 30 s or more, the rest are hand-overs still in flight (a report can be 2 s old). Both logs are TEMPORARY and go once step 2 is decided.
+  The 2026-11-05 four-player session had 242 removals at Halted Stream Camp and 222 at Silent Moons Camp, many within a second of a hand-over; how many were still seen elsewhere is what this measures.
+  Where it stands (2026-11-06): built on top of 2200fbc6 (protocol `c5173cc4`), the message round trip is a unit test, the bot suite passes, not yet in a release, not yet seen in play.
+  Build v1.9.8-7-ge2835e3d (2026-11-07), client and server, FUS and MGO; TPTests 114 pass. Not yet seen in play; every player needs this client.
+  Rig, 2026-11-06, two real games (`two-games-bugs.py`, FUS testing profile, one save): the reports arrive and agree with the server (0 to 3 characters loaded in no game).
+  Removals while the other game still had the NPC: brawl 4 of 35, Windhelm and reconnects 7 of 131, `walk-away` (new: the owner leaves four cells, the other stays) 0 of 71, where the staying game kept all 7 placed NPCs and took them over.
+  No disagreement lasted to the next census. Four games with different mod lists, levelled stand-ins and a leader change, as on 2026-11-05, are not something the rig reproduces, so step 2 waits for a real session's numbers.
+- **Party of three or four: enemy damage (client only).** Enemies now deal 120% to a player when two, three or four of the party are within 50 m; it was 135% for three and 150% for four, which with the
+  server's difficulty took players from full to down in about 2 s on 2026-11-05. Their health bonus is unchanged. Say whether fights still feel fair. The line `Balance: now N of the party within 50 m` shows the numbers.
+- **A copy's or a chest's items set without the game freezing (client only, uncommitted on 65b14ee7).** Nothing to do in play: siege battles, loot, trade and open chests as usual.
+  In the 11-07 play the game's remove-everything call looped forever in player 2's game, on the copy of the siege's Stormcloak Archer FE09F882 as it spawned (at 15:51 and 19:48).
+  The stuck thread, named with the build's symbols: `CharacterService::RunRemoteUpdates` → `Actor::SetActorInventory` → `TESObjectREFR::SetInventory` → the game's `InventoryChanges::RemoveAllItems` → `RemoveItem`, over and over, memory 38 to 71 GB.
+  65b14ee7's count check caught about 25 other archers that session, not that one. The owner's game also held 15 chests whose items' extra data counted -1 to -5, which it then skipped, so their items were added again at each reapply.
+  Now the game's call is gone: each list and each item is removed once per pass, by its own pointer, and one that does not go is logged and left; a list counting 0 or less is set to 1 first.
+  Levelled lists an inventory carries with its items are no longer added to a copy or a chest; copies had held them as items (count 2 after two sets on the first try of this fix).
+  Build v1.9.8-8-g65b14ee7-dirty.973eea0 (also the battle page's `urSS_Battle`), client on FUS and MGO, server unchanged (same protocol); TPTests 114 pass.
+  Rig, two real games, a Sungard battle of 50 a side, twice: no freeze, no `kept item` line, about 115 copies' items set; 138 of 163 soldiers held the same item kinds in both games, against 97 of 167 on the first try.
+  The freeze itself did not come on the rig, on the old build either (a fresh battle; in play it came at a second battle), so the fix is checked by its own bound, not by a reproduced freeze.
+  Two copies still held 7 more item kinds than their owners (their own gear and the owner's); cause not known.
+  To see: no freeze in a battle with player 2 near. In the log: `RemoveAllItems: X kept item Y` names an item a removal left; `counted 1 so that it can be removed` is a broken list mended.
+- **Another player's copy flickering between their pose and the game's own stance (client only).** A bug report's video (2026-11-07) shows a copy, a mage holding a spell, jump between the player's real pose and the plain spell stance, standing farther back, several times a second.
+  On the rig the sending game's body is now and then in another state for one update: an arm turned about 175 degrees, or the hips at the root instead of where VRIK stands them; the other game played those updates, and its copy jumped there and back.
+  Nothing in the game is changed yet: logs only, to find whether that happens in play. `PoseSpike: copy X: N poses in 30 s jumped away from the one before and straight back (shown as they came)` counts the one-update jumps.
+  Say whether a copy flickers, and when. Read `PoseSpike:` and the temporary `PoseFlipDiag:` lines: `local player 14: ... steps ..., N came back` on the sender, `copy X: ...` where they arrive, `copy X posed at N of M frame ends`, and `copy X had no pose at N of M updates` (the arms back to the animation, the stance in the video).
+  The step counts leave out the hands (a wrist flicks that fast in a swing) and poses that arrived late or twice (`N came late or twice and were left out`).
+  `had no pose` also comes when the other player opens the map or skills menu, since no pose is sent then; it counts frames shown, not updates received.
+  Both games need the build: each writes its own half of the lines.
+  Where it stands (2026-11-08): cause not proven. A filter leaving such poses out was tried on the rig, whose jumps come from its controllers lying out of the arms' reach, and is not shipped until play logs show the jumps; logging built on c17ed82e with the late-pose, hands and no-pose changes (uncommitted), not yet in a release, not yet seen in play.
 - **Dead bodies, at connect and after (needs eed5ad8 on both games).** The first player plays alone a little, then the second connects near an old fight. Bodies lie down in both games, and stay down when you walk away and back.
   An older save may still hold bodies that stand: they should drop within a few seconds of you coming near. If one stands: its form id, and `BodyStand:` in the log. The dead creatures of "Dead on one side" are not all covered, see below.
 - **A dragon fight with both players near (needs 8f303ba on both games).** The game must not stop. A `NonFinite:` line in either log is the guard catching what froze the game on 10-31, and it names
@@ -336,6 +368,14 @@ After the session the logs answer the rest: `Stall:`, `Silence:`, `ThreadOwners:
       A real fast travel from the map cannot run in the rig. To see: "Fast travel from the map".
 - [!] **The map freeze, player 2 and together** (cause and fix in KNOWN_ISSUES, "Freeze after closing the unpaused map"). Seen fixed by player 1,
       30 closes online on 2026-10-30. To see: "The map, player 2 and together".
+      Since build 82f3689 (with ec6f79e9) the loop guard on the list draw goes in at the first map open, not at start, so CSX 3.19.2 and later can
+      start; a hook that never went live is now logged as one. No rig run yet. To see: `RenderPassWatch: each list is checked for a loop before it is drawn`
+      after the first map open, and no freeze at a close.
+- [!] **Crash when another game's voice line reached a copy with no AI process** (`AIProcess::GetLipAnim`, VR 0x659B00, from
+      `OnNotifyDialogue`; a second player at a siege battle's start, 2026-11-05 18:09, v1.9.8). The game's speak call reads the speaker's
+      process unchecked, and a soldier switched on a second before had none yet. A sent line now waits for the process, up to the
+      3 s retry. Build 82f3689, no rig test: the rig cannot make a copy speak in the moment it has no process.
+      To see: no crash at a battle's start, and `waiting for its AI process` lines now and then.
 - [!] **Fingers not synced on MGO's skeleton** (since build f997b6a the check takes up to three hops). 536 flattened bones, and `no usable flattened
       bone array` up to 2026-10-23; no MGO session since. FUS has no such skeleton, so no rig run. To see on MGO: no such line, and fingers
       move on the copy.
@@ -344,6 +384,14 @@ After the session the logs answer the rest: `Stall:`, `Silence:`, `ThreadOwners:
       Manager and Mod Organizer starts.
       One did outlive its game on 2026-10-31: a `TPProcess.exe --type=gpu-process` started at 10:36 by the 43-second rig session on 8ad48b5 was still alive at 16:20, its
       parent gone, 2 MB. The crash at 15:05 that day left none. How that one survived is not known, so a GPU helper may not be covered by the fix.
+      Two more on 2026-11-05, both started the second their game ended: a renderer at 00:56:11, at a rig game's crash, and a
+      `gpu-process` at 13:15:52, the same second the rig quit its game. Their parents were gone, and they held `TPProcess.exe`,
+      so the launcher's update to v1.9.8 stopped until its "Stop TPProcess.exe" button ended them.
+      Lead, not confirmed: a helper started as the game ends may never reach `WinMain`, where it starts watching the game.
+      One possible reason is Mod Organizer's file system creating each child suspended, to inject into it, and resuming it after.
+      The 2 MB of the 10-31 one fits a process that never started.
+      Next time one is left, read its threads (`Win32_Thread`, `ThreadWaitReason` 5 is suspended) and its `--pid=` switch before ending it.
+      A fix that covers every case is a job object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` for the helpers: the system ends them when the game dies.
 - [!] **Freeze 2026-10-25 14:51: the autosave entering the Palace of the Kings never finished** (fixed on a98ad845 + the ExtraDataList lock change).
       A race microseconds wide, so no rig test makes it fail. To see: no freeze after a load with the other player's marker near. Not seen
       again in the 349 loading screens of 10-25 to 10-31, which is no proof.
@@ -390,6 +438,54 @@ After the session the logs answer the rest: `Stall:`, `Silence:`, `ThreadOwners:
 
 ## Open work
 
+- [!] **A crash as a jail sentence moves the player out, with another player's copy in the cell** (2026-11-08 23:17, a public v1.9.8 pair, Riften Jail, report 20261108-221734). Guarded, not seen in play.
+      Player B accepted serving the sentence; 0.27 s later the game applied an effect (`PeakValueModifierEffect`) to player A's copy, and the effect's condition asked whether the player is in region C5853 (Skyrim.esm, edited by Azurite Weathers III).
+      Player B had no cell at that moment, and `TESObjectCELL::GetRegionList` read a null cell (`SkyrimVR.exe+0x276DB9`, under `IsPlayerInRegion` and our pass-through `HookApplyActorEffect`).
+      Guard: a copy's effect is not applied while the local player has no cell (`ApplyEffect: an effect on copy X not applied while this player has no cell`); a copy's values come from its owner.
+      Which mod gave player A that effect is not known. Not tried on the rig: it cannot make that effect.
+- [ ] **A null call on an AI thread updating an actor's face** (2026-11-08 21:36, player 2, Fort Greymoor, report 20261108-203703). Not looked into yet.
+      `SkyrimVR.exe+0x5EB6C9` under `Actor::IsMoving` / `UpdateActor3DPosition` / `ProcessLists::UpdateHighActors`, `BSFaceGenAnimationData` and `"NPCEyeBone"` in the registers; no code of ours on the stack. 3 s before, Stormcloak soldier 8C00A309 changed hands three times.
+- [ ] **Crashes in character creation, connected, with no other player nearby** (2026-11-08 19:46:49 and 20:01:00, two new games at Helgen, the RaceSex Menu open for 17 s and 35 s; 20:05:00, Realm of Lorkhan, connected by the auto-connect 3 s after the menu opened, crash 8 s later). Cause unknown.
+      Three of three were connected; player 2's character creation with the mod but not connected went fine. That points at something that runs only while connected, but no such code is found yet.
+      Each time a part of the player's head read a pointer from freed memory, after a race or sex change. 20:05 is the same crash as 19:46 (`FemaleHeadHighElf`).
+      Not connected (20:09, server stopped), the menu stayed open 14 minutes with no crash. The same game then crashed while saving, still not connected (20:15:52): the script engine's save read a garbage pointer from its own data (`SkyrimVR.exe+0xc6dbb0` under `+0x12ac40c`, `mov r8, [rdx]`).
+      All four crashes were on v1.9.8-16-geed70ddc and in brand-new games, so the build and the new game are not told apart yet. The builds before it that day had no crash of this kind, but they only loaded existing saves.
+      Not reproduced on the rig: console race and sex changes, Papyrus face, tint and weight changes (over 1100 steps, connected, also connecting mid-way), on a finished and on a new character; the rig cannot drive the VR menu itself.
+      All three character creation crashes are one fault: a head part's shader property (`[geometry+0x168]`) freed while the part still held it.
+      Diagnostic `HeadPartWatch` (TEMPORARY): logs a head part holding a freed property, and the stack of the release that destroyed one while a part held it. Deployed v1.9.8-17-gfab767c9-dirty.52e2ab5, FUS and MGO, client and server; it runs from the main loop on the main thread, its guarded reads tell the crash handler to leave their faults alone, and an address a new property took is not reported. Rig: 37 head rebuilds in character creation, no false line.
+      Seen in play once on it (22:00, the owner): a new game in Realm of Lorkhan, connected 4 s after the menu opened as at 20:05, 2 min 46 s in the menu, 29 head rebuilds, a save after; no crash and no `HeadPartWatch:` fault line.
+      So it does not happen every time; what differed from the three crashes is not known (that build, a freshly started server, nobody else on it).
+      To see: a `HeadPartWatch: shader property ... was destroyed while` or `... holds no shader property now` line in any log, with the stack under it.
+      19:46: the menu updated the head (`MaleHeadImperial` under its `BSFaceGenNiNode`) and read its shader property's fade node as garbage (`SkyrimVR.exe+0x3e95d0`, `mov eax, [rcx+0x10C]`).
+      20:01: 4 s after the race change (`Animation graph project of actor 14 changed`), the shadow scene's update wrote through a garbage pointer from the brows (`FemaleBrowsHuman06`; `SkyrimVR.exe+0x1354c40`, `mov dword ptr [rcx+0x18], 0`).
+      No code of ours is on either stack. Our only code touching a head's shader property tints other players' copies, and there was none; the VR body code writes only to copies' skeletons. The menu paused the game as it does without the mod.
+      To tell: character creation on the same PC without connecting (the server stopped until it is done; the game retries and joins within a minute of it starting again). A crash there too is not the mod's; none there makes it ours.
+- [!] **Soldiers revived before a player joins are killed by that player's save** (siege at Fort Sungard, 2026-11-08 12:04). Fixed in 870f1af0, built and deployed v1.9.8-16-geed70ddc (FUS and MGO, client and server), not seen in play.
+      The host's game revived the fort's soldiers at 12:03:26 (`Death sync: local actor 526EB is now alive, telling the server`). Player 2 joined at 12:04:02 with them dead in its save:
+      `DeathWins: 526F2 (server id 1A) is dead here but alive in its owner's game`, and the host's game took `player 2's blow of 100000` (`health broadcast killed actor 526F2`). Player 2 saw them all dead and stripped as it spawned.
+      Fix (a protocol change, `6b296bbe`: every player and the server need this build): the owner's revive report marks the character on the server, a death clears the mark, and an announcement from a game that saw the revive carries it.
+      A game joining later follows the owner's life for a marked character instead of keeping its save's body (`Death sync: X is dead here, but its owner's game revived it since its last death; it follows its owner`).
+      `s_lifeFollowsOwner` keeps only the leader's switch-on case. A kill player 2 made where the owner did not see it, after the owner's revive, is lost: the body stands up again, as at the owner.
+      Rig: `live-dead-revived-joins` RED on the build before (body kept dead, killing blow sent), ok after; `live-dead-stays-dead` ok after. TPTests 114 pass (a round trip of the mark).
+      To see: soldiers alive at the host stay alive for a player who joins mid-siege.
+      Follow-up in the tree, not built: a copy still waiting for its 3D now takes the mark from newer server state as it takes the death state, and every copy keeps the mark from its spawn or assignment, so announcing it again from that game keeps the mark (`CharacterService.cpp`, client only).
+- [ ] **An NPC announced again every 4 to 5 s when the game it is handed to declines it** (2026-11-08 14:46:09 to :25, rabbits 107D04 and 107D15; 12:04 to 12:06, Stormcloak Archer 8C00A316, 18 times). Not fixed.
+      The owner's player walked out of range, so the server handed the NPC to player 2. Player 2's game declined (`Hand-off of ... declined: a copy of ours stands in`), the server removed the character, and the owner's game, which still had it loaded, announced it again (`is gone from the server while ... stands here; announced again`).
+      Each round, player 2's copy is deleted and made again. Which side should break the loop is open. The leader's claim fix below does not touch this loop.
+- [!] **An NPC far from both players handed back and forth between their games** (2026-11-08 21:30 to 21:37, Stormcloak Soldier 8C00A309, about 10000 units from both, a new server id every 8 to 11 s). Fixed in build v1.9.8-16-geed70ddc-dirty.2e9c8bb, not seen in play.
+      The leader's game claimed every copy it received, at any distance (`Sending ownership claim for actor 8A00A309`). Its discovery dropped the soldier as it left the leader's loaded area, the server found no taker, and player 2's game, which still had it loaded, announced it again.
+      Now the leader's game claims a copy within 6000 units of its own player, a player's own follower at any distance, and any copy inside the player's interior cell, as before. A copy farther away stays with its owner and is claimed once it comes that near (`...; it came within 6000 units of this player`).
+      Rig: `live-leader-claim-near` ok; on 1fcdc77 the copy was claimed at 7500 units (its far check failed; the run reads INVALID because the bot then owned no NPC to move).
+      Regression run on 2e9c8bb: `live-npc`, `live-levelled`, `live-levelled-copy-rebuild`, `live-follower-stays-in` ok; `live-copy-through-door` ok on a fresh game (INVALID after other scripts had left Ralof the game's); `live-takeover-walk` INVALID twice, no baseline on this PC.
+      Still open: the server's own `LeaderAssignment` hands the leader an NPC its discovery announces anywhere within cell range; last night's loop did not go that way.
+- [!] **A crash in the game's eye tracking on a freed head node** (player 2, 2026-11-08 21:36:54, Fort Greymoor, confirmed by player 2). Cause unknown.
+      The game's per-actor job (0x7084b0, 0x7032f0, 0x5eb3c0) released Irileth's (1A67F) head node, which was already freed, and found no `NPCEyeBone`. CrashLogger's report names her on the stack.
+      3.4 s before, player 2's game had made its Irileth a copy of the host's and set her items again. Our update runs on the game's worker threads, so a change of ours to her 3D during that job fits, and so does another mod's; nothing showed which.
+      Build v1.9.8-16-geed70ddc-dirty.2e9c8bb adds the TEMPORARY `RecentModelChanges:` lines to the crash block: this client's last changes to actors' 3D, matched against the crashing registers and stack (`<<<< ON THE CRASHING THREAD'S STACK`).
+      Next crash like it: read those lines next to CrashLogger's report. The rig's quits never reach that part of the block, so it has not run yet.
+- [ ] **A dead horse that could still be ridden** (2026-11-08 14:22, the host's game). Cause unknown.
+      The host killed horse 798EB at 14:20:58 (`BodyStand: dead 798EB had 289 health; taken` at its death). Its prompt then read "Steal", and at 14:22:08 the host's game reported riding it (`Mount: copy FF001386 of rider 12 told to ride copy 798EB` in player 2's log).
+      It read "Search" after player 2 touched it; no log line says what changed. Build 1a16be1 adds the TEMPORARY `Mount: X starts to ride Y, whose life state here is ...`, logged when a ride starts on a horse that is not plainly alive.
 - [!] **Dead bodies standing: a body already dead here was given health** (session 2026-10-31 20:09, 20:12: a searchable guard standing, almost all NPCs standing for player 2 at connect, standing skeletons for player 1). Fixed in build eed5ad8, not seen in play.
       Cause: a copy that is to die gets 1 health so it lives until `Kill()` (`ValuesUntilKilled`). Three arrival paths gave it to a body already dead in this game, where no kill follows, so the body kept 1 health, got up and stood, still searchable. A save keeps that.
       Two real games on one save: the same corpse read -99877 health, lying, in its owner's game and 1 health, standing (pelvis 63 over the feet), in the second. Taking the health alone did not lay it down; `RagdollInstant` did. The first guess, the leveled rebuild, was wrong: with no rebuild they stood all the same.
@@ -482,6 +578,72 @@ After the session the logs answer the rest: `Stall:`, `Silence:`, `ThreadOwners:
       Rig, two real games: the leader moved 15:03 to 21:03, both games there within a second, a quarter day passed in both, the member's controls never locked; a member, an hour past 24 and the hour it is already: nothing moved. Not seen in play.
       The first try was refused: both players were in combat at the fort with no target. The server answers 2, 3, 6 were not run. MGO's server does not set bEnableSleep, so there it is refused.
       Left as it is: in the flat build only, a menu opened and closed within a round trip leaves a stale grant that a plugin's ask then takes.
+      `urSovngarde_IsPlayerCopy`: true only for another player's live copy here; a copy left from that player's earlier connection, switched off until freed, answers false.
+      The siege mod's own test (any temporary actor not owned here) also took that old copy and other games' humanoid NPC copies for players.
+      Build v1.9.8-3-ge54d2693-dirty.e2e5284. Rig, two real games on v1.9.8-4-g2200fbc6 (`two-games-switch.py sides`): true for the second player's copy, false for an NPC and for the game's own player.
+- [!] **A temporary actor its game deleted lived on in another game** (the siege's dragon, 11-06 17:55: deleted by the leader's plugin, given to player 2's game by the server, then back as a copy).
+      The client let any local temporary actor go as if its cell had unloaded. Now one marked deleted while its cell is loaded is released as `Deleted`, and the server removes it from every game; a placed actor is still only let go.
+      One the game has already freed is still handed on: the game also frees the temporary actors of a cell left by a door or a teleport, before the client notices, and a player still there should keep them.
+      Protocol change: both players and the server need it. Build v1.9.8-3-ge54d2693-dirty.e2e5284 (client), server since 2128844, FUS and MGO.
+      Not rig-tested: an actor nothing holds is freed the moment it is marked (Papyrus `Delete` and the console's `markfordelete` alike), so the rig cannot make the held, marked state the dragon was in.
+      An interim build that took a freed actor as deleted was green in the rig, and was withdrawn after review for the door case.
+      To see: a siege battle's end leaves no dragon in player 2's game, the leader's log has `Deleted: local actor ... released as deleted`, and the next battle has one dragon.
+- [ ] **PLANCK crashes at the main menu since v1.9.8, for players on a Quest 3 or 3S through Steam Link** (hub `planck-right-hand-at-load`; two machines, 11-05 and 11-06).
+      `activeragdoll.dll+0x24D04` reads through a null pointer next to the player's `RightWandNode`, called from HIGGS's hook of the player's update in the AI job, 0.3 to 1 s after the main menu's scene loads (the "VR Playroom", player "Prisoner").
+      Same PCs and headsets on v1.9.7: 7 of 8 and 4 of 5 starts got into the game; on v1.9.8, 2 of 12 and 3 of 15. A Quest 3 through Steam Link on v1.9.6 and v1.9.7 never hit it (26 starts).
+      Not found in v1.9.7..v1.9.8: nothing new touches hands, HIGGS or PLANCK at the main menu, and the client logs the same lines in the same order on both. The moved `Main::Update` hook (CBPC fix) is the only change there that runs every frame; HIGGS does not hook that call.
+      Both crashing machines run PLANCK 0.8.2: the crashing read sits at +0x24D04 only in 0.8.2 (0.8.1 has it at +0x24C04, the Lifetime-and-Collision fix DLL at +0x25224).
+      The read is the same in all three: the first-person right hand from the player's node table, unchecked.
+      Machines seen on 0.8.1 or the fix DLL never crashed there. Both crashing machines start straight into the VR Playroom: a start-up console command, no Main Menu.
+      Rig, v1.9.8-4 with PLANCK 0.8.2, started into that room the same way (`headless.ps1 up -NoConnect -MainMenuCommand 'cow VRPlayroom 29 -5'`): "Prisoner" spawned, no fault.
+      So the missing piece is Steam Link with a Quest 3 or 3S; the rig's controllers are virtual and there from the start.
+      Next: a Steam Link start on a Quest, straight into the playroom with PLANCK 0.8.2, on v1.9.8 and then on v1.9.7.
+- [!] **8 GB more at every load, freezes and wrong colours: the siege plugin queued SKSE tasks 20 times a second through loads** (both players, 11-07; KNOWN_ISSUES has the details).
+      Seen: textures in the wrong colours at load, loads up to 5 min 40 s, slow play, and freezes at the first load when the game passed the PC's 31 GB of RAM.
+      Cause found by a rig A/B and the siege session's bisect: its glide thread (since 11-06 20:08) queued a task 20 times a second at all times; empty tasks did the same. This client plays no part.
+      Fixed in the siege plugin (8eb27e9, deployed to FUS 15:19): the first `Health:` after a load on the owner's save is 8.7 GB, against 18.4 before, as on 11-05.
+      To see in play: the colours right at load, `Health:` at the first load near 20 GB, no `FreezeWatchdog:` there. Seen needs the new siege DLL too.
+- [ ] **A crash moving a dead follower's items to the dead-body cleanup coffin** (the owner's game, 11-07 19:53 and 11-08 12:14, each at the second siege battle).
+      Both times Lydia died, and 9 to 12 s later `ReferenceEnable: A2C94 ... switched off here, as the leader's game has it`: a plugin in the leader's game switched her off with `urSovngarde_SwitchActor`, which is meant for placed actors.
+      The party-hour jump then made the game's cleanup script empty the switched-off body into its coffin (reference 172B6, base F6891), and the game crashed on a freed extra-data list in the coffin's entry.
+      Rig, the owner's 11-07 19:32 autosave (2026-11-08): kill Lydia, `Disable`, `RemoveAllItems` into 172B6 crashes with the play stack, with this client loaded and with the plain game; the same move without `Disable` works.
+      So the crash is the game's own; the switch-off of a dead follower sets it up. A body without duplicate items was not tried: she holds 13 Sentinel cloaks and 6 Sentinel boots, how they came is not known.
+      An earlier rig A/B passed F6891, the base, as the destination, which deletes the items instead of moving them; its "no crash" says nothing. With this client connected 5 kinds of item were back on her after it.
+      The siege's call was its "set the fort's own people aside" step: its follower test is the game's teammate flag, which the game clears at death. The siege now skips the dead (deployed 2026-11-08 12:55, not seen in play).
+      Guard here too (uncommitted, built v1.9.8-11-g4f4002ca-dirty.03a7b50, FUS and MGO): a leader's switch-off leaves on a dead actor whose reference a master file holds, logging `ReferenceEnable: dead X (base Y) left on here`; the leader's game does not send it either (`not switched off for the party`). A plugin's own placed or spawned dead still go, as the siege needs.
+      Rig `live-dead-switch`: RED on the build before (Lydia switched off), GREEN on 03a7b50 (left on); her body then emptied into the coffin without a crash. Not seen in play.
+      To see: no crash at a second battle after a follower died; no `ReferenceEnable: ... switched off` line for a follower.
+- [ ] **A crash when a revived soldier's copy equips arrows** (player 2's game, 2026-11-08 14:29:45, first battle at Sungard, a Stormcloak reinforcement wave; both on 03a7b50).
+      The copy FE09F8A8 came back as a body in that game and had its items set to its owner's; 70 ms later its owner revived it, and 3 s later its arrow equip crashed the game.
+      The crash is in Enchantment Art Extender VR's equip handler (1.0.2.1, also in the owner's profile): on every equip of a living actor it reads the right hand's entry in the actor's AI process (+0x260) and that entry's extra data, and that extra data was freed.
+      How that hand came to name freed extra data is not known. The copy had been switched on 106 ms before its items were set, and it was dead then; the arrows' extra data held 40 against a count of 26.
+      Rig, the owner's 11-07 19:32 autosave, three ways (`live-dead-copy-hands`): Lydia dead in this game, made the bot's copy, her items set to the bot's (none; a worn bow and arrows; the same right after she was switched on), revived, then an arrow equip.
+      Each time the game kept her hands right: it emptied them as her items went, filled them from the items set, and no hand named extra data her items did not hold. No crash, on 03a7b50 either.
+      So the cause is open, and what is built is a guard at the place of the crash, not a fix of a reproduced fault.
+      Guard (uncommitted, v1.9.8-12-gded04eaf-dirty.2d7425e, client and server on FUS and MGO, client only in effect, same protocol): a hand whose extra data is not its own item's (freed, or since given to another item) lets go of it.
+      It is checked around each removal this client makes, before a revival, and before each equip or hand item from a copy's owner; the plugin reads a hand with no extra data safely. Each time it acts it logs `HandWatch: X (dead: ...) pointed its right hand (item) at extra data ...; it lets go of it`.
+      Rig: `live-dead-copy-hands` passes (game alive, no `HandWatch:` line); it is a path check, not RED/GREEN, as the fault did not come.
+      To see: no crash when soldiers come back in a later wave. A `HandWatch:` line is the first sighting of such a hand, and says at which step it was found.
+- [ ] **The siege's battle page keeps the battle going** (`urSS_Battle`, the siege plugin's page with the soldiers left and End battle as a 3 s hold).
+      Opened unpaused by its plugin it took no laser clicks on the two-game rig (11-04); it opens pausing, as the setup page does, which takes them.
+      Now on the unpaused menu list (VR only, connected only): the pause is cleared as it opens, and while it is open the player's controls and melee swings are held. Alone, it pauses.
+      Build v1.9.8-8-g65b14ee7-dirty.da89bed (client, FUS and MGO), TPTests 114 pass; the siege session tests it on the two-game rig. Not yet seen in play.
+      To see: in a battle with the page open, the fight goes on, the laser clicks the page, and a swing while pointing does not hit. In the log: `Menu opened while connected: urSS_Battle (runs unpaused)`.
+- [ ] **An essential NPC copy stays down after its owner's NPC got up** (Lydia, player 2's game, 11-06 18:00-18:15).
+      In the owner's game the battle kept dropping her into bleedout at -30 health. That health was copied onto her copy, and player 2's game put the copy into its own bleedout (life state 8, get-up queued, knock state 5).
+      Copies run no AI, so the copy never gets up by itself. When the owner's Lydia got up, `bleedOutStop` was refused on the copy as an action and as a graph event. She lay or slid from 18:03.
+      From 18:11 the copy counted as dead or dying, so `moveStart` and `TurnRight` were refused too and she stood still. Not fixed. The fallback (`IdleForceDefaultState`) runs for player copies only.
+      Direction: an essential copy should not enter the game's own bleedout from a copied health, or should be taken out of it when its owner's life state is alive. `Tools/VR/bleedout-slide.py` holds an essential NPC in bleedout, a start for a red test.
+- [x] **The two-game rig's second game closed itself at start** (11-05 09:09, 11-06 18:53): the `two-games.on` marker was missing, so the game's own check found the first game's window (`FindWindowA` in its start, VR 0x5B5969) and quit.
+      Not a fault: the marker had been removed after the last run, as the guide says. The `setup` step now creates it when missing.
+      With it, the second game starts, but its first load can stall: at 11-06 20:27 for over 15 min with no CPU (taken down), at 21:08 for 3 min before it went on; at 21:27 not at all.
+      Both games write the same SKSE log files, so the first game's plugin logs are cut when the second starts.
+- [ ] **A siege side does not show on player 2's copy in the leader's game** (11-06 17:51 and 17:56). The copy took its owner's factions 2 and 5 s before the leader's check (20 factions, the side one in them by the 19 and 20 counts), yet `IsInFaction` read no side.
+      Rig, two real games on v1.9.8-4-g2200fbc6 (`two-games-switch.py sides`, 11-06 21:12): the second player joined, left and joined `urSS_SideImperial`, and the copy followed each time within 3 to 4 s at rank 0, -2, 0.
+      So the faction travels; the play warnings stay unexplained. If they come back, log the copy's rank for each side at the leader's check.
+- [ ] **A crash in the game's own AI job in big siege battles** (`SkyrimVR.exe+0x743D74`, a job thread, `Job_Non_render_safe_AI` through ActorKnowledge; 11-05 18:27 and 11-06 21:16, the leader's game).
+      A function that removes entries from a list of shared pointers was given a garbage index (0xFB69C82C), as when the list changes under it. No frame of ours on the stack.
+      The 11-06 one came in the rig, two games on one PC at 2 fps (frames of 469 ms on average). Not known whether our copies play a part; a full dump from a crash in real play would show whose list it was.
 - [!] **A follower with no server id after a hand-over, so the other player loses her** (10-31 14:43, and 11-01 12:42: Lydia fighting for player 2 alone). Fixed in build v1.9.7-12-g629aaced-dirty.090ea03, protocol change, not seen in play.
       Cause, both times: her owner's game dropped her (`Transferring ownership of local actor`), nobody was in range of her last place, so the server removed her (`Removing actor ... no eligible owner remains`). The other game still ran her, with no server id: `server id not found for form id A2C94`.
       Fix: `NotifyRemoveCharacter` says when the server no longer has a character (`Gone`), and a game where that reference stands announces it again and runs it.
@@ -509,6 +671,8 @@ After the session the logs answer the rest: `Stall:`, `Silence:`, `ThreadOwners:
         Reading one game function that takes the lock settles it.
       - Confirmed: `HookActorProcess` (id 37356, VR 0x1406226a0) sits on a small alarm check. It never sees an actor and skips nothing, so copies run their own AI, against "Remote AI suppression" in KNOWN_ISSUES.
         It may be what writes a copy's graph each frame (see "An NPC taken over while it walks"). Moving it to 0x1405e0e20 stops the movement step, not the AI, and needs a real game. A decision, not a quick fix.
+        Seen in play 2026-11-08 21:35 to 21:37 at Fort Greymoor: Stormcloak copies near player 2, who is a Stormcloak in that save, went red on the compass, kept combat music on and flickered, without attacking, for about a minute.
+        That fits copies running their own AI against the owner's replay. What started the fight was not logged; the only candidate is the host's PvP hit on player 2 at 21:33:34. Left as it is for now, by player 2's choice.
       - One check only: `ApplyAnimationVariables` (id 39004) reads a third argument in r8b, and the live `ForceAction` path passes none, so a copy may get the wrong variables after a forced action.
       - Confirmed, small: `InterruptCast` (SE 33630) is called without its bool, so a copy's magicka refund depends on a leftover register.
       - Suspect: `CalculateRealDamage` applies the multiplier the game skips for a fall, so the health change sent for fall damage is too high. A hit by a player never takes that path.
@@ -728,7 +892,18 @@ After the session the logs answer the rest: `Stall:`, `Silence:`, `ThreadOwners:
       mount package, which it accepts, but the copy never gets on: copies run no AI of their own. Tried in the rig and
       reverted: `Actor::PutActorOnMountQuick` (vtable 0xAE on VR) returns false; letting the copy's AI run with its
       position free for 10 s left it beside the horse. Next if taken up: build the rider/mount `ExtraInteraction` on
-      the copy, then `PutActorOnMountQuick` (real reverse work on VR); or ask cmpayc's fork whether it has mounts.
+      the copy, then `PutActorOnMountQuick` (real reverse work on VR).
+      Checked 2026-11-05: cmpayc's fork has upstream's mount code unchanged, the same as ours; nothing to borrow.
+      The siege mod's cavalry needs it, and ships switched off until then (NPC riders the host seats with
+      `InitiateMountPackage`). What it takes besides seating the copy:
+      - A mount asked before rider and horse have server ids is dropped without a log line (`OnMountEvent`); hold it until both exist.
+      - `NotifyMount` goes once, to the players in range: the server keeps no rider-to-horse state, so a game that loads the
+        pair later, or joins, sees the rider on foot. The pair belongs in the actor's spawn data (protocol change).
+      - No dismount message or hook exists (a knockdown's get-up, `Dismount`, the horse's death).
+      - Hand-offs move each actor alone (`TransferToNextOwner`, the out-of-range sweep): with three players a rider and its
+        horse can split. A mounted pair should move together.
+      - A seated copy must not be placed at the owner's reported position, or interpolation fights the saddle.
+      - Mounted combat on a copy has never been tested.
 - [ ] **NPCs pulled back when a player joins** (2026-10-14): NPCs that walked away in the host's game, then were removed
       by the server for want of an owner, come back where the joiner's save has them. A fix that remembered the last
       released place was tried and removed the same evening: some release positions are bad ((0, 0, 0) for an unloaded

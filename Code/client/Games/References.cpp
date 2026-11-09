@@ -59,6 +59,11 @@ float CalculateRealDamage(Actor* apHittee, float aDamage, bool aKillMove, bool a
 
     float multiplier = s_getDifficultyMultiplier(PlayerCharacter::Get()->difficulty, ActorValueInfo::kHealth, isPlayer);
 
+    // Between players only half of what the difficulty adds counts: Master hits 1.5 times as hard instead of 2, Legendary 2 times instead of 3.
+    constexpr float cPvpShareOfExtra = 0.5f;
+    if (aOnOtherPlayer && multiplier > 1.f)
+        multiplier = 1.f + (multiplier - 1.f) * cPvpShareOfExtra;
+
     float realDamage = aDamage;
 
     // TODO(cosideci): this seems problematic? It may not register the kill for others?
@@ -71,7 +76,8 @@ float CalculateRealDamage(Actor* apHittee, float aDamage, bool aKillMove, bool a
 
 // Skyrim's fights are made for one player: the first entry is a player alone, and a party of more than four counts as four.
 constexpr float cPartyEnemyHealth[] = {1.f, 1.5f, 1.9f, 2.25f};
-constexpr float cPartyEnemyDamage[] = {1.f, 1.2f, 1.35f, 1.5f};
+// Damage stays at two players' level for bigger parties, so a single hit does not take a player down.
+constexpr float cPartyEnemyDamage[] = {1.f, 1.2f, 1.2f, 1.2f};
 
 float PartyEnemyHealth(const uint32_t aPlayersNearby) noexcept
 {

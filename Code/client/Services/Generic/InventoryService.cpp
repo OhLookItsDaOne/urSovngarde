@@ -1,6 +1,7 @@
 #include <Services/InventoryService.h>
 #include <EpochMiss.h>
 #include <PerfScope.h>
+#include <RecentModelChanges.h>
 
 #include <Messages/RequestObjectInventoryChanges.h>
 #include <Messages/NotifyObjectInventoryChanges.h>
@@ -292,6 +293,9 @@ void InventoryService::OnNotifyEquipmentChanges(const NotifyEquipmentChanges& ac
         return;
     }
 
+    // The equip makes other plugins read the copy's hands.
+    pActor->LetHandsGoOfStrayExtraData("its item does not hold, before an equip from its owner");
+
     uint32_t equipSlotId = modSystem.GetGameId(acMessage.EquipSlotId);
     TESForm* pEquipSlot = TESForm::GetById(equipSlotId);
 
@@ -462,6 +466,7 @@ void InventoryService::RunNakedNPCBugChecks() noexcept
         ScopedEquipOverride seo;
         ScopedInventoryOverride sio;
 
+        RecentModelChanges::Note(pActor, RecentModelChanges::Kind::ItemsChanged);
         pActor->ResetInventory(false);
 
         if (++resets == cMaxResets)
@@ -574,6 +579,9 @@ void NoteHandItem(Actor* apActor, TESForm* apItem, bool aLeft, bool aEquipped) n
 
 void InventoryService::ApplyHandEquipment(Actor* apActor, const Inventory& acEquipment, bool aArrival) noexcept
 {
+    // The equips below make other plugins read the actor's hands.
+    apActor->LetHandsGoOfStrayExtraData("its item does not hold, before its owner's hand items");
+
     constexpr uint8_t cLightFormType = 31;
 
     auto& modSystem = World::Get().GetModSystem();

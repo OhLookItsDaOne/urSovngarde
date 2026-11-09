@@ -187,6 +187,10 @@ struct TESObjectREFR : TESForm
     uint32_t GetAnimationVariableInt(BSFixedString* apVariableName) noexcept;
 
     void RemoveAllItems() noexcept;
+    //! Gives each item at least the count its extra data lists hold, a list counting 0 or less a count of 1, so that removing them ends.
+    void MatchCountsToExtraData() noexcept;
+    //! For an actor: a hand pointing at extra data that is not its item's lets go of it.
+    void LetHandsGoOfStrayExtraData(const char* acpWhen) noexcept;
     Vector<uint32_t> RemoveNonQuestItems(Inventory& aCurrentInventory) noexcept;
     void Delete() const noexcept;
     void Disable() const noexcept;

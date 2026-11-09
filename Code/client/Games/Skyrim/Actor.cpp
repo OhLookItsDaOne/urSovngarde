@@ -15,6 +15,7 @@
 #include <Games/Memory.h>
 #include <Combat/CombatController.h>
 #include <CrashHandler.h>
+#include <RecentModelChanges.h>
 
 #include <Events/HealthChangeEvent.h>
 #include <Events/InventoryChangeEvent.h>
@@ -326,6 +327,7 @@ void Actor::QueueUpdate() noexcept
     TP_THIS_FUNCTION(TQueueUpdate, void, Actor, bool);
     POINTER_SKYRIMSE(TQueueUpdate, QueueUpdate, 40255, 39181);
 
+    RecentModelChanges::Note(this, RecentModelChanges::Kind::Rebuilt);
     TiltedPhoques::ThisCall(QueueUpdate, this, true);
 
     pSetting->data = originalValue;
@@ -426,6 +428,7 @@ void Actor::SetWeaponDrawnEx(bool aDraw) noexcept
         spdlog::debug("Setting weapon drawn after update: {:X}:{}, current state: {}", formID, aDraw, actorState.IsWeaponDrawn());
     }
 
+    RecentModelChanges::Note(this, RecentModelChanges::Kind::WeaponDrawn);
     g_forceAnimation = true;
     SetWeaponDrawn(aDraw);
     g_forceAnimation = false;
@@ -934,6 +937,7 @@ void Actor::SetActorInventory(const Inventory& acInventory) noexcept
 
     if (!cUnchanged)
     {
+        RecentModelChanges::Note(this, RecentModelChanges::Kind::ItemsChanged);
         const ActorExtension* pSelfExtension = this->GetExtension();
         if (pSelfExtension && !pSelfExtension->IsPlayer() && currentInventory.ContainsQuestItems())
             SetInventoryRetainingQuestItems(currentInventory, acInventory);
@@ -1151,6 +1155,8 @@ void Actor::Kill(Actor* apKiller) noexcept
     if (pExtension->IsPlayer())
         return;
 
+    RecentModelChanges::Note(this, RecentModelChanges::Kind::Killed);
+
     // Remote actors only play animations sent by their owner (HookPerformAction).
     // The death animation and ragdoll have to go through here, or the body dies standing up.
     const bool forceAnimation = pExtension->IsRemote();
@@ -1203,6 +1209,8 @@ bool Actor::PlayIdle(TESIdleForm* apIdle) noexcept
 
 void Actor::Respawn() noexcept
 {
+    RecentModelChanges::Note(this, RecentModelChanges::Kind::Revived);
+    LetHandsGoOfStrayExtraData("its item does not hold, before its revival");
 #ifdef SKYRIMVR
     // Resurrect(resetInventory, attach3D) = SE 36331, by address like KillImpl above.
     // No Reset here: it unloads the actor, and a copy announced again that way comes back dead.
@@ -1372,7 +1380,7 @@ bool TP_MAKE_THISCALL(HookDamageActor, Actor, float aDamage, Actor* apHitter, bo
             aDamage *= GameplayFormulas::PartyEnemyDamage(cPlayersNearby);
     }
 
-    // Every hit of this player on another player, by weapon or by spell, is as strong as an NPC's hit on a player.
+    // Every hit of this player on another player, by weapon or by spell, is as strong as an NPC's hit on a player, with half of what the difficulty adds.
     const ActorExtension* pExPlayerHitter = apHitter ? apHitter->GetExtension() : nullptr;
     const bool cOnOtherPlayer = pExHittee->IsRemotePlayer() && pExPlayerHitter && pExPlayerHitter->IsLocalPlayer();
     float realDamage = GameplayFormulas::CalculateRealDamage(apThis, aDamage, aKillMove, cOnOtherPlayer);
@@ -1526,6 +1534,24 @@ static TApplyActorEffect* RealApplyActorEffect = nullptr;
 
 void TP_MAKE_THISCALL(HookApplyActorEffect, ActiveEffect, Actor* apTarget, float aEffectValue, unsigned int unk1)
 {
+    // A copy's effect is not applied while this player has no cell, as while a jail sentence moves them out.
+    // Applying it checks the effect's conditions, and one that asks the player's region reads a cell that is not there.
+    // A copy's values come from its owner, so nothing is lost.
+    if (apTarget && apTarget->GetExtension() && apTarget->GetExtension()->IsRemote())
+    {
+        const PlayerCharacter* pPlayer = PlayerCharacter::Get();
+        if (pPlayer && !pPlayer->parentCell)
+        {
+            static std::atomic<uint32_t> s_skipped{0};
+            static std::atomic<int64_t> s_nextSaid{0};
+            const uint32_t cSkipped = ++s_skipped;
+            const int64_t cNow = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (int64_t next = s_nextSaid.load(); cNow >= next && s_nextSaid.compare_exchange_strong(next, cNow + 10))
+                spdlog::info("ApplyEffect: an effect on copy {:X} not applied while this player has no cell ({} so far)", apTarget->formID, cSkipped);
+            return;
+        }
+    }
+
     const auto* pValueModEffect = Cast<ValueModifierEffect>(apThis);
 
     if (pValueModEffect)
@@ -1675,7 +1701,10 @@ void Actor::DropOrPickUpObject(const Inventory::Entry& arEntry, NiPoint3* apLoca
     }
 
     if (arEntry.Count < 0)
+    {
+        RecentModelChanges::Note(this, RecentModelChanges::Kind::ItemsChanged);
         DropObject(pObject, pExtraData, -arEntry.Count, apLocation, apRotation);
+    }
     // TODO: pick up
 }
 
@@ -1736,6 +1765,11 @@ bool TP_MAKE_THISCALL(HookInitiateMountPackage, Actor, Actor* apMount)
     const ActorExtension* pExtension = apThis->GetExtension();
     if (apMount && pExtension && pExtension->IsLocal())
         World::Get().GetRunner().Trigger(MountEvent(apThis->formID, apMount->formID));
+
+    // TEMPORARY: a horse killed in play could still be ridden (its prompt said "Steal"); what the game had of it when a ride began.
+    if (apMount && pExtension && pExtension->IsLocal() && (((apMount->actorState.flags1 >> 21) & 0xF) != 0 || apMount->GetActorValue(ActorValueInfo::kHealth) <= 0.f))
+        spdlog::info("Mount: {:X} starts to ride {:X}, whose life state here is {} (dead {}), health {:.0f}", apThis->formID, apMount->formID,
+                     (apMount->actorState.flags1 >> 21) & 0xF, apMount->IsDead(), apMount->GetActorValue(ActorValueInfo::kHealth));
 
     return TiltedPhoques::ThisCall(RealInitiateMountPackage, apThis, apMount);
 }
