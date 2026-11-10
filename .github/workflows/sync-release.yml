@@ -6,6 +6,7 @@ name: Sync upstream release into server
 # with GITHUB_TOKEN do not start other workflows, and the push must start "Build linux", which publishes
 # the server-<version> release. On a merge conflict, or when the fix is gone after the merge, nothing is
 # pushed and the run fails, so GitHub mails the owner.
+# The newest commit on main must not carry [skip ci]: GitHub then skips the scheduled runs too.
 
 on:
     schedule:
