@@ -1,7 +1,7 @@
 name: Sync upstream release into server
 
 # The fork's `server` branch is the latest upstream release plus the fork's Linux OpenSSL 3 fix.
-# Every hour this checks Dosylia/urSovngarde for a new release and merges its tag into `server`.
+# Every 15 minutes this checks Dosylia/urSovngarde for a new release and merges its tag into `server`.
 # The push uses SYNC_TOKEN (a fine-grained token with Contents: write on this fork), because pushes made
 # with GITHUB_TOKEN do not start other workflows, and the push must start "Build linux", which publishes
 # the server-<version> release. On a merge conflict, or when the fix is gone after the merge, nothing is
@@ -10,7 +10,9 @@ name: Sync upstream release into server
 
 on:
     schedule:
-        - cron: "23 * * * *"
+        # Every 15 minutes: GitHub drops most scheduled runs of this fork (on 2026-11-10..12 only one hourly run
+        # in seven or eight started), so more slots bring the delay after a release down. Each run takes ~10 s.
+        - cron: "7,22,37,52 * * * *"
     workflow_dispatch:
 
 permissions:
