@@ -262,12 +262,36 @@ void CharacterService::HandOffAbandonedActors() const noexcept
     }
 }
 
+// A debug option: where each player is, every ten seconds, at debug level (so only a server run with URSOVNGARDE_LOG_LEVEL debug or trace writes it).
+// One line a player; a test player (STBot) is sent to somebody with its --x, --y and --worldspace, or "cell <id>" indoors.
+static void LogWhereabouts(World& aWorld) noexcept
+{
+    static std::chrono::steady_clock::time_point s_next{};
+    const auto cNow = std::chrono::steady_clock::now();
+    if (cNow < s_next || !spdlog::should_log(spdlog::level::debug))
+        return;
+    s_next = cNow + std::chrono::seconds(10);
+
+    for (Player* pPlayer : aWorld.GetPlayerManager())
+    {
+        const auto cCharacter = pPlayer->GetCharacter();
+        const auto* pMovement = cCharacter && aWorld.valid(*cCharacter) ? aWorld.try_get<MovementComponent>(*cCharacter) : nullptr;
+        if (!pMovement)
+            continue;
+        const auto& cell = pPlayer->GetCellComponent();
+        spdlog::debug("Where: player {} '{}' in '{}': worldspace {:X}:{:X}, cell {:X}:{:X}, grid ({}, {}), at ({:.0f}, {:.0f}, {:.0f})", pPlayer->GetId(),
+                      pPlayer->GetUsername().c_str(), pPlayer->GetPlace().c_str(), cell.WorldSpaceId.ModId, cell.WorldSpaceId.BaseId, cell.Cell.ModId, cell.Cell.BaseId,
+                      cell.CenterCoords.X, cell.CenterCoords.Y, pMovement->Position.x, pMovement->Position.y, pMovement->Position.z);
+    }
+}
+
 void CharacterService::OnUpdate(const UpdateEvent&) const noexcept
 {
     ProcessFactionsChanges();
     HandOffAbandonedActors();
     ProcessPendingLeaderAssignments();
     LogPresenceCensus();
+    LogWhereabouts(m_world);
 }
 
 void CharacterService::OnActorPresenceRequest(const PacketEvent<RequestActorPresence>& acMessage) const noexcept
