@@ -30,19 +30,22 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      actions: read
     steps:
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: urSovngarde-*-windows-*
-          merge-multiple: true
-          path: release-assets
-
       - name: Publish the test client
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # The build uploads its zips as they are, and download-artifact would unpack them, so each is fetched whole.
+          mkdir release-assets
           cd release-assets
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" --paginate \
+            -q '.artifacts[] | select(.name | test("^urSovngarde-.*-windows-")) | "\(.id) \(.name)"' |
+            while read -r id name; do
+              gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > "${name%.zip}.zip"
+            done
           ls -l
+          for zip in *.zip; do unzip -tq "$zip"; done
           main="$(ls urSovngarde-*-windows-x64.zip)"
           version="${main#urSovngarde-}"
           version="${version%-windows-x64.zip}"
