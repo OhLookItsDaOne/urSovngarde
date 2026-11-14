@@ -139,6 +139,9 @@ void DroppedItemService::OnMove(const PacketEvent<RequestDroppedItemMove>& acMes
     if (it == m_items.end())
         return; // picked up meanwhile
 
+    if (!TakeHold(m_itemHolds, message.Id, acMessage.pPlayer, message.AtRest, "dropped item"))
+        return;
+
     it->second.Position = message.Position;
     it->second.Rotation = message.Rotation;
 
@@ -165,6 +168,12 @@ void DroppedItemService::OnObjectMove(const PacketEvent<RequestWorldObjectMove>&
 {
     const auto& message = acMessage.Packet;
     const uint64_t cKey = (static_cast<uint64_t>(message.ObjectId.ModId) << 32) | message.ObjectId.BaseId;
+
+    // Taken into an inventory: nobody holds it any more, whoever did.
+    if (message.Taken)
+        m_objectHolds.erase(cKey);
+    else if (!TakeHold(m_objectHolds, cKey, acMessage.pPlayer, message.AtRest, "world object"))
+        return;
 
     // Every move is remembered, so a resend never puts the object back where it was before.
     ObjectPlace& place = m_objects[cKey];
@@ -214,11 +223,63 @@ void DroppedItemService::OnPull(const PacketEvent<RequestPull>& acMessage) const
         return;
     }
 
+    // The holder's game is the one that moves it. With no holder, everyone near the hand is told, and a game that moves it anyway acts.
+    const uint64_t cKey = message.Kind == RequestPull::kWorldObject ? (static_cast<uint64_t>(message.ObjectId.ModId) << 32) | message.ObjectId.BaseId : message.ServerId;
+    if (Player* pHolder = HolderOf(message.Kind == RequestPull::kWorldObject ? m_objectHolds : m_itemHolds, cKey))
+    {
+        if (pHolder != acMessage.pPlayer)
+            pHolder->Send(notify, TiltedPhoques::kUnreliable);
+        return;
+    }
+
     for (Player* pPlayer : m_world.GetPlayerManager())
     {
         if (pPlayer != acMessage.pPlayer && pPlayer->GetCellComponent().IsInRange(acMessage.pPlayer->GetCellComponent(), false))
             pPlayer->Send(notify, TiltedPhoques::kUnreliable);
     }
+}
+
+bool DroppedItemService::TakeHold(std::map<uint64_t, Hold>& aHolds, const uint64_t aKey, const Player* apPlayer, const bool aAtRest, const char* apWhat) noexcept
+{
+    constexpr auto cHoldFor = std::chrono::seconds(3);
+    const auto cNow = std::chrono::steady_clock::now();
+
+    const auto cHold = aHolds.find(aKey);
+    if (cHold != aHolds.end() && cHold->second.PlayerId != apPlayer->GetId() && cNow - cHold->second.LastMove < cHoldFor &&
+        m_world.GetPlayerManager().GetById(cHold->second.PlayerId))
+    {
+        if (cNow >= cHold->second.NextLog)
+        {
+            cHold->second.NextLog = cNow + std::chrono::seconds(2);
+            spdlog::info("Referee: {} {:X} is held by player {:X}; player {:X}'s move of it is dropped", apWhat, aKey, cHold->second.PlayerId, apPlayer->GetId());
+        }
+        return false;
+    }
+
+    if (aAtRest)
+    {
+        if (cHold != aHolds.end())
+        {
+            spdlog::info("Referee: player {:X} let go of {} {:X}", apPlayer->GetId(), apWhat, aKey);
+            aHolds.erase(cHold);
+        }
+        return true;
+    }
+
+    if (cHold == aHolds.end() || cHold->second.PlayerId != apPlayer->GetId())
+        spdlog::info("Referee: player {:X} now holds {} {:X}", apPlayer->GetId(), apWhat, aKey);
+    Hold& hold = aHolds[aKey];
+    hold.PlayerId = apPlayer->GetId();
+    hold.LastMove = cNow;
+    return true;
+}
+
+Player* DroppedItemService::HolderOf(const std::map<uint64_t, Hold>& acHolds, const uint64_t aKey) const noexcept
+{
+    const auto cHold = acHolds.find(aKey);
+    if (cHold == acHolds.end() || std::chrono::steady_clock::now() - cHold->second.LastMove >= std::chrono::seconds(3))
+        return nullptr;
+    return m_world.GetPlayerManager().GetById(cHold->second.PlayerId);
 }
 
 // Reads the packet, not the player's cell component, which another service updates from the same packet in no set order.

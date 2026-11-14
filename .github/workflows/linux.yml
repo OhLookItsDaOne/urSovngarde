@@ -164,6 +164,15 @@ jobs:
                   tar -C release-stage -czf \
                     "release-assets/urSovngardeServer-${version}-linux-${{ matrix.arch }}.tar.gz" \
                     .
+                  # test-build: the headless test player (STBot) and its scripts, to try the build against the Testbuild server without a second game.
+                  if [ "$GITHUB_REF" = "refs/heads/test-build" ]; then
+                    install -d bot-stage/scripts
+                    install -m 755 packaged/bin/STBot bot-stage/
+                    cp packaged/lib/*.so bot-stage/ 2>/dev/null || true
+                    cp Code/bot/scripts/*.txt bot-stage/scripts/
+                    ldd bot-stage/STBot || true
+                    tar -C bot-stage -czf "release-assets/STBot-${version}-linux-${{ matrix.arch }}.tar.gz" .
+                  fi
 
             - name: Upload the server branch's build
               if: ${{ github.ref == 'refs/heads/server' || github.ref == 'refs/heads/test-build' }}
@@ -173,6 +182,15 @@ jobs:
                   retention-days: 30
                   if-no-files-found: error
                   path: release-assets/urSovngardeServer-${{ env.ARTIFACT_VERSION }}-linux-${{ matrix.arch }}.tar.gz
+
+            - name: Upload the test player
+              if: ${{ github.ref == 'refs/heads/test-build' }}
+              uses: actions/upload-artifact@v7
+              with:
+                  name: urSovngardeServer-${{ env.ARTIFACT_VERSION }}-linux-${{ matrix.arch }}-bot
+                  retention-days: 30
+                  if-no-files-found: error
+                  path: release-assets/STBot-${{ env.ARTIFACT_VERSION }}-linux-${{ matrix.arch }}.tar.gz
 
             # Upload artifacts
             - name: Upload build files for the next job
@@ -208,7 +226,10 @@ jobs:
                   amd64="$(ls urSovngardeServer-*-linux-amd64.tar.gz)"
                   version="${amd64#urSovngardeServer-}"
                   version="${version%-linux-amd64.tar.gz}"
-                  sha256sum urSovngardeServer-*.tar.gz > SHA256SUMS
+                  # The test player, on test-build only.
+                  bots=()
+                  if ls STBot-*.tar.gz >/dev/null 2>&1; then bots=(STBot-*.tar.gz); fi
+                  sha256sum urSovngardeServer-*.tar.gz "${bots[@]}" > SHA256SUMS
                   cat SHA256SUMS
                   tag="server-$version"
                   title="Server build $version"
@@ -228,4 +249,4 @@ jobs:
                   gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
                     --title "$title" --latest=false "${prerelease[@]}" \
                     --notes "$notes" \
-                    urSovngardeServer-*.tar.gz SHA256SUMS
+                    urSovngardeServer-*.tar.gz "${bots[@]}" SHA256SUMS

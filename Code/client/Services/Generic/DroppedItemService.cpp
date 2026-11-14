@@ -942,6 +942,14 @@ void DroppedItemService::OnNotifyWorldObjectMove(const NotifyWorldObjectMove& ac
 
     const auto now = std::chrono::steady_clock::now();
     Motion& motion = m_objectMotion[cFormId];
+    if (acMessage.AtRest)
+    {
+        // A put-down from the game that had it before, while this player carries it: it is this game's now, and stays in the hand.
+        if (!motion.Held && motion.Moving && now - motion.LastLocalMove < std::chrono::milliseconds(500))
+            return;
+        if (TakeOverPulled(RequestPull::kWorldObject, 0, cFormId, pRef, motion))
+            return;
+    }
     if (!motion.Held)
     {
         pRef->SetMotionType(TESObjectREFR::kMotionKeyframed);
@@ -983,6 +991,15 @@ void DroppedItemService::OnNotifyDroppedItemMove(const NotifyDroppedItemMove& ac
         return;
 
     const auto now = std::chrono::steady_clock::now();
+
+    if (acMessage.AtRest)
+    {
+        // As for a world object (OnNotifyWorldObjectMove).
+        if (!motion.Held && motion.Moving && now - motion.LastLocalMove < std::chrono::milliseconds(500))
+            return;
+        if (TakeOverPulled(RequestPull::kDroppedItem, acMessage.Id, it->second, pRef, motion))
+            return;
+    }
 
     // Held still while the other side moves it, or local physics pulls it down between updates and it stutters.
     // Also for a lone "put down": it is placed exactly, then let go.
@@ -1052,6 +1069,45 @@ void DroppedItemService::RunPulls(const std::chrono::steady_clock::time_point aN
                 m_transport.Send(request);
         };
 
+        // The key of this player's own hand, for a pull this game does itself.
+        const uint64_t cLocalKey = (static_cast<uint64_t>(0xFFFFFFFFu) << 1) | side;
+
+        if (pull.Active && pull.Local)
+        {
+            // This game runs the thing now (TakeOverPulled), and the hand pulls it here: no HIGGS grab holds it, as the press began before it was ours.
+            Motion* pMotion = nullptr;
+            if (pull.Kind == RequestPull::kWorldObject)
+            {
+                if (const auto cMotion = m_objectMotion.find(pull.FormId); cMotion != m_objectMotion.end())
+                    pMotion = &cMotion->second;
+            }
+            else if (const auto cMotion = m_motion.find(pull.ServerId); cMotion != m_motion.end())
+                pMotion = &cMotion->second;
+            TESObjectREFR* pRef = Cast<TESObjectREFR>(TESForm::GetById(pull.FormId));
+
+            if (pMotion && pMotion->Held)
+            {
+                // Another game took it again (the referee gave it the hold): this hand pulls over there once more.
+                VRBodySync::EndPull(cLocalKey);
+                pull.Local = false;
+                spdlog::info("PullDiag: {:X} is another game's to move again; this player's {} hand pulls it over there", pull.FormId, side ? "right" : "left");
+            }
+            else if (cPressed && pMotion && pRef && !pRef->IsDeleted() && !pRef->IsDisabled() && VRBodySync::PullBody(cLocalKey, pRef, hand))
+            {
+                // Carried: not put down while it hangs still from the hand.
+                pMotion->LastLocalMove = aNow;
+                continue;
+            }
+            else
+            {
+                VRBodySync::EndPull(cLocalKey);
+                pull.Active = false;
+                spdlog::info("PullDiag: this player's {} hand let go of {:X}, which this game ran, after {:.1f} s", side ? "right" : "left", pull.FormId,
+                             std::chrono::duration<float>(aNow - pull.Since).count());
+                continue;
+            }
+        }
+
         if (pull.Active)
         {
             // Still theirs to move: held for them here, or a body they still run.
@@ -1092,15 +1148,17 @@ void DroppedItemService::RunPulls(const std::chrono::steady_clock::time_point aN
             continue;
         }
 
-        if (!cEdge)
+        if (!cPressed)
             continue;
 
         // The nearest thing under the hand that another game is moving right now.
+        // A new press takes anything; a press already held takes only what this hand was just carrying, which the referee gave to another game.
+        const auto carriedHere = [&](const Motion& acMotion) { return aNow - acMotion.LastLocalMove < std::chrono::seconds(1); };
         HandPull found{};
         float nearest = cGrabReach;
         for (auto& [formId, motion] : m_objectMotion)
         {
-            if (!motion.Held)
+            if (!motion.Held || !(cEdge || carriedHere(motion)))
                 continue;
             TESObjectREFR* pRef = Cast<TESObjectREFR>(TESForm::GetById(formId));
             GameId objectId{};
@@ -1118,7 +1176,7 @@ void DroppedItemService::RunPulls(const std::chrono::steady_clock::time_point aN
         for (const auto& [id, refFormId] : m_refById)
         {
             const auto cMotion = m_motion.find(id);
-            if (cMotion == m_motion.end() || !cMotion->second.Held)
+            if (cMotion == m_motion.end() || !cMotion->second.Held || !(cEdge || carriedHere(cMotion->second)))
                 continue;
             TESObjectREFR* pRef = Cast<TESObjectREFR>(TESForm::GetById(refFormId));
             if (!pRef || !IsStillOurs(pRef, cMotion->second) || pRef->IsDeleted() || pRef->IsDisabled())
@@ -1139,7 +1197,7 @@ void DroppedItemService::RunPulls(const std::chrono::steady_clock::time_point aN
                 const uint32_t cFormId = view.get<FormIdComponent>(cEntity).Id;
                 Actor* pActor = Cast<Actor>(TESForm::GetById(cFormId));
                 // A body its owner is carrying; one that lies still is taken over by grabbing it, as before (IsRemoteBodyGrabbedHere).
-                if (!pActor || !pActor->actorState.IsDead() || !VRBodySync::IsBodyMovedByOwner(cFormId))
+                if (!cEdge || !pActor || !pActor->actorState.IsDead() || !VRBodySync::IsBodyMovedByOwner(cFormId))
                     continue;
                 if (const float cApart = VRBodySync::NearestNodeTo(pActor, hand); cApart < nearest)
                 {
@@ -1218,7 +1276,90 @@ void DroppedItemService::OnNotifyPull(const NotifyPull& acMessage) noexcept
         return;
     }
 
+    const auto cNow = std::chrono::steady_clock::now();
+
+    // Just handed over (below): their last positions are still arriving, and it is theirs now.
+    if (pMotion && cNow < pMotion->QuietUntil)
+    {
+        VRBodySync::EndPull(cKey);
+        return;
+    }
+
     // Counted as carried here: it is not called put down under the other player's hand, and its moves are sent though it is next to their copy.
-    if (VRBodySync::PullBody(cKey, pRef, glm::vec3(acMessage.Position)) && pMotion)
-        pMotion->LastLocalMove = std::chrono::steady_clock::now();
+    if (!VRBodySync::PullBody(cKey, pRef, glm::vec3(acMessage.Position)) || !pMotion)
+        return;
+    pMotion->LastLocalMove = cNow;
+
+    // With no hand of this player's on it, the other player has it alone, and their own game should run it: no delay for them.
+    // Said as a put-down, which the referee takes as letting go; their game takes it over (TakeOverPulled).
+    bool held = false;
+    for (uint8_t side = 0; side < 2; ++side)
+        if (glm::vec3 hand{}; VRBodySync::PressedHand(side, hand) && VRBodySync::NearestNodeTo(pRef, hand) <= 60.f)
+            held = true;
+    if (held)
+    {
+        pMotion->PulledUnheldSince = {};
+        return;
+    }
+    if (pMotion->PulledUnheldSince == std::chrono::steady_clock::time_point{})
+        pMotion->PulledUnheldSince = cNow;
+    if (cNow - pMotion->PulledUnheldSince < std::chrono::milliseconds(400))
+        return;
+
+    const glm::vec3 cPosition = WorldPositionOf(pRef);
+    const glm::vec3 cRotation = RotationOf(pRef);
+    if (acMessage.Kind == RequestPull::kWorldObject)
+    {
+        RequestWorldObjectMove request{};
+        request.ObjectId = acMessage.ObjectId;
+        auto& modSystem = m_world.GetModSystem();
+        if (TESObjectCELL* pObjectCell = pRef->GetParentCellEx())
+            modSystem.GetServerModId(pObjectCell->formID, request.CellId);
+        if (TESWorldSpace* pWorldSpace = pRef->GetWorldSpace())
+            modSystem.GetServerModId(pWorldSpace->formID, request.WorldSpaceId);
+        request.Position = cPosition;
+        request.Rotation = cRotation;
+        request.AtRest = true;
+        m_transport.Send(request);
+    }
+    else
+    {
+        RequestDroppedItemMove request{};
+        request.Id = acMessage.ServerId;
+        request.Position = cPosition;
+        request.Rotation = cRotation;
+        request.AtRest = true;
+        m_transport.Send(request);
+    }
+    VRBodySync::EndPull(cKey);
+    pMotion->PulledUnheldSince = {};
+    pMotion->Moving = false;
+    pMotion->LastPosition = cPosition;
+    pMotion->LastRotation = cRotation;
+    pMotion->QuietUntil = cNow + std::chrono::seconds(1);
+    spdlog::info("PullDiag: {:X} is pulled by player {:X} and no hand here is on it; handed over to their game", pRef->formID, acMessage.PlayerId);
+}
+
+bool DroppedItemService::TakeOverPulled(const uint8_t aKind, const uint32_t aServerId, const uint32_t aFormId, TESObjectREFR* apRef, Motion& aMotion) noexcept
+{
+    for (uint8_t side = 0; side < 2; ++side)
+    {
+        HandPull& pull = m_handPulls[side];
+        if (!pull.Active || pull.Local || pull.Kind != aKind || pull.FormId != aFormId || pull.ServerId != aServerId)
+            continue;
+
+        const auto cNow = std::chrono::steady_clock::now();
+        if (aMotion.Held)
+            apRef->SetMotionType(TESObjectREFR::kMotionDynamic);
+        aMotion.Held = false;
+        aMotion.Moving = true;
+        aMotion.LastLocalMove = cNow;
+        aMotion.QuietUntil = {};
+        aMotion.LastPosition = WorldPositionOf(apRef);
+        aMotion.LastRotation = RotationOf(apRef);
+        pull.Local = true;
+        spdlog::info("PullDiag: the game that moved {:X} let go of it while this player's {} hand pulls on it; this game runs it now", aFormId, side ? "right" : "left");
+        return true;
+    }
+    return false;
 }

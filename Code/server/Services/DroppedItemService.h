@@ -76,6 +76,22 @@ private:
         std::chrono::steady_clock::time_point MovedAt{};
     };
 
+    //! The referee for things players move by hand: one game at a time moves a thing, and that game is its holder.
+    //! The first to send a move holds it, until it says the thing is at rest, or sends nothing for three seconds, or leaves.
+    //! Moves from anyone else meanwhile are dropped: their game follows the holder's moves, and a hand of theirs on the thing pulls it there (OnPull).
+    struct Hold
+    {
+        uint32_t PlayerId{};
+        std::chrono::steady_clock::time_point LastMove{};
+        std::chrono::steady_clock::time_point NextLog{};
+    };
+    //! Whether this player's move of the thing counts, taking or keeping the hold; aAtRest gives the hold up.
+    bool TakeHold(std::map<uint64_t, Hold>& aHolds, uint64_t aKey, const Player* apPlayer, bool aAtRest, const char* apWhat) noexcept;
+    //! Who holds the thing now, or null.
+    Player* HolderOf(const std::map<uint64_t, Hold>& acHolds, uint64_t aKey) const noexcept;
+    std::map<uint64_t, Hold> m_objectHolds;
+    std::map<uint64_t, Hold> m_itemHolds;
+
     World& m_world;
     std::map<uint32_t, Item> m_items;
     std::map<uint64_t, ObjectPlace> m_objects;

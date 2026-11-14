@@ -41,6 +41,8 @@
 #include <Messages/RequestReferenceEnable.h>
 #include <Messages/NotifyReferenceEnable.h>
 #include <Messages/RequestWorldObjectMove.h>
+#include <Messages/RequestPull.h>
+#include <Messages/NotifyPull.h>
 #include <Messages/RequestDroppedItemMove.h>
 #include <Messages/RequestDroppedItemAdd.h>
 #include <Messages/RequestDroppedItemRemove.h>
@@ -1398,6 +1400,26 @@ void Bot::HandleMessage(const ServerMessage& acMessage) noexcept
         if (message.Id.ModId == m_skyrimModId)
             m_locks[message.Id.BaseId] = message.IsLocked;
         spdlog::info("Lock of {:X}:{:X} {} in another game, relayed here", message.Id.ModId, message.Id.BaseId, message.IsLocked ? "locked" : "unlocked");
+        return;
+    }
+
+    // Another player's hand on something this bot moves (it holds a world object with "moveobject ... held"): logged, at most once a second.
+    if (opcode == NotifyPull::Opcode)
+    {
+        const auto& message = static_cast<const NotifyPull&>(acMessage);
+        static Clock::time_point s_nextLog{};
+        static int s_count = 0;
+        ++s_count;
+        if (const auto cNow = Clock::now(); cNow >= s_nextLog || !message.Active)
+        {
+            s_nextLog = cNow + std::chrono::seconds(1);
+            const glm::vec3 cHand(message.Position);
+            spdlog::info("Pull: player {}'s {} hand {} {} {:X} / {:X}:{:X}, the hand at ({:.0f}, {:.0f}, {:.0f}); {} message(s) since the last line", message.PlayerId,
+                         message.Hand ? "right" : "left", message.Active ? "pulls on" : "let go of",
+                         message.Kind == RequestPull::kActor ? "character" : message.Kind == RequestPull::kWorldObject ? "world object" : "dropped item", message.ServerId,
+                         message.ObjectId.ModId, message.ObjectId.BaseId, cHand.x, cHand.y, cHand.z, s_count);
+            s_count = 0;
+        }
         return;
     }
 
@@ -2878,6 +2900,39 @@ bool Bot::StepCommand(const Command& acCommand, const bool aFirstTick) noexcept
         SendMsg(request);
         spdlog::info("[script] world object {:X} moved to ({:.0f}, {:.0f}, {:.0f}){}", refId, x, y, z, request.AtRest ? ", at rest" : "");
         return true;
+    }
+
+    // "pull object|item|actor <hex id> <x> <y> <z> <seconds> [left]": this bot's hand, at that place, on something another
+    // player's game is moving, the way a client reports a grip pressed on it. Object: a Skyrim.esm reference; item: a
+    // dropped item's server id; actor: a character's server id. Sent 30 times a second, then once as let go.
+    if (name == "pull")
+    {
+        uint32_t id = 0;
+        float x = 0.f, y = 0.f, z = 0.f;
+        if (args.size() < 5 || !ParseHex(args[1], id) || !ParseFloat(args[2], x) || !ParseFloat(args[3], y) || !ParseFloat(args[4], z))
+        {
+            spdlog::error("[script] pull needs object|item|actor, a hex id, x y z and seconds");
+            return true;
+        }
+        const bool cDone = Seconds(now - m_commandStart) >= arg(5, 5.f);
+        static Clock::time_point s_nextSend{};
+        if (!cDone && !aFirstTick && now < s_nextSend)
+            return false;
+        s_nextSend = now + std::chrono::milliseconds(33);
+
+        RequestPull request{};
+        request.Kind = args[0] == "actor" ? RequestPull::kActor : args[0] == "item" ? RequestPull::kDroppedItem : RequestPull::kWorldObject;
+        if (request.Kind == RequestPull::kWorldObject)
+            request.ObjectId = Skyrim(id);
+        else
+            request.ServerId = id;
+        request.Hand = args.size() > 6 && args[6] == "left" ? 0 : 1;
+        request.Position = ToNet(glm::vec3(x, y, z));
+        request.Active = !cDone;
+        SendMsg(request);
+        if (aFirstTick || cDone)
+            spdlog::info("[script] hand {} {} {:X} at ({:.0f}, {:.0f}, {:.0f})", cDone ? "let go of" : "pulls on", args[0], id, x, y, z);
+        return cDone;
     }
 
     // "takeobject <hex reference> <x> <y> <z>": a world object of Skyrim.esm, lying there, taken into this bot's

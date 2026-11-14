@@ -1,0 +1,12 @@
+# The bot's hand pulls on something the host is carrying (EXPERIMENTAL pulls, see VRBodySync).
+# The host holds a placed object in their hand; the bot's hand, at a fixed place, pulls on it for 20 seconds.
+# Fill in the object's reference id (Skyrim.esm, hex, from the console) and a place about 150 units from the host.
+# The host's log then has PullDiag lines, and the object is tugged toward that place.
+#   STBot pull-puller.txt --server <host:port> --x <host x> --y <host y>
+log waiting for the host to pick the object up
+wait 10
+log pulling
+pull object 0 0 0 0 20
+log done
+wait 5
+stop

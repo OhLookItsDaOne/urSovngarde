@@ -46,6 +46,10 @@ private:
     void RunPulls(std::chrono::steady_clock::time_point aNow) noexcept;
     //! Another player's hand on something this game is moving.
     void OnNotifyPull(const NotifyPull&) noexcept;
+    struct Motion;
+    //! The other game put down what a hand here pulls on: this game takes it over, and the hand pulls it here.
+    //! True if it did; the caller then leaves the thing to this game's physics.
+    bool TakeOverPulled(uint8_t aKind, uint32_t aServerId, uint32_t aFormId, TESObjectREFR* apRef, Motion& aMotion) noexcept;
     void OnUpdate(const UpdateEvent&) noexcept;
 
     //! Send a reference that lies on the floor to the server. False when its place cannot be named to the server.
@@ -97,6 +101,8 @@ private:
         bool RemoteAtRest{};
         //! Its 3D was there on the last pass. A cell loading settles every item in it, which is not a move.
         bool Loaded{};
+        //! Since when another player's hand pulls it here while no hand of this player's is on it; empty while one is.
+        std::chrono::steady_clock::time_point PulledUnheldSince{};
         //! A 3D load in a fresh drop's first two seconds is part of the throw, not a cell reload.
         std::chrono::steady_clock::time_point FreshDropUntil{};
     };
@@ -113,6 +119,8 @@ private:
     {
         bool Active{};
         bool WasPressed{};
+        //! The game that moved it let go and this game runs it now: this hand pulls it here, no longer over there.
+        bool Local{};
         uint8_t Kind{};
         uint32_t ServerId{};
         uint32_t FormId{};

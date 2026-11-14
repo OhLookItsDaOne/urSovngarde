@@ -1,0 +1,30 @@
+# The bot holds a placed object, and the host takes hold of it (EXPERIMENTAL pulls, see VRBodySync).
+# Fill in the object's reference id (Skyrim.esm, hex) and where the bot holds it: within the host's reach.
+# In the host's game the object hangs there, held for the bot; a grip or trigger pressed with the hand on it sends
+# the hand here ("Pull:" lines in this bot's log). After 30 seconds the bot puts it down, and the host's game takes it over.
+#   STBot pull-holder.txt --server <host:port> --x <host x> --y <host y>
+log holding the object
+moveobject 0 0 0 0 held
+wait 1
+moveobject 0 0 0 0 held
+wait 1
+moveobject 0 0 0 0 held
+wait 1
+moveobject 0 0 0 0 held
+wait 1
+moveobject 0 0 0 0 held
+wait 1
+moveobject 0 0 0 0 held
+wait 1
+moveobject 0 0 0 0 held
+wait 1
+moveobject 0 0 0 0 held
+wait 1
+moveobject 0 0 0 0 held
+wait 1
+moveobject 0 0 0 0 held
+wait 1
+log putting it down
+moveobject 0 0 0 0 rest
+wait 10
+stop
