@@ -664,6 +664,31 @@ void GameServer::OnDisconnection(const ConnectionId_t aConnectionId, EDisconnect
 
     spdlog::info("Connection ended {:x} - '{}' disconnected", aConnectionId, (pPlayer != NULL ? pPlayer->GetUsername().c_str() : "NULL"));
 
+    // How it ended as the network saw it, and where the player last was: a crash and a lost connection both end as a timeout, a quit from the menu does not.
+    // Kept in the log so that crashes can be matched to a place.
+    if (pPlayer)
+    {
+        const char* pHow = "for an unknown reason";
+        switch (aReason)
+        {
+        case Server::EDisconnectReason::Quit: pHow = "the game closed the connection (quit)"; break;
+        case Server::EDisconnectReason::Kicked: pHow = "kicked"; break;
+        case Server::EDisconnectReason::Banned: pHow = "banned"; break;
+        case Server::EDisconnectReason::BadConnection: pHow = "the connection failed"; break;
+        case Server::EDisconnectReason::TimedOut: pHow = "nothing came from the game any more (a crash, a freeze or a lost connection)"; break;
+        case Server::EDisconnectReason::Unknown: break;
+        }
+        const auto cCharacter = pPlayer->GetCharacter();
+        const auto* pMovement = cCharacter && m_pWorld->valid(*cCharacter) ? m_pWorld->try_get<MovementComponent>(*cCharacter) : nullptr;
+        const auto& cell = pPlayer->GetCellComponent();
+        if (pMovement)
+            spdlog::info("Last seen: player {} '{}' left: {}; in '{}', worldspace {:X}:{:X}, cell {:X}:{:X}, grid ({}, {}), at ({:.0f}, {:.0f}, {:.0f})", pPlayer->GetId(),
+                         pPlayer->GetUsername().c_str(), pHow, pPlayer->GetPlace().c_str(), cell.WorldSpaceId.ModId, cell.WorldSpaceId.BaseId, cell.Cell.ModId, cell.Cell.BaseId,
+                         cell.CenterCoords.X, cell.CenterCoords.Y, pMovement->Position.x, pMovement->Position.y, pMovement->Position.z);
+        else
+            spdlog::info("Last seen: player {} '{}' left: {}; it had no character in the world yet", pPlayer->GetId(), pPlayer->GetUsername().c_str(), pHow);
+    }
+
     m_pWorld->GetScriptService().HandlePlayerQuit(aConnectionId, aReason);
 
     if (pPlayer)
