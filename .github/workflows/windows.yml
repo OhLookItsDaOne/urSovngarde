@@ -48,7 +48,10 @@ jobs:
             # an old one, such as v1.9.3 for v1.9.7. Upstream's tags come first.
             - name: Upstream release tags in a fork
               if: github.repository != 'Dosylia/urSovngarde'
-              run: git fetch --no-recurse-submodules --tags https://github.com/Dosylia/urSovngarde.git || true
+              # The fork's own server-*/client-*/testbuild-* release tags would be nearer than any release, so they go.
+              run: |
+                  git fetch --no-recurse-submodules --tags https://github.com/Dosylia/urSovngarde.git || true
+                  git tag -l 'server-*' 'client-*' 'testbuild-*' | xargs -r git tag -d
 
             - name: Checkout main on tag push
               if: github.ref_type == 'tag'
