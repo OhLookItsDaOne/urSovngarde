@@ -4,7 +4,9 @@
 #include <Games/Skyrim/Interface/UI.h>
 #include <Interface/Menus/MapMenu.h>
 #include <PatchCheck.h>
+#include <Games/Skyrim/GameStack.h>
 
+#include <cstring>
 #include <intrin.h>
 
 // Every pass the game draws is put on a list by BSBatchRenderer's two register functions (its vtable slots 1 and 2).
@@ -43,121 +45,8 @@ size_t SlotOf(const void* apPass) noexcept
     return (reinterpret_cast<uintptr_t>(apPass) >> 4) & (std::size(s_lastInserts) - 1);
 }
 
-bool Readable(const void* apAddress, const size_t aBytes) noexcept
-{
-    MEMORY_BASIC_INFORMATION info{};
-    if (!apAddress || !VirtualQuery(apAddress, &info, sizeof(info)))
-        return false;
-    if (info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
-        return false;
-    return reinterpret_cast<uintptr_t>(apAddress) + aBytes <= reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
-}
-
-std::string Where(const void* apAddress) noexcept
-{
-    HMODULE module = nullptr;
-    if (apAddress && GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCWSTR>(apAddress), &module))
-    {
-        wchar_t path[MAX_PATH]{};
-        GetModuleFileNameW(module, path, MAX_PATH);
-        const std::wstring cPath(path);
-        const std::wstring cName = cPath.substr(cPath.find_last_of(L"\\/") + 1);
-        return fmt::format("{}+{:#x}", std::string(cName.begin(), cName.end()), reinterpret_cast<uintptr_t>(apAddress) - reinterpret_cast<uintptr_t>(module));
-    }
-    return fmt::format("{}", apAddress);
-}
-
-// The game's functions are not in our image's unwind table, so RtlCaptureStackBackTrace stops at the first one.
-// The game's own table (SkyrimVR 1.4.15's exception directory) is in our image at its own RVA and is searched here.
-constexpr uintptr_t kGameUnwindTable = 0x36F4000;
-constexpr size_t kGameUnwindEntries = 0x15B058 / sizeof(RUNTIME_FUNCTION);
-constexpr DWORD kGameCodeEnd = 0x1580000;
-uintptr_t s_exe = 0;
-bool s_gameUnwindTable = false;
-
-const RUNTIME_FUNCTION* GameFunctionEntry(const DWORD64 aPc) noexcept
-{
-    const DWORD64 cRva = aPc - s_exe;
-    if (aPc < s_exe || cRva >= kGameCodeEnd)
-        return nullptr;
-    const auto* pEntries = reinterpret_cast<const RUNTIME_FUNCTION*>(s_exe + kGameUnwindTable);
-    size_t low = 0;
-    size_t high = kGameUnwindEntries;
-    while (low < high)
-    {
-        const size_t cMiddle = (low + high) / 2;
-        if (cRva < pEntries[cMiddle].BeginAddress)
-            high = cMiddle;
-        else if (cRva >= pEntries[cMiddle].EndAddress)
-            low = cMiddle + 1;
-        else
-            return &pEntries[cMiddle];
-    }
-    return nullptr;
-}
-
-// The table is used only if it reads as one: entries in order, each inside the game's code.
-void CheckGameUnwindTable() noexcept
-{
-    s_exe = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-    const auto* pEntries = reinterpret_cast<const RUNTIME_FUNCTION*>(s_exe + kGameUnwindTable);
-    for (size_t i = 0; i < 64; ++i)
-    {
-        if (pEntries[i].BeginAddress >= pEntries[i].EndAddress || pEntries[i].EndAddress > kGameCodeEnd ||
-            (i && pEntries[i].BeginAddress < pEntries[i - 1].EndAddress))
-        {
-            spdlog::error("RenderPassWatch: the game's unwind table does not read as one (entry {}); stacks stop at the first game frame", i);
-            return;
-        }
-    }
-    s_gameUnwindTable = true;
-}
-
-// The return addresses from the caller's caller up, through game and plugin frames alike.
-__declspec(noinline) USHORT CaptureStack(void** apFrames, const USHORT aMax) noexcept
-{
-    if (!s_gameUnwindTable)
-        return RtlCaptureStackBackTrace(2, aMax, apFrames, nullptr);
-
-    CONTEXT context{};
-    RtlCaptureContext(&context);
-    USHORT depth = 0;
-    int skip = 1;
-    __try
-    {
-        while (depth < aMax && context.Rip)
-        {
-            DWORD64 imageBase = 0;
-            auto* pEntry = RtlLookupFunctionEntry(context.Rip, &imageBase, nullptr);
-            if (!pEntry)
-            {
-                pEntry = const_cast<RUNTIME_FUNCTION*>(GameFunctionEntry(context.Rip));
-                imageBase = s_exe;
-            }
-            if (pEntry)
-            {
-                void* pHandlerData = nullptr;
-                DWORD64 establisherFrame = 0;
-                RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, context.Rip, pEntry, &context, &pHandlerData, &establisherFrame, nullptr);
-            }
-            else
-            {
-                // A leaf function: its return address is on top of the stack.
-                context.Rip = *reinterpret_cast<const DWORD64*>(context.Rsp);
-                context.Rsp += 8;
-            }
-            if (!context.Rip)
-                break;
-            if (skip-- > 0)
-                continue;
-            apFrames[depth++] = reinterpret_cast<void*>(context.Rip);
-        }
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-    }
-    return depth;
-}
+using GameStack::Readable;
+using GameStack::Where;
 
 std::string GeometryName(const uint8_t* apPass) noexcept
 {
@@ -231,10 +120,7 @@ struct PointerInsert
 
 std::string StackOf(void* const* apFrames, const USHORT aDepth) noexcept
 {
-    std::string stack;
-    for (USHORT i = 0; i < aDepth; ++i)
-        stack += (i ? " < " : "") + Where(apFrames[i]);
-    return stack;
+    return GameStack::Describe(apFrames, aDepth);
 }
 
 std::string StackOf(const PointerInsert& acInsert) noexcept
@@ -347,7 +233,7 @@ void TracePointerAppend(const void* apAccumulator, const uint8_t* apGeometry, co
 {
     FeedRecord record{GetCurrentThreadId()};
     if (NearMapClose())
-        record.Depth = CaptureStack(record.Frames, static_cast<USHORT>(std::size(record.Frames)));
+        record.Depth = GameStack::Capture(record.Frames, static_cast<USHORT>(std::size(record.Frames)));
     const auto* pParent = *reinterpret_cast<const uint8_t* const*>(apGeometry + kObjectParent);
     for (size_t i = 0; pParent && i < std::size(record.Parents); ++i)
     {
@@ -365,7 +251,7 @@ void TracePointerAppend(const void* apAccumulator, const uint8_t* apGeometry, co
     {
         s_seen[s_seenCount++] = apAccumulator;
         if (!record.Depth)
-            record.Depth = CaptureStack(record.Frames, static_cast<USHORT>(std::size(record.Frames)));
+            record.Depth = GameStack::Capture(record.Frames, static_cast<USHORT>(std::size(record.Frames)));
         spdlog::info("RenderPassWatch: the VR pointer first {} {} on thread {} (main thread {}), under {}: {}", acCuller ? "put on visible list" : "appended to accumulator",
                      apAccumulator, record.Thread, GameMainThreadId(), ParentsOf(record), StackOf(record.Frames, record.Depth));
     }
@@ -395,7 +281,7 @@ void TracePointerWalk(const void* apAccumulator) noexcept
     if (pFeed->Walks < std::size(pFeed->WalkRecords))
     {
         if (NearMapClose())
-            record.Depth = CaptureStack(record.Frames, static_cast<USHORT>(std::size(record.Frames)));
+            record.Depth = GameStack::Capture(record.Frames, static_cast<USHORT>(std::size(record.Frames)));
         pFeed->WalkRecords[pFeed->Walks] = record;
     }
     ++pFeed->Walks;
@@ -418,7 +304,7 @@ void TracePointerInsert(const void* apRenderer, const uint8_t* apPass, const siz
 {
     PointerInsert insert{apPass, 1, apRenderer, GetCurrentThreadId(), aSlot, {}, 0};
     if (NearMapClose())
-        insert.Depth = CaptureStack(insert.Frames, static_cast<USHORT>(std::size(insert.Frames)));
+        insert.Depth = GameStack::Capture(insert.Frames, static_cast<USHORT>(std::size(insert.Frames)));
     const uint64_t cFrame = MainLoopFrame();
 
     std::scoped_lock lock(s_pointerLock);
@@ -428,7 +314,7 @@ void TracePointerInsert(const void* apRenderer, const uint8_t* apPass, const siz
     {
         s_pointerThreads[s_pointerThreadCount++] = insert.Thread;
         if (!insert.Depth)
-            insert.Depth = CaptureStack(insert.Frames, static_cast<USHORT>(std::size(insert.Frames)));
+            insert.Depth = GameStack::Capture(insert.Frames, static_cast<USHORT>(std::size(insert.Frames)));
         spdlog::info("RenderPassWatch: the VR pointer's pass {} put on a list from thread {} (main thread {}), renderer {}, slot {}, frame {}, its link before {}; "
                      "the map {}: {}",
                      fmt::ptr(apPass), insert.Thread, GameMainThreadId(), fmt::ptr(apRenderer), aSlot, cFrame, apNextBefore, MapMenuShown() ? "shown" : "not shown",
@@ -700,10 +586,10 @@ static TiltedPhoques::Initializer s_renderPassWatch(
         spdlog::info("RenderPassWatch: BSBatchRenderer's register functions watched (they were {} and {})", Where(s_realRegister[0]), Where(s_realRegister[1]));
     });
 
-// Installed late, not with the other hooks: Community Shaders' VR shadow batch checks this function's first bytes
-// when SKSE loads it, and stops with an error when another hook is there already.
-// Called from every client update; it installs the first time the map is open. The loop only comes after a map close,
-// and by then every plugin has loaded, so another plugin's hook (a jump at the start) comes first and this one goes on top.
+// Community Shaders' VR shadow batch checks this function's first bytes when SKSE loads it, and stops the game if they changed.
+// So this hook goes in late, from the client's update, the first time the map is open.
+// The loop it cuts only follows a map close, so nothing is lost by waiting.
+// Another plugin's hook there, a jump at the start, is kept, and this one goes on top of it.
 void InstallDrawListCheck() noexcept
 {
     static bool s_tried = false;
@@ -722,9 +608,12 @@ void InstallDrawListCheck() noexcept
         return;
     }
     const std::string cOtherHook = cHooked ? fmt::format(" (on top of another plugin's hook: {})", PatchCheck::Bytes(pDraw, 6)) : std::string();
+    // MinHook writes a 5-byte jump at the start, so the hook is live only if those bytes changed.
+    uint8_t firstBytes[5]{};
+    std::memcpy(firstBytes, pDraw, sizeof(firstBytes));
     s_realDrawList = reinterpret_cast<TDrawList*>(pDraw);
     TP_HOOK_IMMEDIATE(&s_realDrawList, HookDrawList);
-    if (reinterpret_cast<uint8_t*>(s_realDrawList) == pDraw)
+    if (reinterpret_cast<uint8_t*>(s_realDrawList) == pDraw || std::memcmp(firstBytes, pDraw, sizeof(firstBytes)) == 0)
     {
         s_realDrawList = nullptr;
         spdlog::error("RenderPassWatch: the list draw at {} could not be hooked ({}); lists are not checked for loops", fmt::ptr(pDraw), PatchCheck::Bytes(pDraw, 10));
@@ -736,7 +625,7 @@ void InstallDrawListCheck() noexcept
 static TiltedPhoques::Initializer s_accumulatorTrace(
     []()
     {
-        CheckGameUnwindTable();
+        GameStack::Ready();
 
         const auto exe = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
         const auto* pCullerAppend = reinterpret_cast<const uint8_t*>(exe + kCullerAppend);
@@ -757,6 +646,6 @@ static TiltedPhoques::Initializer s_accumulatorTrace(
         TP_HOOK(&s_realAppend, HookAccumulatorAppend);
         s_realWalk = reinterpret_cast<TAccumulatorWalk*>(exe + kAccumulatorWalk);
         TP_HOOK(&s_realWalk, HookAccumulatorWalk);
-        spdlog::info("RenderPassWatch: what feeds the laser to each accumulator is traced; full stacks {}", s_gameUnwindTable ? "on" : "off");
+        spdlog::info("RenderPassWatch: what feeds the laser to each accumulator is traced; full stacks {}", GameStack::Ready() ? "on" : "off");
     });
 #endif

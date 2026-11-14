@@ -148,7 +148,8 @@ entries below are under `#ifdef SKYRIMVR` with `static_assert`s.
     node's first bytes change), and the skeleton is resolved again when they differ.
   - Not posed: dead, dying or bleeding out actors (the ragdoll owns them), and actors outside a 50 degree
     view cone from the headset (`PlayerCharacter` +0x570, checked by name), because posing a culled actor
-    tears its skin.
+    tears its skin. A live copy is tested where it is drawn (its root and the pose's hips), not at its own
+    bones, and once in view it stays posed until 10 degrees past the cone.
   - Bones are found along the skeleton chain, because physics armour carries duplicate hand nodes.
 - **Send rate:** the local player 30 Hz, other actors 10 Hz. The VR pose plays back 100 ms late,
   movement 300 ms.
@@ -495,6 +496,11 @@ entries below are under `#ifdef SKYRIMVR` with `static_assert`s.
   through four loading screens (exterior, inn, Dragonsreach, Whiterun) clean. Not yet played.
   Seen hit it on 2026-10-06 (19:41 and 19:43, twice out of two loads): his crash logger put 100997 at 0x1354D20, a
   plain newer library, which came with his Engine Fixes 7.10; Emma's file has it at 0x90D400.
+- **CSX 3.19.2 and later check the first bytes of the list draw (VR 0x141349270)** when SKSE loads them, and stop the
+  game with "Incompatible VR shadow batch hook" if another hook is there. The map freeze guard hooks that function, so it
+  goes in only the first time the map is open, after every plugin has loaded, and sits on top of CSX's own hook
+  (`RenderPassWatch: each list is checked for a loop before it is drawn (on top of another plugin's hook: ...)`).
+  That is the only one of our hooks on the functions CSX checks. FUS still runs csx3.18, which has no such check.
 - **The clean-up on connect deleted the game's own temporary actors (fixed 2026-10-06).** On connect
   the client deleted every actor with an `FF` id, not only its own copies from an earlier connection. Emma's crash at
   19:38:42 on 2026-10-06: FF0011DD "Aspiring Mage" (a Skyrim.esm base, made by the game while her save loaded, 6 s
@@ -580,3 +586,19 @@ entries below are under `#ifdef SKYRIMVR` with `static_assert`s.
   bytes free, Skyrim's saves failed from 11:56 ("The save/load operation failed", empty `.ess.tmp` files; the last whole
   save is the 11:43 autosave) and MO2 could not write its ini ("File is write protected"). Seen ran the same build. Any
   next try is measured in the rig first: the size of `cef_debug.log` after ten minutes, and the menus drawn.
+- Not every such log is this crash: when the game dies of something else, its browser dies with it and writes the same
+  `libcef.dll+7A52582` log 0 to 2 s later (hub report 20261106-232915-a3766d3b: five, each right after a PLANCK or Crash
+  Logger fault). Only one with no other crash just before it counts here.
+
+## A plugin queuing SKSE tasks 20 times a second costs 8 GB at every load (freezes, wrong colours)
+
+- 2026-11-07 on FUS, both players: textures in the wrong colours at load (rocks flat blue, ground red, trunks glowing white),
+  long loads (5 min 40 s once), slow play, and three freezes at the first load (10:19, 13:19, 13:34).
+  - Each freeze came when `Health:` read 28 to 32 GB private, on a PC with 31 GB of RAM, and Windows paged the game out.
+  - The stuck thread was a game job thread running the queued task, waiting inside the Windows heap.
+- Cause: the siege plugin's "glide" thread queued an SKSE task 20 times a second at all times, loads included (since 11-06).
+  Empty tasks gave the same spike. Fixed in the siege plugin: nothing is queued outside a battle or during a load.
+- Rig, the owner's save, the first `Health:` line after the load: 18.4 GB private and 13.4 GB working set with the old
+  plugin, 8.7 to 10.1 GB with the fix or without the plugin, as on 11-05. This client made no difference.
+- The colours never showed on the rig; whether they went with the fix is for the headset to say.
+- Any plugin, and this client: never queue SKSE tasks on a timer that runs through loads.

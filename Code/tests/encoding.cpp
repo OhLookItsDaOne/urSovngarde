@@ -632,6 +632,27 @@ TEST_CASE("Packets", "[encoding.packets]")
         }
     }
 
+    SECTION("RequestActorPresence")
+    {
+        RequestActorPresence sendMessage;
+        sendMessage.Actors = {{0x900121, ActorPresenceKind::Own, false}, {0x1038B1, ActorPresenceKind::Copy, true}, {0x300090, ActorPresenceKind::StandIn, false}};
+
+        uint8_t storage[1 << 12];
+        Buffer buffer(storage, sizeof(storage));
+        Buffer::Writer writer(&buffer);
+        sendMessage.Serialize(writer);
+
+        Buffer::Reader reader(&buffer);
+        const ClientMessageFactory factory;
+        auto pMessage = factory.Extract(reader);
+
+        REQUIRE(pMessage);
+        const auto pRecv = CastUnique<RequestActorPresence>(std::move(pMessage));
+        REQUIRE(*pRecv == sendMessage);
+        REQUIRE(pRecv->Actors[2].Kind == ActorPresenceKind::StandIn);
+        REQUIRE(pRecv->Actors[1].Dead);
+    }
+
     SECTION("RequestReferenceEnable and NotifyReferenceEnable")
     {
         const ReferenceEnableState camp{GameId(0, 0x8680C), true};
@@ -724,6 +745,56 @@ TEST_CASE("Packets", "[encoding.packets]")
             const auto pRecv = CastUnique<NotifyRemoveCharacter>(std::move(pMessage));
             REQUIRE(*pRecv == sendMessage);
             REQUIRE(pRecv->Gone == cGone);
+        }
+    }
+
+    SECTION("A character revived since its last death")
+    {
+        for (const bool cRevived : {false, true})
+        {
+            AssignCharacterRequest announce;
+            announce.Cookie = 7;
+            announce.CurrentActorData.RevivedSinceDeath = cRevived;
+            Buffer announceBuffer(1000);
+            Buffer::Writer announceWriter(&announceBuffer);
+            announce.Serialize(announceWriter);
+            Buffer::Reader announceReader(&announceBuffer);
+            auto pAnnounce = ClientMessageFactory{}.Extract(announceReader);
+            REQUIRE(pAnnounce);
+            const auto pAnnounced = CastUnique<AssignCharacterRequest>(std::move(pAnnounce));
+            REQUIRE(*pAnnounced == announce);
+            REQUIRE(pAnnounced->CurrentActorData.RevivedSinceDeath == cRevived);
+
+            CharacterSpawnRequest spawn;
+            spawn.ServerId = 0x1A;
+            spawn.FollowerOfPlayerId = 3;
+            spawn.RevivedSinceDeath = cRevived;
+            Buffer spawnBuffer(1000);
+            Buffer::Writer spawnWriter(&spawnBuffer);
+            spawn.Serialize(spawnWriter);
+            Buffer::Reader spawnReader(&spawnBuffer);
+            auto pSpawn = ServerMessageFactory{}.Extract(spawnReader);
+            REQUIRE(pSpawn);
+            const auto pSpawned = CastUnique<CharacterSpawnRequest>(std::move(pSpawn));
+            REQUIRE(*pSpawned == spawn);
+            REQUIRE(pSpawned->RevivedSinceDeath == cRevived);
+            REQUIRE(pSpawned->FollowerOfPlayerId == 3);
+
+            AssignCharacterResponse answer;
+            answer.Cookie = 9;
+            answer.ServerId = 0x100014;
+            answer.RevivedSinceDeath = cRevived;
+            answer.LeveledNpcPickId.BaseId = 0x770B1;
+            Buffer answerBuffer(1000);
+            Buffer::Writer answerWriter(&answerBuffer);
+            answer.Serialize(answerWriter);
+            Buffer::Reader answerReader(&answerBuffer);
+            auto pAnswer = ServerMessageFactory{}.Extract(answerReader);
+            REQUIRE(pAnswer);
+            const auto pAnswered = CastUnique<AssignCharacterResponse>(std::move(pAnswer));
+            REQUIRE(*pAnswered == answer);
+            REQUIRE(pAnswered->RevivedSinceDeath == cRevived);
+            REQUIRE(pAnswered->LeveledNpcPickId.BaseId == 0x770B1);
         }
     }
 }
