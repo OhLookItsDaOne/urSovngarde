@@ -2413,11 +2413,95 @@ void DriveWeaponBodiesBeforeStep(void* apHkpWorld, const float aSeconds) noexcep
     }
 }
 
+// Pulls: another player's hand on something this game is moving (a body its player carries, an object they hold).
+//
+// That player's game cannot move the thing, as only this game's physics decides where it is and sends it to everyone.
+// So their hand's position comes here (NotifyPull), and right before each physics step the nearest body of the thing is sped toward it.
+// The player here still holds the thing with HIGGS, so the body hangs between the two hands, and each can pull it from the other.
+// EXPERIMENTAL: written without a headset; the PullDiag lines say what it did.
+struct Pull
+{
+    uint64_t Key = 0;          // whose hand: player id << 1 | side
+    void* pRoot = nullptr;     // the thing's 3D, referenced while the pull lasts, so its bodies are not freed under physics
+    uint8_t* pHavok = nullptr; // the body that was nearest the hand when the pull began
+    float Target[3]{};         // the hand, in Havok units
+    std::chrono::steady_clock::time_point At{};
+    std::chrono::steady_clock::time_point Since{};
+    float StartApart = 0.f;    // game units between hand and body when it began
+};
+std::mutex s_pullsLock;
+std::vector<Pull> s_pulls;
+// The 3Ds of pulls that ended, let go of a second later (ExpirePulls): a physics step that began before the end may still be moving their bodies.
+std::vector<std::pair<void*, std::chrono::steady_clock::time_point>> s_retiredPullRoots;
+
+bool IsPullable(const uint8_t* apBody) noexcept
+{
+    // Dynamic motion types only (sphere/box inertia, dynamic, thin box): a keyframed or fixed body is somebody else's to move.
+    const uint8_t motionType = apBody[kMotionTypeOffset];
+    return (motionType >= 1 && motionType <= 3) || motionType == 6;
+}
+
+void DrivePullsBeforeStep(void* apHkpWorld, const float aSeconds) noexcept
+{
+    if (!apHkpWorld || !(aSeconds > 0.f))
+        return;
+
+    std::array<Pull, 8> pulls;
+    size_t count = 0;
+    {
+        std::lock_guard pullsLock(s_pullsLock);
+        if (s_pulls.empty())
+            return;
+        // A hand's position is sent about 30 times a second; one not heard from for 300 ms has let go or left.
+        const auto cNow = std::chrono::steady_clock::now();
+        for (const Pull& pull : s_pulls)
+            if (count < pulls.size() && pull.pHavok && cNow - pull.At < std::chrono::milliseconds(300) && At<void*>(pull.pHavok, kHkWorldOffset) == apHkpWorld)
+                pulls[count++] = pull;
+    }
+    if (count == 0)
+        return;
+
+    POINTER_SKYRIMSE(THkpEntityActivate, s_activate, 60096, 60096);
+    void* pBhkWorld = At<void*>(apHkpWorld, kBhkWorldOfHkpWorldOffset);
+    if (!s_activate.Get() || !pBhkWorld)
+        return;
+    const auto* pLock = reinterpret_cast<const volatile uint32_t*>(static_cast<uint8_t*>(pBhkWorld) + kWorldLockOffset); // BSReadWriteLock: writer thread, lock word
+    if (pLock[0] != GetCurrentThreadId() && pLock[1] != 0)
+        return;
+    WorldWriteLock lock(pBhkWorld);
+    if (!lock.Held())
+        return;
+
+    for (size_t i = 0; i < count; ++i)
+    {
+        uint8_t* pHavok = pulls[i].pHavok;
+        if (!IsPullable(pHavok))
+            continue;
+        // A sleeping body ignores its velocity.
+        s_activate.Get()(pHavok);
+
+        const float* pAt = reinterpret_cast<const float*>(pHavok + kBodyTranslationOffset);
+        const glm::vec3 toHand = glm::vec3{pulls[i].Target[0], pulls[i].Target[1], pulls[i].Target[2]} - glm::vec3{pAt[0], pAt[1], pAt[2]};
+        // The speed that would bring it to the hand in 150 ms, at most 4 m/s: a hand that is far away tugs, it does not fling.
+        constexpr float cReachSeconds = 0.15f;
+        constexpr float cMaxSpeed = 4.f;
+        glm::vec3 wanted = toHand / cReachSeconds;
+        if (const float speed = glm::length(wanted); speed > cMaxSpeed)
+            wanted *= cMaxSpeed / speed;
+        // Blended with the speed it has: what else holds it (this player's hand, another pull, the rest of its ragdoll) keeps its say.
+        float* pLinear = reinterpret_cast<float*>(pHavok + kAngularVelocityOffset - 0x10);
+        const glm::vec3 current{pLinear[0], pLinear[1], pLinear[2]};
+        const glm::vec3 speed = current + (wanted - current) * 0.6f;
+        pLinear[0] = speed.x, pLinear[1] = speed.y, pLinear[2] = speed.z;
+    }
+}
+
 // Replaces the call to hkpWorld::stepDeltaTime in bhkWorld::Update, VR 0xDFB722, only if that instruction is a call.
 // HIGGS hooks the same call (src/hooks.cpp, prePhysicsStepHookLoc); whichever patches second calls the other.
 int HookStepDeltaTime(void* apHkpWorld, float aSeconds)
 {
     DriveWeaponBodiesBeforeStep(apHkpWorld, aSeconds);
+    DrivePullsBeforeStep(apHkpWorld, aSeconds);
     return s_stepDeltaTime(apHkpWorld, aSeconds);
 }
 
@@ -4386,6 +4470,174 @@ void PulseClashHaptics(const uint8_t aSide) noexcept
 {
     if (aSide < 2)
         VRHaptics::Pulse(aSide == 1, 3999);
+}
+
+bool IsBodyMovedByOwner(const uint32_t aFormId) noexcept
+{
+    const auto cPosedAt = BodyPosedAt(aFormId);
+    return cPosedAt && std::chrono::steady_clock::now() - *cPosedAt < std::chrono::seconds(2);
+}
+
+bool PressedHand(const uint8_t aSide, glm::vec3& aAt) noexcept
+{
+    PlayerCharacter* pPlayer = PlayerCharacter::Get();
+    void* pHand = pPlayer && aSide < 2 ? FirstPersonHand(pPlayer, aSide) : nullptr;
+    if (!pHand || !VRHaptics::HandPressed(aSide == 1))
+        return false;
+    aAt = ToGlm(At<NiTransform>(pHand, kWorldOffset).translate);
+    return true;
+}
+
+float NearestNodeTo(TESObjectREFR* apRef, const glm::vec3& acPoint) noexcept
+{
+    void* pRoot = apRef ? static_cast<void*>(apRef->GetNiNode()) : nullptr;
+    if (!pRoot)
+        return 1e9f;
+
+    // A live tree, so only null checks. Every node counts: a dragon is held by a wing, far from its root.
+    float nearest = 1e9f;
+    TiltedPhoques::Vector<void*> queue;
+    queue.push_back(pRoot);
+    for (size_t head = 0; head < queue.size() && head < 512; ++head)
+    {
+        void* pObject = queue[head];
+        nearest = std::min(nearest, glm::distance(acPoint, ToGlm(At<NiTransform>(pObject, kWorldOffset).translate)));
+        void* pNode = AsNode(pObject);
+        void** pChildren = pNode ? At<void**>(pNode, kChildrenOffset + 0x8) : nullptr;
+        const uint16_t capacity = pNode ? At<uint16_t>(pNode, kChildrenOffset + 0x10) : 0;
+        for (uint16_t i = 0; pChildren && i < capacity; ++i)
+            if (pChildren[i])
+                queue.push_back(pChildren[i]);
+    }
+    return nearest;
+}
+
+void EndPull(const uint64_t aKey) noexcept
+{
+    void* pRoot = nullptr;
+    {
+        std::lock_guard pullsLock(s_pullsLock);
+        const auto cPull = std::find_if(s_pulls.begin(), s_pulls.end(), [aKey](const Pull& acPull) { return acPull.Key == aKey; });
+        if (cPull == s_pulls.end())
+            return;
+        pRoot = cPull->pRoot;
+        spdlog::info("PullDiag: player {:X}'s {} hand let go after {:.1f} s", aKey >> 1, (aKey & 1) ? "right" : "left",
+                     std::chrono::duration<float>(std::chrono::steady_clock::now() - cPull->Since).count());
+        s_pulls.erase(cPull);
+    }
+    // Not released yet: see s_retiredPullRoots. Main thread only, as ExpirePulls is.
+    if (pRoot)
+        s_retiredPullRoots.emplace_back(pRoot, std::chrono::steady_clock::now());
+}
+
+void ExpirePulls() noexcept
+{
+    // Collected first: EndPull takes the lock itself.
+    TiltedPhoques::Vector<uint64_t> gone;
+    {
+        std::lock_guard pullsLock(s_pullsLock);
+        const auto cNow = std::chrono::steady_clock::now();
+        for (const Pull& pull : s_pulls)
+            if (cNow - pull.At > std::chrono::milliseconds(500))
+                gone.push_back(pull.Key);
+    }
+    for (const uint64_t cKey : gone)
+        EndPull(cKey);
+
+    const auto cNow = std::chrono::steady_clock::now();
+    for (auto it = s_retiredPullRoots.begin(); it != s_retiredPullRoots.end();)
+    {
+        if (cNow - it->second < std::chrono::seconds(1))
+        {
+            ++it;
+            continue;
+        }
+        static_cast<NiRefObject*>(it->first)->DecRef();
+        it = s_retiredPullRoots.erase(it);
+    }
+}
+
+bool PullBody(const uint64_t aKey, TESObjectREFR* apRef, const glm::vec3& acHand) noexcept
+{
+    POINTER_SKYRIMSE(float, s_havokScale, 231896, 231896);
+    const float cScale = s_havokScale.Get() ? *s_havokScale.Get() : 0.f;
+    void* pRoot = apRef ? static_cast<void*>(apRef->GetNiNode()) : nullptr;
+    if (!(cScale > 0.f) || !pRoot)
+    {
+        EndPull(aKey);
+        return false;
+    }
+
+    const auto cNow = std::chrono::steady_clock::now();
+    {
+        std::lock_guard pullsLock(s_pullsLock);
+        const auto cPull = std::find_if(s_pulls.begin(), s_pulls.end(), [aKey](const Pull& acPull) { return acPull.Key == aKey; });
+        if (cPull != s_pulls.end() && cPull->pRoot == pRoot)
+        {
+            cPull->Target[0] = acHand.x * cScale, cPull->Target[1] = acHand.y * cScale, cPull->Target[2] = acHand.z * cScale;
+            cPull->At = cNow;
+            return true;
+        }
+    }
+    // Another thing, or the same one with a rebuilt 3D: the pull starts over.
+    EndPull(aKey);
+
+    // The dynamic body nearest the hand is the one it pulls: the limb it took, or the object itself.
+    uint8_t* pNearest = nullptr;
+    float nearest = 1e9f;
+    TiltedPhoques::Vector<void*> queue;
+    queue.push_back(pRoot);
+    for (size_t head = 0; head < queue.size() && head < 512; ++head)
+    {
+        void* pObject = queue[head];
+        if (uint8_t* pBody = HavokBodyOfLive(pObject); pBody && At<void*>(pBody, kHkWorldOffset) && IsPullable(pBody))
+        {
+            const float* pAt = reinterpret_cast<const float*>(pBody + kBodyTranslationOffset);
+            const float cApart = glm::distance(acHand, glm::vec3{pAt[0], pAt[1], pAt[2]} / cScale);
+            if (cApart < nearest)
+            {
+                nearest = cApart;
+                pNearest = pBody;
+            }
+        }
+        void* pNode = AsNode(pObject);
+        void** pChildren = pNode ? At<void**>(pNode, kChildrenOffset + 0x8) : nullptr;
+        const uint16_t capacity = pNode ? At<uint16_t>(pNode, kChildrenOffset + 0x10) : 0;
+        for (uint16_t i = 0; pChildren && i < capacity; ++i)
+            if (pChildren[i])
+                queue.push_back(pChildren[i]);
+    }
+
+    // The hand's game shows the thing a little behind where it is here, so the hand may be off by that much; further is not a hand on it.
+    constexpr float cReach = 120.f;
+    if (!pNearest || nearest > cReach)
+    {
+        static std::chrono::steady_clock::time_point s_nextLog{};
+        if (cNow >= s_nextLog)
+        {
+            s_nextLog = cNow + std::chrono::seconds(2);
+            spdlog::info("PullDiag: player {:X}'s hand is on {:X} over there, but here {}; not pulled", aKey >> 1, apRef->formID,
+                         pNearest ? fmt::format("its nearest body is {:.0f} units from that hand", nearest) : std::string("it has no body physics moves"));
+        }
+        return false;
+    }
+
+    Pull pull{};
+    pull.Key = aKey;
+    pull.pRoot = pRoot;
+    pull.pHavok = pNearest;
+    pull.Target[0] = acHand.x * cScale, pull.Target[1] = acHand.y * cScale, pull.Target[2] = acHand.z * cScale;
+    pull.At = cNow;
+    pull.Since = cNow;
+    pull.StartApart = nearest;
+    static_cast<NiRefObject*>(pRoot)->IncRef();
+    {
+        std::lock_guard pullsLock(s_pullsLock);
+        s_pulls.push_back(pull);
+    }
+    spdlog::info("PullDiag: player {:X}'s {} hand took hold of {:X}, {:.0f} units from its nearest body; pulling that body toward the hand", aKey >> 1,
+                 (aKey & 1) ? "right" : "left", apRef->formID, nearest);
+    return true;
 }
 
 void ForgetCorpse(const uint32_t aFormId) noexcept

@@ -13,6 +13,7 @@ struct RequestDroppedItemAdd;
 struct RequestDroppedItemRemove;
 struct RequestDroppedItemMove;
 struct RequestWorldObjectMove;
+struct RequestPull;
 struct EnterInteriorCellRequest;
 struct EnterExteriorCellRequest;
 struct ShiftGridCellRequest;
@@ -46,6 +47,7 @@ private:
     void OnRemove(const PacketEvent<RequestDroppedItemRemove>& acMessage) noexcept;
     void OnMove(const PacketEvent<RequestDroppedItemMove>& acMessage) noexcept;
     void OnObjectMove(const PacketEvent<RequestWorldObjectMove>& acMessage) noexcept;
+    void OnPull(const PacketEvent<RequestPull>& acMessage) const noexcept;
     void OnEnterInteriorCell(const PacketEvent<EnterInteriorCellRequest>& acMessage) const noexcept;
     void OnEnterExteriorCell(const PacketEvent<EnterExteriorCellRequest>& acMessage) const noexcept;
     void OnShiftGridCell(const PacketEvent<ShiftGridCellRequest>& acMessage) const noexcept;
@@ -83,6 +85,7 @@ private:
     entt::scoped_connection m_removeConnection;
     entt::scoped_connection m_moveConnection;
     entt::scoped_connection m_objectMoveConnection;
+    entt::scoped_connection m_pullConnection;
     entt::scoped_connection m_interiorConnection;
     entt::scoped_connection m_exteriorConnection;
     entt::scoped_connection m_gridConnection;

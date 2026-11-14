@@ -73,6 +73,7 @@ enum ClientOpcode : unsigned char
     kRequestPartyPlugin,
     kRequestPartyValue,
     kRequestActorPresence,
+    kRequestPull,
     kClientOpcodeMax
 };
 
@@ -147,5 +148,6 @@ enum ServerOpcode : unsigned char
     kNotifyWarState,
     kNotifyPartyPlugin,
     kNotifyPartyValue,
+    kNotifyPull,
     kServerOpcodeMax
 };

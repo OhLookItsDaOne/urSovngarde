@@ -15,6 +15,7 @@ struct NotifyDroppedItem;
 struct NotifyDroppedItemRemoved;
 struct NotifyDroppedItemMove;
 struct NotifyWorldObjectMove;
+struct NotifyPull;
 struct UpdateEvent;
 struct TESObjectREFR;
 
@@ -41,6 +42,10 @@ private:
     void OnNotifyDroppedItemMove(const NotifyDroppedItemMove&) noexcept;
     void OnNotifyWorldObjectMove(const NotifyWorldObjectMove&) noexcept;
     void UpdateWorldObjects(std::chrono::steady_clock::time_point aNow) noexcept;
+    //! A hand of this player's on something another player's game is moving: its position is sent there, which pulls the thing toward it.
+    void RunPulls(std::chrono::steady_clock::time_point aNow) noexcept;
+    //! Another player's hand on something this game is moving.
+    void OnNotifyPull(const NotifyPull&) noexcept;
     void OnUpdate(const UpdateEvent&) noexcept;
 
     //! Send a reference that lies on the floor to the server. False when its place cannot be named to the server.
@@ -103,6 +108,19 @@ private:
     std::vector<uint32_t> m_objectCandidates;
     std::chrono::steady_clock::time_point m_candidatesAt{};
 
+    //! What each hand (0 left, 1 right) pulls on, if anything. Kind is RequestPull's.
+    struct HandPull
+    {
+        bool Active{};
+        bool WasPressed{};
+        uint8_t Kind{};
+        uint32_t ServerId{};
+        uint32_t FormId{};
+        GameId ObjectId{};
+        std::chrono::steady_clock::time_point Since{};
+    };
+    HandPull m_handPulls[2];
+
     //! Old drops already announced this session, so a cell change does not send them again.
     std::unordered_set<uint32_t> m_announced;
     //! What the player dropped while not connected (reference and item), announced once connected.
@@ -120,5 +138,6 @@ private:
     entt::scoped_connection m_removedConnection;
     entt::scoped_connection m_moveConnection;
     entt::scoped_connection m_objectMoveConnection;
+    entt::scoped_connection m_pullConnection;
     entt::scoped_connection m_updateConnection;
 };

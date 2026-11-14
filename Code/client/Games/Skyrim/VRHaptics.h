@@ -27,4 +27,8 @@ struct Grips
 };
 Grips GripsHeld() noexcept;
 
+//! Whether that controller's grip or trigger is pressed, read from OpenVR; reading never takes the press from the game.
+//! Either one, since HIGGS can be set to grab with either.
+bool HandPressed(bool aRightHand) noexcept;
+
 } // namespace VRHaptics

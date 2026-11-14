@@ -109,6 +109,20 @@ Grips GripsHeld() noexcept
     return grips;
 }
 
+bool HandPressed(const bool aRightHand) noexcept
+{
+    // Grip, Axis2 (the grip on Oculus Touch) and Axis1 (the trigger).
+    constexpr uint64_t cMask = (1ull << vr::k_EButton_Grip) | (1ull << vr::k_EButton_Axis2) | (1ull << vr::k_EButton_Axis1);
+
+    vr::IVRSystem* pSystem = GetVRSystem();
+    if (!pSystem)
+        return false;
+    const vr::TrackedDeviceIndex_t cDevice =
+        pSystem->GetTrackedDeviceIndexForControllerRole(aRightHand ? vr::TrackedControllerRole_RightHand : vr::TrackedControllerRole_LeftHand);
+    vr::VRControllerState_t state{};
+    return cDevice != vr::k_unTrackedDeviceIndexInvalid && pSystem->GetControllerState(cDevice, &state, sizeof(state)) && (state.ulButtonPressed & cMask) != 0;
+}
+
 } // namespace VRHaptics
 
 #else
@@ -123,6 +137,11 @@ bool Pulse(bool, uint16_t) noexcept
 Grips GripsHeld() noexcept
 {
     return {};
+}
+
+bool HandPressed(bool) noexcept
+{
+    return false;
 }
 } // namespace VRHaptics
 

@@ -18,6 +18,9 @@
 #include <Messages/NotifyDroppedItemMove.h>
 #include <Messages/RequestWorldObjectMove.h>
 #include <Messages/NotifyWorldObjectMove.h>
+#include <Messages/RequestPull.h>
+#include <Messages/NotifyPull.h>
+#include <Games/Skyrim/VRBodySync.h>
 #include <Events/UpdateEvent.h>
 #include <NetImmerse/NiTransform.h>
 
@@ -201,6 +204,7 @@ DroppedItemService::DroppedItemService(World& aWorld, entt::dispatcher& aDispatc
     m_removedConnection = aDispatcher.sink<NotifyDroppedItemRemoved>().connect<&DroppedItemService::OnNotifyDroppedItemRemoved>(this);
     m_moveConnection = aDispatcher.sink<NotifyDroppedItemMove>().connect<&DroppedItemService::OnNotifyDroppedItemMove>(this);
     m_objectMoveConnection = aDispatcher.sink<NotifyWorldObjectMove>().connect<&DroppedItemService::OnNotifyWorldObjectMove>(this);
+    m_pullConnection = aDispatcher.sink<NotifyPull>().connect<&DroppedItemService::OnNotifyPull>(this);
     m_updateConnection = aDispatcher.sink<UpdateEvent>().connect<&DroppedItemService::OnUpdate>(this);
 }
 
@@ -661,6 +665,7 @@ void DroppedItemService::OnUpdate(const UpdateEvent&) noexcept
     }
 
     UpdateWorldObjects(now);
+    RunPulls(now);
 }
 
 namespace
@@ -1011,4 +1016,209 @@ void DroppedItemService::OnNotifyDroppedItemMove(const NotifyDroppedItemMove& ac
     motion.Moving = false;
     // Let go two seconds after the last update (OnUpdate), not now: a still hand also sends "at rest".
     motion.RemoteAtRest = acMessage.AtRest;
+}
+
+// EXPERIMENTAL, see VRBodySync's pulls.
+// What another player's game moves is held still here (keyframed) or posed from their bones, so a hand here cannot take it.
+// Instead, a grip or trigger pressed with the hand on it sends the hand's position, and their game pulls the thing toward it.
+// It then comes back here with their updates, like everything else they move.
+void DroppedItemService::RunPulls(const std::chrono::steady_clock::time_point aNow) noexcept
+{
+    VRBodySync::ExpirePulls();
+
+    constexpr float cGrabReach = 40.f;
+
+    for (uint8_t side = 0; side < 2; ++side)
+    {
+        HandPull& pull = m_handPulls[side];
+        glm::vec3 hand{};
+        const bool cPressed = VRBodySync::PressedHand(side, hand);
+        const bool cEdge = cPressed && !pull.WasPressed;
+        pull.WasPressed = cPressed;
+
+        const auto send = [&](const bool aActive)
+        {
+            RequestPull request{};
+            request.Kind = pull.Kind;
+            request.ServerId = pull.ServerId;
+            request.ObjectId = pull.ObjectId;
+            request.Hand = side;
+            request.Position = hand;
+            request.Active = aActive;
+            // A lost position is replaced by the next one; the end is sent reliably, though the other game also lets go by itself.
+            if (aActive)
+                m_transport.SendUnreliable(request);
+            else
+                m_transport.Send(request);
+        };
+
+        if (pull.Active)
+        {
+            // Still theirs to move: held for them here, or a body they still run.
+            bool still = cPressed;
+            if (still && pull.Kind == RequestPull::kWorldObject)
+            {
+                const auto cMotion = m_objectMotion.find(pull.FormId);
+                still = cMotion != m_objectMotion.end() && cMotion->second.Held;
+                // A thing hanging still from this hand sends no moves, and would be let go here as put down.
+                if (still)
+                    cMotion->second.LastRemote = aNow;
+            }
+            else if (still && pull.Kind == RequestPull::kDroppedItem)
+            {
+                const auto cMotion = m_motion.find(pull.ServerId);
+                still = cMotion != m_motion.end() && cMotion->second.Held;
+                if (still)
+                    cMotion->second.LastRemote = aNow;
+            }
+            else if (still)
+            {
+                still = false;
+                auto view = m_world.view<RemoteComponent, FormIdComponent>();
+                for (const auto cEntity : view)
+                    if (view.get<RemoteComponent>(cEntity).Id == pull.ServerId && view.get<FormIdComponent>(cEntity).Id == pull.FormId)
+                        still = true;
+            }
+
+            if (still)
+            {
+                send(true);
+                continue;
+            }
+            send(false);
+            pull.Active = false;
+            spdlog::info("PullDiag: this player's {} hand let go of {:X} after {:.1f} s ({})", side ? "right" : "left", pull.FormId,
+                         std::chrono::duration<float>(aNow - pull.Since).count(), cPressed ? "it is no longer the other game's to move" : "the press ended");
+            continue;
+        }
+
+        if (!cEdge)
+            continue;
+
+        // The nearest thing under the hand that another game is moving right now.
+        HandPull found{};
+        float nearest = cGrabReach;
+        for (auto& [formId, motion] : m_objectMotion)
+        {
+            if (!motion.Held)
+                continue;
+            TESObjectREFR* pRef = Cast<TESObjectREFR>(TESForm::GetById(formId));
+            GameId objectId{};
+            if (!pRef || pRef->IsDeleted() || pRef->IsDisabled() || !m_world.GetModSystem().GetServerModId(formId, objectId))
+                continue;
+            if (const float cApart = VRBodySync::NearestNodeTo(pRef, hand); cApart < nearest)
+            {
+                nearest = cApart;
+                found = HandPull{};
+                found.Kind = RequestPull::kWorldObject;
+                found.FormId = formId;
+                found.ObjectId = objectId;
+            }
+        }
+        for (const auto& [id, refFormId] : m_refById)
+        {
+            const auto cMotion = m_motion.find(id);
+            if (cMotion == m_motion.end() || !cMotion->second.Held)
+                continue;
+            TESObjectREFR* pRef = Cast<TESObjectREFR>(TESForm::GetById(refFormId));
+            if (!pRef || !IsStillOurs(pRef, cMotion->second) || pRef->IsDeleted() || pRef->IsDisabled())
+                continue;
+            if (const float cApart = VRBodySync::NearestNodeTo(pRef, hand); cApart < nearest)
+            {
+                nearest = cApart;
+                found = HandPull{};
+                found.Kind = RequestPull::kDroppedItem;
+                found.ServerId = id;
+                found.FormId = refFormId;
+            }
+        }
+        {
+            auto view = m_world.view<RemoteComponent, FormIdComponent>();
+            for (const auto cEntity : view)
+            {
+                const uint32_t cFormId = view.get<FormIdComponent>(cEntity).Id;
+                Actor* pActor = Cast<Actor>(TESForm::GetById(cFormId));
+                // A body its owner is carrying; one that lies still is taken over by grabbing it, as before (IsRemoteBodyGrabbedHere).
+                if (!pActor || !pActor->actorState.IsDead() || !VRBodySync::IsBodyMovedByOwner(cFormId))
+                    continue;
+                if (const float cApart = VRBodySync::NearestNodeTo(pActor, hand); cApart < nearest)
+                {
+                    nearest = cApart;
+                    found = HandPull{};
+                    found.Kind = RequestPull::kActor;
+                    found.ServerId = view.get<RemoteComponent>(cEntity).Id;
+                    found.FormId = cFormId;
+                }
+            }
+        }
+
+        if (found.FormId == 0)
+            continue;
+
+        found.Active = true;
+        found.WasPressed = true;
+        found.Since = aNow;
+        pull = found;
+        spdlog::info("PullDiag: this player's {} hand pressed {:.0f} units from {:X}, which another game is moving ({}); sending the hand there", side ? "right" : "left",
+                     nearest, pull.FormId, pull.Kind == RequestPull::kActor ? "a body" : pull.Kind == RequestPull::kWorldObject ? "a placed object" : "a dropped item");
+        send(true);
+    }
+}
+
+void DroppedItemService::OnNotifyPull(const NotifyPull& acMessage) noexcept
+{
+    const uint64_t cKey = (static_cast<uint64_t>(acMessage.PlayerId) << 1) | (acMessage.Hand & 1);
+    if (!acMessage.Active)
+    {
+        VRBodySync::EndPull(cKey);
+        return;
+    }
+
+    // Only the game that moves the thing pulls it: one that holds it still for another game leaves it alone.
+    TESObjectREFR* pRef = nullptr;
+    Motion* pMotion = nullptr;
+    if (acMessage.Kind == RequestPull::kActor)
+    {
+        auto view = m_world.view<LocalComponent, FormIdComponent>();
+        for (const auto cEntity : view)
+        {
+            if (view.get<LocalComponent>(cEntity).Id != acMessage.ServerId)
+                continue;
+            Actor* pActor = Cast<Actor>(TESForm::GetById(view.get<FormIdComponent>(cEntity).Id));
+            // Bodies only: a living actor's ragdoll is driven by its animation.
+            if (pActor && pActor->formID != 0x14 && pActor->actorState.IsDead())
+                pRef = pActor;
+            break;
+        }
+    }
+    else if (acMessage.Kind == RequestPull::kWorldObject)
+    {
+        const uint32_t cFormId = m_world.GetModSystem().GetGameId(acMessage.ObjectId);
+        pRef = cFormId ? Cast<TESObjectREFR>(TESForm::GetById(cFormId)) : nullptr;
+        if (pRef && !IsMovableObject(pRef))
+            pRef = nullptr;
+        if (const auto cMotion = m_objectMotion.find(cFormId); cMotion != m_objectMotion.end())
+            pMotion = &cMotion->second;
+    }
+    else if (acMessage.Kind == RequestPull::kDroppedItem)
+    {
+        if (const auto cRef = m_refById.find(acMessage.ServerId); cRef != m_refById.end())
+        {
+            pRef = Cast<TESObjectREFR>(TESForm::GetById(cRef->second));
+            if (const auto cMotion = m_motion.find(acMessage.ServerId); cMotion != m_motion.end())
+                pMotion = &cMotion->second;
+            if (pRef && pMotion && !IsStillOurs(pRef, *pMotion))
+                pRef = nullptr;
+        }
+    }
+
+    if (!pRef || pRef->IsDeleted() || pRef->IsDisabled() || (pMotion && pMotion->Held))
+    {
+        VRBodySync::EndPull(cKey);
+        return;
+    }
+
+    // Counted as carried here: it is not called put down under the other player's hand, and its moves are sent though it is next to their copy.
+    if (VRBodySync::PullBody(cKey, pRef, glm::vec3(acMessage.Position)) && pMotion)
+        pMotion->LastLocalMove = std::chrono::steady_clock::now();
 }

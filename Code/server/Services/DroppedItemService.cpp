@@ -12,6 +12,8 @@
 #include <Messages/NotifyDroppedItemMove.h>
 #include <Messages/RequestWorldObjectMove.h>
 #include <Messages/NotifyWorldObjectMove.h>
+#include <Messages/RequestPull.h>
+#include <Messages/NotifyPull.h>
 #include <Messages/EnterInteriorCellRequest.h>
 #include <Messages/EnterExteriorCellRequest.h>
 #include <Messages/ShiftGridCellRequest.h>
@@ -45,6 +47,7 @@ DroppedItemService::DroppedItemService(World& aWorld, entt::dispatcher& aDispatc
     , m_removeConnection(aDispatcher.sink<PacketEvent<RequestDroppedItemRemove>>().connect<&DroppedItemService::OnRemove>(this))
     , m_moveConnection(aDispatcher.sink<PacketEvent<RequestDroppedItemMove>>().connect<&DroppedItemService::OnMove>(this))
     , m_objectMoveConnection(aDispatcher.sink<PacketEvent<RequestWorldObjectMove>>().connect<&DroppedItemService::OnObjectMove>(this))
+    , m_pullConnection(aDispatcher.sink<PacketEvent<RequestPull>>().connect<&DroppedItemService::OnPull>(this))
     , m_interiorConnection(aDispatcher.sink<PacketEvent<EnterInteriorCellRequest>>().connect<&DroppedItemService::OnEnterInteriorCell>(this))
     , m_exteriorConnection(aDispatcher.sink<PacketEvent<EnterExteriorCellRequest>>().connect<&DroppedItemService::OnEnterExteriorCell>(this))
     , m_gridConnection(aDispatcher.sink<PacketEvent<ShiftGridCellRequest>>().connect<&DroppedItemService::OnShiftGridCell>(this))
@@ -183,6 +186,38 @@ void DroppedItemService::OnObjectMove(const PacketEvent<RequestWorldObjectMove>&
     {
         if (pPlayer != acMessage.pPlayer && pPlayer->GetCellComponent().IsInRange(cell, false))
             pPlayer->Send(notify);
+    }
+}
+
+// A hand on something another player's game is moving: passed on to that game, which pulls the thing toward the hand.
+// A character goes to its owner; an object has no owner here, so everyone near the hand is told and the game that moves it acts.
+void DroppedItemService::OnPull(const PacketEvent<RequestPull>& acMessage) const noexcept
+{
+    const auto& message = acMessage.Packet;
+
+    NotifyPull notify{};
+    notify.PlayerId = acMessage.pPlayer->GetId();
+    notify.Kind = message.Kind;
+    notify.ServerId = message.ServerId;
+    notify.ObjectId = message.ObjectId;
+    notify.Hand = message.Hand;
+    notify.Position = message.Position;
+    notify.Active = message.Active;
+
+    if (message.Kind == RequestPull::kActor)
+    {
+        const auto cEntity = static_cast<entt::entity>(message.ServerId);
+        const auto* pOwnerComponent = m_world.valid(cEntity) ? m_world.try_get<OwnerComponent>(cEntity) : nullptr;
+        Player* pOwner = pOwnerComponent ? pOwnerComponent->GetOwner() : nullptr;
+        if (pOwner && pOwner != acMessage.pPlayer)
+            pOwner->Send(notify, TiltedPhoques::kUnreliable);
+        return;
+    }
+
+    for (Player* pPlayer : m_world.GetPlayerManager())
+    {
+        if (pPlayer != acMessage.pPlayer && pPlayer->GetCellComponent().IsInRange(acMessage.pPlayer->GetCellComponent(), false))
+            pPlayer->Send(notify, TiltedPhoques::kUnreliable);
     }
 }
 

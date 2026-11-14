@@ -3,6 +3,7 @@
 #include <Structs/VRPose.h>
 
 struct Actor;
+struct TESObjectREFR;
 struct PlayerCharacter;
 
 //! Syncs the pose of VR players: spine, head, arms and hands always.
@@ -108,6 +109,22 @@ bool CaptureBodyPose(Actor* apActor, VRPose& aOutPose) noexcept;
 //! True once per grab, after a third of a second of motion; the caller then asks for the body so that this side sends it.
 //! acOwnerPosition is where the owner's updates put it: motion that follows those is the owner's, not a hand here.
 bool IsRemoteBodyGrabbedHere(Actor* apActor, const glm::vec3& acOwnerPosition) noexcept;
+
+//! Pulls (EXPERIMENTAL): a hand on something another player's game is moving.
+//! The hand's game sends where the hand is (RequestPull); the game that moves the thing pulls its nearest body toward it.
+//!
+//! Whether that hand of this player presses its grip or trigger, and where it is. Side 0 left, 1 right.
+bool PressedHand(uint8_t aSide, glm::vec3& aAt) noexcept;
+//! How far the nearest node of a reference's 3D is from a point; very large without 3D.
+float NearestNodeTo(TESObjectREFR* apRef, const glm::vec3& acPoint) noexcept;
+//! Whether the owner's bones moved this dead body here in the last two seconds: its owner is carrying it.
+bool IsBodyMovedByOwner(uint32_t aFormId) noexcept;
+//! In the game that moves the thing: pull its body nearest acHand toward acHand until EndPull, or until this is not called for 300 ms.
+//! aKey names the hand (player id << 1 | side). False if the thing has no body to pull near that hand.
+bool PullBody(uint64_t aKey, TESObjectREFR* apRef, const glm::vec3& acHand) noexcept;
+void EndPull(uint64_t aKey) noexcept;
+//! Once a frame or so, on the main thread: lets go of what pulls that stopped arriving held.
+void ExpirePulls() noexcept;
 
 //! Weapon touch: a controller pulse when your blade or your hand meets somebody else's weapon.
 //!
