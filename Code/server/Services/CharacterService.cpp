@@ -587,6 +587,10 @@ void CharacterService::OnAssignCharacterRequest(const PacketEvent<AssignCharacte
             }
             const bool cOwnFollower = ConnectedFollowerPlayer(m_world, ownerComponent) == acMessage.pPlayer->GetId();
 
+            // A game that registers the actor has it loaded again, so it can be given it once more.
+            // Its name stays on the list from the time it let the actor go, and it would be passed over when the owner falls silent.
+            std::erase(ownerComponent.InvalidOwners, acMessage.pPlayer);
+
             const bool isOwner = ownerComponent.GetOwner() == acMessage.pPlayer;
             const bool transferToLeader = !isOwner && !cOwnFollower && CanClaimOwnership(acMessage.pPlayer, *itor, ownerComponent.OwnershipEpoch, OwnershipTransferReason::LeaderAssignment);
 

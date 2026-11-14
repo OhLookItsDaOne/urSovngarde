@@ -695,7 +695,10 @@ void GameServer::OnDisconnection(const ConnectionId_t aConnectionId, EDisconnect
                 continue;
             }
 
-            const auto& [ownerComponent] = ownerView.get(entity);
+            auto& ownerComponent = ownerView.get<OwnerComponent>(entity);
+            // The list holds player addresses, and the next player to connect can be given this one's:
+            // left in, that player would never be offered the actor, and it would be removed while it stands in their game.
+            std::erase(ownerComponent.InvalidOwners, pPlayer);
             if (ownerComponent.GetOwner() == pPlayer)
             {
                 m_pWorld->GetDispatcher().enqueue(OwnershipTransferEvent(entity));
