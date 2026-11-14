@@ -114,6 +114,8 @@ struct CharacterService
 #ifdef SKYRIMVR
     void LayDownStandingBodies() noexcept;
 #endif
+    //! Switches off the removed copies queued since the last frame; called on the main thread at the start of a frame.
+    static void DisableQueuedCopies() noexcept;
 
 private:
     //! False when the cell to move to could not be found.
@@ -134,6 +136,8 @@ private:
     void RestoreConformedWeapons(Actor* apActor) noexcept;
     // This player's followers owned by another player, asked for back once they are near this player.
     void RunFollowerReclaims() const noexcept;
+    // As party leader, claims a copy left unclaimed on arrival for being far from this player, once it comes near.
+    void RunLeaderClaims() const noexcept;
     // Tells the server who became, or stopped being, this player's follower.
     void RunFollowerReports() const noexcept;
     // Tells the server every 2 s which characters this game has loaded, and as what.

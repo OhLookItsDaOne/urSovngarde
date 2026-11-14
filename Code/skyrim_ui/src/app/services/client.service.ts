@@ -201,6 +201,14 @@ export class ClientService implements OnDestroy {
     this._password = password;
   }
 
+  /** The launcher set a friend's server and the game connects to it by itself; the menu names the friend meanwhile. */
+  public joiningFriend(name: string): void {
+    this.isConnectionInProgressChange.next(true);
+    this._host = name;
+    this._port = 0;
+    this._password = '';
+  }
+
   /** The address of the last connection this menu started. */
   public get host(): string {
     return this._host;
@@ -294,6 +302,10 @@ export class ClientService implements OnDestroy {
     skyrimtogether.setVoiceVolume(volume);
   }
 
+  public setVoicePartyNearbyOnly(nearbyOnly: boolean): void {
+    skyrimtogether.setVoicePartyNearbyOnly(nearbyOnly);
+  }
+
   public setPlayerVoiceMuted(playerId: number, muted: boolean): void {
     skyrimtogether.setPlayerVoiceMuted(playerId, muted);
   }
@@ -374,8 +386,9 @@ export class ClientService implements OnDestroy {
   private onDisconnect(isError: boolean): void {
     void this.zone.run(async () => {
       this.localPlayerId = undefined;
-      this.connectionStateChange.next(false);
+      // In this order: a launcher join going on sets "in progress" again when told of the disconnection.
       this.isConnectionInProgressChange.next(false);
+      this.connectionStateChange.next(false);
 
       if (isError && this._remainingReconnectionAttempt > 0) {
         this._remainingReconnectionAttempt--;

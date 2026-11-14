@@ -14,6 +14,7 @@
 #include <Events/InventoryChangeEvent.h>
 #include <Events/DroppedItemEvents.h>
 #include <PlayerCharacter.h>
+#include <RecentModelChanges.h>
 #include <Events/ScriptAnimationEvent.h>
 #include <Events/LockChangeEvent.h>
 #include <Events/ReferenceEnableEvent.h>
@@ -38,6 +39,9 @@
 #include <Havok/hkbVariableValueSet.h>
 #include <Havok/hkbStateMachine.h>
 #include <Forms/TESObjectCELL.h>
+#include <AI/AIProcess.h>
+#include <Misc/InventoryEntry.h>
+#include <Misc/MiddleProcess.h>
 #include <Forms/TESWorldSpace.h>
 #include <Forms/TESActorBase.h>
 
@@ -406,6 +410,13 @@ ExtraDataList* TESObjectREFR::GetExtraDataList() noexcept
     return &extraData;
 }
 
+// TEMPORARY: see RecentModelChanges.
+static void NoteActorChange(const TESObjectREFR* apReference, const RecentModelChanges::Kind aKind) noexcept
+{
+    if (apReference->formType == FormType::Character)
+        RecentModelChanges::Note(static_cast<const Actor*>(apReference), aKind);
+}
+
 // Delete() should only be used on temporaries
 void TESObjectREFR::Delete() const noexcept
 {
@@ -413,6 +424,7 @@ void TESObjectREFR::Delete() const noexcept
 
     PAPYRUS_FUNCTION(void, ObjectReference, Delete);
 
+    NoteActorChange(this, RecentModelChanges::Kind::Deleted);
     s_pDelete(this);
 }
 
@@ -420,6 +432,7 @@ void TESObjectREFR::Delete() const noexcept
 // Loaded later, the task names a form id the game may have given to something else since, as it does a temporary copy's.
 void TESObjectREFR::Disable() const noexcept
 {
+    NoteActorChange(this, RecentModelChanges::Kind::Disable);
     const_cast<TESObjectREFR*>(this)->DisableImpl();
 }
 
@@ -442,6 +455,9 @@ void TESObjectREFR::MoveTo(TESObjectCELL* apCell, const NiPoint3& acPosition) co
 
     POINTER_SKYRIMSE(TInternalMoveTo, s_internalMoveTo, 56626, 56227);
 
+    // Without its 3D a move frees nothing, and copies waiting for theirs are moved every frame (RunSpawnUpdates).
+    if (const_cast<TESObjectREFR*>(this)->GetNiNode())
+        NoteActorChange(this, RecentModelChanges::Kind::Moved);
     TiltedPhoques::ThisCall(s_internalMoveTo, this, GetNullHandle(), apCell, apCell->worldspace, acPosition, rotation);
 }
 
@@ -579,7 +595,145 @@ bool HoldsList(const ExtraContainerChanges::Entry* apEntry, const ExtraDataList*
             return true;
     return false;
 }
+
+// An actor's hands and ammunition point at extra data of their items.
+// A hand that points at extra data that is not its item's, freed or given to another item since, is still read there by the game and other plugins.
+constexpr const char* kHandNames[] = {"left hand", "right hand", "ammunition"};
+
+// The slots of the hands in an actor's AI process; false for a reference without one.
+bool GetHandSlots(TESObjectREFR* apRef, InventoryEntry** (&aSlots)[3]) noexcept
+{
+    Actor* pActor = Cast<Actor>(apRef);
+    MiddleProcess* pMiddle = pActor && pActor->currentProcess ? pActor->currentProcess->middleProcess : nullptr;
+    if (!pMiddle)
+        return false;
+    aSlots[0] = &pMiddle->leftEquippedObject;
+    aSlots[1] = &pMiddle->rightEquippedObject;
+    aSlots[2] = &pMiddle->ammoEquippedObject;
+    return true;
+}
+
+// Whether any change entry of the item holds this list.
+bool ItemHoldsList(const ExtraContainerChanges::Data* apChanges, const TESForm* apItem, const ExtraDataList* apList) noexcept
+{
+    for (const ExtraContainerChanges::Entry* pEntry : *apChanges->entries)
+        if (pEntry && pEntry->form == apItem && HoldsList(pEntry, apList))
+            return true;
+    return false;
+}
+
+// Whether a hand's list names extra data that is not its item's.
+// The game gives each hand entry a list of its own (the rig never saw one shared with an item), so walking it is safe.
+// The extra data it names may be freed or reused, so only addresses are compared.
+bool NamesStrayExtraData(const ExtraContainerChanges::Data* apChanges, const InventoryEntry* apHand) noexcept
+{
+    if (!apChanges || !apChanges->entries)
+        return false;
+    size_t seen = 0;
+    for (const ExtraDataList* pList : *apHand->pExtraLists)
+    {
+        // A hand holds a list or two; the bound keeps a broken list from running on.
+        if (++seen > 8)
+            break;
+        if (pList && !ItemHoldsList(apChanges, apHand->pObject, pList))
+            return true;
+    }
+    return false;
+}
+
+// Hands this client emptied, by actor form id, as (item, left hand).
+// Only a player copy's are taken, at its owner's next hand items (TakeEmptiedHands); an NPC's stay noted.
+TiltedPhoques::Map<uint32_t, Vector<std::pair<TESForm*, bool>>> s_emptiedHands;
+
+// The hand is emptied, as an unequip leaves it.
+// A hand left holding its item with no extra data list is not safe: the game reads that list with no null check, for a hand holding a light and in an equip.
+// The hand's entry is not freed, as that needs the game's own destructor; it is small.
+void EmptyHand(TESObjectREFR* apRef, InventoryEntry** appSlot, const size_t aHand, const char* acpWhen) noexcept
+{
+    const InventoryEntry* pEntry = *appSlot;
+    const Actor* pActor = Cast<Actor>(apRef);
+    spdlog::info("HandWatch: {:X} (dead: {}) pointed its {} ({:X}) at extra data {}; the hand is emptied", apRef->formID, pActor && pActor->IsDead(), kHandNames[aHand],
+                 pEntry->pObject ? pEntry->pObject->formID : 0, acpWhen);
+    // The ammunition is no hand item.
+    if (aHand < 2 && pEntry->pObject)
+        s_emptiedHands[apRef->formID].push_back({pEntry->pObject, aHand == 0});
+    *appSlot = nullptr;
+}
+
+// A removal is watched: what the hands point at is noted before it, and a hand the game left as it was is checked after.
+class HandWatch
+{
+public:
+    explicit HandWatch(TESObjectREFR* apRef) noexcept
+        : m_pRef(apRef)
+    {
+        InventoryEntry** slots[3];
+        if (!GetHandSlots(apRef, slots))
+            return;
+        for (size_t i = 0; i < std::size(slots); ++i)
+        {
+            m_hands[i].pEntry = *slots[i];
+            m_hands[i].pLists = m_hands[i].pEntry ? m_hands[i].pEntry->pExtraLists : nullptr;
+        }
+    }
+
+    void EmptyRemovedHands() noexcept
+    {
+        InventoryEntry** slots[3];
+        if (!GetHandSlots(m_pRef, slots))
+            return;
+        const ExtraContainerChanges::Data* pChanges = m_pRef->GetContainerChanges();
+        for (size_t i = 0; i < std::size(slots); ++i)
+        {
+            const Hand& hand = m_hands[i];
+            // The game set this hand anew, or it pointed at nothing.
+            if (!hand.pLists || *slots[i] != hand.pEntry || hand.pEntry->pExtraLists != hand.pLists)
+                continue;
+            if (NamesStrayExtraData(pChanges, hand.pEntry))
+                EmptyHand(m_pRef, slots[i], i, "its item does not hold, after a removal");
+        }
+    }
+
+private:
+    struct Hand
+    {
+        InventoryEntry* pEntry = nullptr;
+        GameList<ExtraDataList>* pLists = nullptr;
+    };
+
+    TESObjectREFR* m_pRef;
+    Hand m_hands[3];
+};
 } // namespace
+
+// Other plugins read a living actor's hands on every equip (Enchantment Art Extender reads the right hand's extra data).
+// Items also leave an actor by the game's own hand (looting, the dead-body clean-up), which no watch here sees.
+// So before a revival and before each equip from its owner, a copy's hands are checked against its items once more.
+void TESObjectREFR::EmptyHandsOfStrayExtraData(const char* acpWhen) noexcept
+{
+    InventoryEntry** slots[3];
+    if (!GetHandSlots(this, slots))
+        return;
+
+    const ExtraContainerChanges::Data* pChanges = GetContainerChanges();
+    for (size_t i = 0; i < std::size(slots); ++i)
+    {
+        InventoryEntry* pEntry = *slots[i];
+        if (pEntry && pEntry->pExtraLists && NamesStrayExtraData(pChanges, pEntry))
+            EmptyHand(this, slots[i], i, acpWhen);
+    }
+}
+
+Vector<std::pair<TESForm*, bool>> TESObjectREFR::TakeEmptiedHands(uint32_t aFormId) noexcept
+{
+    Vector<std::pair<TESForm*, bool>> emptied;
+    if (const auto it = s_emptiedHands.find(aFormId); it != s_emptiedHands.end())
+    {
+        emptied = std::move(it->second);
+        s_emptiedHands.erase(it);
+    }
+    return emptied;
+}
 
 // The game removes an item's extra data lists one at a time, and a removal does nothing once the item's count is used up.
 // So each item gets at least the count its lists hold, and a list counting 0 or less, which holds no item as the game counts it, is set to 1.
@@ -731,7 +885,9 @@ void TESObjectREFR::RemoveAllItems() noexcept
         }
         --budget;
 
+        HandWatch hands(this);
         RemoveItem(pItem, count, ITEM_REMOVE_REASON::kRemove, pList, nullptr);
+        hands.EmptyRemovedHands();
 
         // Progress: the list is gone, or the item's count went down.
         const ExtraContainerChanges::Entry* pAfter = FindEntry(GetContainerChanges(), pItem);
@@ -1173,6 +1329,9 @@ void TESObjectREFR::AddOrRemoveItem(const Inventory::Entry& arEntry, bool aIsSet
     if (pObject->formType == FormType::LeveledItem)
         return;
 
+    // A whole inventory set again is noted once, by Actor::SetActorInventory.
+    if (!aIsSettingInventory)
+        NoteActorChange(this, RecentModelChanges::Kind::ItemsChanged);
     ExtraDataList* pExtraDataList = GetExtraDataFromItem(arEntry);
 
     // A quest object another player picked up from the world already reached their copy here, through the replayed pick-up.
@@ -1209,7 +1368,9 @@ void TESObjectREFR::AddOrRemoveItem(const Inventory::Entry& arEntry, bool aIsSet
     else if (arEntry.Count < 0)
     {
         spdlog::debug("Removing item {:X}, count {}", pObject->formID, -arEntry.Count);
+        HandWatch hands(this);
         RemoveItem(pObject, -arEntry.Count, ITEM_REMOVE_REASON::kRemove, pExtraDataList, nullptr);
+        hands.EmptyRemovedHands();
     }
 
     // TODO(cosideci): this is still flawed. Adding the refr to the quest leader is hard.
@@ -1249,6 +1410,7 @@ void TESObjectREFR::EnableImpl() noexcept
 
     POINTER_SKYRIMSE(TEnableImpl, s_enable, 19800, 19373);
 
+    NoteActorChange(this, RecentModelChanges::Kind::Enable);
     TiltedPhoques::ThisCall(s_enable, this, false);
 }
 
