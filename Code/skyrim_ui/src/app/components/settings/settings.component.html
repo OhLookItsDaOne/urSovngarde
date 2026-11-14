@@ -52,6 +52,17 @@
         />
       </div>
       <div class="setting">
+        <label for="voicePartyNearbyOnly">{{
+          'COMPONENT.SETTINGS.VOICE_PARTY_NEARBY_ONLY' | transloco
+        }}</label>
+        <input
+          type="checkbox"
+          id="voicePartyNearbyOnly"
+          [ngModel]="settings.voicePartyNearbyOnly | async"
+          (ngModelChange)="settings.voicePartyNearbyOnly.next($event)"
+        />
+      </div>
+      <div class="setting">
         <label for="voiceVolume">{{
           'COMPONENT.SETTINGS.VOICE_VOLUME' | transloco
         }}</label>
@@ -109,6 +120,17 @@
 
     <section>
       <h2>{{ 'COMPONENT.SETTINGS.PARTY' | transloco }}</h2>
+      <div class="setting">
+        <label for="shareWithSteamFriends">{{
+          'COMPONENT.SETTINGS.SHARE_WITH_STEAM_FRIENDS' | transloco
+        }}</label>
+        <input
+          type="checkbox"
+          id="shareWithSteamFriends"
+          [ngModel]="settings.shareWithSteamFriends | async"
+          (ngModelChange)="settings.shareWithSteamFriends.next($event)"
+        />
+      </div>
       <div class="setting">
         <label for="showParty">{{
           'COMPONENT.SETTINGS.SHOW_PARTY' | transloco

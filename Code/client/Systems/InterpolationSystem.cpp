@@ -91,6 +91,46 @@ float LegSpeed(Actor* apActor) noexcept
 // Copies that went quiet without being stopped, so that why is logged once per quiet spell.
 TiltedPhoques::Set<uint32_t> s_quietNotStopped;
 
+#ifdef SKYRIMVR
+// TEMPORARY diagnostic for a player copy seen flipping between two poses several times a second (with PoseFlipDiag in VRBodySync); remove once understood.
+// It counts the poses that jumped away and came straight back, and shows every pose as it came.
+// Whether two poses are further apart than a body moves between two updates: the hips' horizontal place, or a bone other than the hands.
+// The hands are left out because a wrist can flick that fast.
+bool PosesFarApart(const VRPose& acA, const VRPose& acB, const float aHips, const float aDegrees) noexcept
+{
+    if (acA.HasHips && acB.HasHips && glm::distance(glm::vec2{acA.HipOffset[0], acA.HipOffset[1]}, glm::vec2{acB.HipOffset[0], acB.HipOffset[1]}) > aHips)
+        return true;
+    // Two rotations are more than aDegrees apart when the absolute dot product of their quaternions is below the cosine of half of it.
+    const float cCosHalf = std::cos(glm::radians(aDegrees) / 2.f);
+    for (size_t i = 0; i < VRPose::kUpperBoneCount; ++i)
+    {
+        if (i == VRPose::kLeftHand || i == VRPose::kRightHand)
+            continue;
+        if (std::fabs(glm::dot(static_cast<glm::quat>(acA.Bones[i]), static_cast<glm::quat>(acB.Bones[i]))) < cCosHalf)
+            return true;
+    }
+    return false;
+}
+
+// A pose that jumped away from the one before and is back beside it in the one after: a body read in another state, not a movement.
+// On the rig the sending game's skeleton was sometimes in another state for one update, and the copy jumped to that pose and straight back.
+bool IsPoseSpike(const VRPose& acBefore, const VRPose& acPose, const VRPose& acAfter) noexcept
+{
+    if (acBefore.NoBones || acPose.NoBones || acAfter.NoBones)
+        return false;
+    return PosesFarApart(acBefore, acPose, 15.f, 60.f) && PosesFarApart(acPose, acAfter, 15.f, 60.f) && !PosesFarApart(acBefore, acAfter, 7.5f, 30.f);
+}
+
+// Spikes in each remote player's poses: counted once each, logged every 30 s while there are any.
+struct PoseSpikes
+{
+    uint64_t LastTick = 0;
+    uint32_t Count = 0;
+    std::chrono::steady_clock::time_point NextLog{};
+};
+TiltedPhoques::Map<uint32_t, PoseSpikes> s_poseSpikes;
+#endif
+
 // The graph's own stop, then no speed for the legs, as when the owner's character stands still.
 void StopQuietCopy(Actor* apActor, const double aQuietFor) noexcept
 {
@@ -354,6 +394,36 @@ void InterpolationSystem::Update(Actor* apActor, InterpolationComponent& aInterp
     vrPose.HasWeapons = false;
     vrPose.HasSpellAim = false;
     {
+#ifdef SKYRIMVR
+        // TEMPORARY, see IsPoseSpike: a remote player's poses that jumped away and straight back are counted; all are still shown.
+        if (apActor && apActor->GetExtension() && apActor->GetExtension()->IsRemotePlayer())
+        {
+            std::array<const InterpolationComponent::TimePoint*, 64> posed{};
+            size_t posedCount = 0;
+            for (const auto& point : movements)
+                if (point.VRPoseData.HasData && posedCount < posed.size())
+                    posed[posedCount++] = &point;
+
+            PoseSpikes& spikes = s_poseSpikes[apActor->formID];
+            for (size_t i = 1; i + 1 < posedCount; ++i)
+                if (posed[i]->Tick > spikes.LastTick && IsPoseSpike(posed[i - 1]->VRPoseData, posed[i]->VRPoseData, posed[i + 1]->VRPoseData))
+                {
+                    spikes.LastTick = posed[i]->Tick;
+                    ++spikes.Count;
+                }
+            const auto cNow = std::chrono::steady_clock::now();
+            if (spikes.NextLog == std::chrono::steady_clock::time_point{})
+                spikes.NextLog = cNow + 30s;
+            else if (cNow >= spikes.NextLog)
+            {
+                if (spikes.Count)
+                    spdlog::info("PoseSpike: copy {:X}: {} poses in 30 s jumped away from the one before and straight back (shown as they came)", apActor->formID, spikes.Count);
+                spikes.Count = 0;
+                spikes.NextLog = cNow + 30s;
+            }
+        }
+#endif
+
         const InterpolationComponent::TimePoint* pBefore = nullptr;
         const InterpolationComponent::TimePoint* pAfter = nullptr;
         for (const auto& point : movements)
@@ -520,9 +590,25 @@ void InterpolationSystem::Update(Actor* apActor, InterpolationComponent& aInterp
     if (apActor->actorState.IsDying() || apActor->actorState.IsBleedingOut())
         return;
 
+    const ActorExtension* pExtension = apActor->GetExtension();
+
+    // Another player's copy never goes down here, and its AI does not run here to finish a fall (HookActorProcess).
+    // A knock that a hit here leaves on it stays for good, and no sword hit lands on it here after that.
+    // So it stands again at once, as its owner's game decides whether that player goes down.
+    if (pExtension && pExtension->IsRemotePlayer() && apActor->actorState.IsKnockedDown() && !apActor->actorState.IsDead())
+    {
+        static std::chrono::steady_clock::time_point s_nextSaid{};
+        if (const auto cNow = std::chrono::steady_clock::now(); cNow >= s_nextSaid)
+        {
+            s_nextSaid = cNow + 10s;
+            spdlog::info("KnockDown: player copy {:X} was knocked here (knock state {}); stood up again, as a copy never goes down", apActor->formID,
+                         (apActor->actorState.flags1 >> 25) & 0x7);
+        }
+        apActor->actorState.flags1 &= ~0xE000000u;
+    }
+
     // An NPC copy thrown to the floor lies in its own ragdoll until it gets up here (its knock state is its own).
     // Moved meanwhile, the body would glide along the floor behind its owner (live-copy-knockdown).
-    const ActorExtension* pExtension = apActor->GetExtension();
     const bool cKnockedNpc = !apActor->actorState.IsDead() && apActor->actorState.IsKnockedDown() && pExtension && !pExtension->IsRemotePlayer();
     {
         // KNOCK_STATE_ENUM 5: the ragdoll has come to rest and the get-up is queued.
@@ -575,7 +661,14 @@ void InterpolationSystem::Update(Actor* apActor, InterpolationComponent& aInterp
         }
     }
     if (cKnockedNpc)
+    {
+#ifdef SKYRIMVR
+        // Carried over there, as a player picks up a rabbit, it is drawn from its owner's bones; once they stop, its ragdoll goes where the owner left it.
+        // PlaceCorpse moves a living body only then, so a copy's own fall is left where it lies.
+        VRBodySync::PlaceCorpse(apActor, position);
+#endif
         return;
+    }
 
     if (apActor->actorState.IsDead())
     {
@@ -819,5 +912,6 @@ void InterpolationSystem::Forget(const uint32_t aFormId) noexcept
     s_saidDeadAlone.erase(aFormId);
 #ifdef SKYRIMVR
     VRBodySync::ForgetCorpse(aFormId);
+    s_poseSpikes.erase(aFormId);
 #endif
 }
