@@ -585,12 +585,13 @@ void DroppedItemService::OnUpdate(const UpdateEvent&) noexcept
     if (!m_transport.IsConnected())
         return;
 
-    // Thirty times a second: the receiver snaps to each update, so fewer would stutter.
+    // Every frame, at most 90 times a second: the receiver snaps to each update, and a hand on a thing another game moves waits for its answer.
+    // At 30 a second, up to 33 ms passed before a move or a hand was sent, twice on the way round. Only things that move are sent, so it costs a few small messages.
     static std::chrono::steady_clock::time_point s_next{};
     const auto now = std::chrono::steady_clock::now();
     if (now < s_next)
         return;
-    s_next = now + std::chrono::milliseconds(33);
+    s_next = now + std::chrono::milliseconds(11);
 
     for (const auto& [id, refFormId] : m_refById)
     {
