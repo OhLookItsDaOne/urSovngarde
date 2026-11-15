@@ -1,5 +1,8 @@
 // urSovngardeBridge.dll, an SKSE VR plugin (Data/SKSE/Plugins).
 //
+// Weapon Throw VR (Shizof, nexusmods.com/skyrimspecialedition/mods/31374) hands out its interface the same way; the message
+// number and receiver name are those of the WeaponThrowVRinterface001 files in that mod's published source.
+//
 // HIGGS, PLANCK and VRIK each hand out an interface object to other mods, but only through SKSE's messaging, and only
 // an SKSE plugin has the plugin handle that messaging asks for. The co-op client is not an SKSE plugin: the launcher
 // carries it. So this plugin asks the three mods for their interfaces once all plugins are loaded, and keeps the
@@ -70,6 +73,8 @@ struct BridgeState
     void* Higgs = nullptr;
     void* Planck = nullptr;
     void* Vrik = nullptr;
+    // Since bridge version 2. Null without Weapon Throw VR, or with a version of it that has no interface.
+    void* WeaponThrow = nullptr;
 };
 
 BridgeState s_state;
@@ -93,6 +98,8 @@ void OnSkseMessage(SKSEMessagingInterface::Message* apMessage)
     s_state.Higgs = Ask(0xF9279A57, "HIGGS");
     s_state.Planck = Ask(0x92F38745, "PLANCK");
     s_state.Vrik = Ask(0xF2AFAEE6, "VRIK");
+    // Weapon Throw VR listens from PostLoad on.
+    s_state.WeaponThrow = Ask(0xFA07A15D, "WeaponThrowVR");
     s_state.Stage = 3;
 }
 } // namespace
@@ -103,7 +110,7 @@ __declspec(dllexport) bool SKSEPlugin_Query(const SKSEInterface* apSkse, PluginI
 {
     apInfo->infoVersion = 1;
     apInfo->name = "urSovngardeBridge";
-    apInfo->version = 1;
+    apInfo->version = 2;
 
     s_handle = apSkse->GetPluginHandle();
     s_state.SkseVersion = apSkse->skseVersion;

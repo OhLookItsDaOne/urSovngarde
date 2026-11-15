@@ -21,7 +21,40 @@ struct BridgeState
     void* Higgs;
     void* Planck;
     void* Vrik;
+    // Not in the first bridge: read only where Size says it is there.
+    void* WeaponThrow;
 };
+// The size of the first bridge's record, which this client still takes.
+constexpr uint32_t kFirstBridgeSize = offsetof(BridgeState, WeaponThrow);
+
+// Weapon Throw VR: what it said (on its own thread) and what the launch hook saw (on the main thread), each kept until paired.
+std::mutex s_throwLock;
+struct
+{
+    uint32_t WeaponFormId = 0;
+    bool IsLeft = false;
+    std::chrono::steady_clock::time_point At{};
+} s_saidThrown;
+struct
+{
+    uint32_t Handle = 0;
+    std::chrono::steady_clock::time_point At{};
+} s_helperLaunch;
+bool s_returned[2]{};
+
+void OnWeaponThrown(TESForm* apWeapon, bool aIsLeft, void*)
+{
+    std::scoped_lock _{s_throwLock};
+    s_saidThrown.WeaponFormId = apWeapon ? apWeapon->formID : 0;
+    s_saidThrown.IsLeft = aIsLeft;
+    s_saidThrown.At = std::chrono::steady_clock::now();
+}
+
+void OnWeaponReturned(TESForm*, bool aIsLeft, void*, void*)
+{
+    std::scoped_lock _{s_throwLock};
+    s_returned[aIsLeft ? 0 : 1] = true;
+}
 
 VRModApis::HiggsInterface* s_pHiggs = nullptr;
 VRModApis::PlanckInterface* s_pPlanck = nullptr;
@@ -179,7 +212,7 @@ void Poll() noexcept
             pState = static_cast<const BridgeState*>(cGet());
     }
 
-    if (!pState || pState->Size < sizeof(BridgeState) || pState->Stage < 3)
+    if (!pState || pState->Size < kFirstBridgeSize || pState->Stage < 3)
     {
         // Said on the screen too, every two minutes: without the bridge this game guesses what its hands hold, a thing another player
         // moves cannot be taken, and the other players never learn what this player holds. A player does not read the log.
@@ -210,6 +243,17 @@ void Poll() noexcept
     spdlog::info("VRModApis: SKSE {:#x} on runtime {:#x}; HIGGS {}, PLANCK {}, VRIK {}", pState->SkseVersion, pState->RuntimeVersion, cBuild(s_pHiggs), cBuild(s_pPlanck),
                  cBuild(s_pVrik));
 
+    // Weapon Throw VR is no requirement: without it, or with a bridge from before it was asked, thrown weapons are simply not shown.
+    if (auto* pThrow = pState->Size >= sizeof(BridgeState) ? static_cast<WeaponThrowInterface*>(pState->WeaponThrow) : nullptr)
+    {
+        pThrow->RegisterThrowCallback(OnWeaponThrown);
+        pThrow->RegisterReturnCallback(OnWeaponReturned);
+        spdlog::info("VRModApis: Weapon Throw VR build {} answered; thrown weapons are shown to the other players", pThrow->GetBuildNumber());
+    }
+    else
+        spdlog::info("VRModApis: Weapon Throw VR did not answer ({}); thrown weapons are not shown to the other players",
+                     pState->Size >= sizeof(BridgeState) ? "not installed, or a version without an interface" : "urSovngardeBridge.dll is an older one");
+
     if (s_pHiggs)
     {
         s_pHiggs->AddGrabbedCallback(OnGrabbed);
@@ -229,6 +273,48 @@ void TakeHandEvents(std::vector<HandEvent>& aEvents) noexcept
             aEvents.push_back(std::move(*it));
     }
     s_events.erase(s_events.begin(), it);
+}
+
+bool TakeThrown(Thrown& aThrown) noexcept
+{
+    const auto cNow = std::chrono::steady_clock::now();
+    std::scoped_lock _{s_throwLock};
+    // The mod queues the shot and then reports the throw, so either can come first; two seconds apart at most.
+    if (s_saidThrown.WeaponFormId && cNow - s_saidThrown.At > std::chrono::seconds(2))
+        s_saidThrown.WeaponFormId = 0;
+    if (s_helperLaunch.Handle && cNow - s_helperLaunch.At > std::chrono::seconds(2))
+        s_helperLaunch.Handle = 0;
+    if (!s_saidThrown.WeaponFormId || !s_helperLaunch.Handle)
+        return false;
+
+    aThrown.WeaponFormId = s_saidThrown.WeaponFormId;
+    aThrown.IsLeft = s_saidThrown.IsLeft;
+    aThrown.ProjectileHandle = s_helperLaunch.Handle;
+    s_saidThrown.WeaponFormId = 0;
+    s_helperLaunch.Handle = 0;
+    return true;
+}
+
+bool TakeReturned(bool& aIsLeft) noexcept
+{
+    std::scoped_lock _{s_throwLock};
+    for (int side = 0; side < 2; ++side)
+    {
+        if (s_returned[side])
+        {
+            s_returned[side] = false;
+            aIsLeft = side == 0;
+            return true;
+        }
+    }
+    return false;
+}
+
+void NoteHelperLaunch(const uint32_t aProjectileHandle) noexcept
+{
+    std::scoped_lock _{s_throwLock};
+    s_helperLaunch.Handle = aProjectileHandle;
+    s_helperLaunch.At = std::chrono::steady_clock::now();
 }
 
 uint32_t HeldByHand(const uint8_t aSide) noexcept

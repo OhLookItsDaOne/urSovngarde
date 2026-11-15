@@ -6,6 +6,8 @@
 #include <Structs/Inventory.h>
 #include <Structs/Vector3_NetQuantize.h>
 
+#include <set>
+
 struct World;
 struct Player;
 struct CellIdComponent;
@@ -15,6 +17,7 @@ struct RequestDroppedItemMove;
 struct RequestWorldObjectMove;
 struct RequestPull;
 struct RequestGrabReport;
+struct RequestThrownWeapon;
 struct EnterInteriorCellRequest;
 struct EnterExteriorCellRequest;
 struct ShiftGridCellRequest;
@@ -50,6 +53,8 @@ private:
     void OnObjectMove(const PacketEvent<RequestWorldObjectMove>& acMessage) noexcept;
     void OnPull(const PacketEvent<RequestPull>& acMessage) const noexcept;
     void OnGrabReport(const PacketEvent<RequestGrabReport>& acMessage) noexcept;
+    //! Where a weapon a player threw is: passed on to the players around, who show a copy of it.
+    void OnThrownWeapon(const PacketEvent<RequestThrownWeapon>& acMessage) noexcept;
     void OnEnterInteriorCell(const PacketEvent<EnterInteriorCellRequest>& acMessage) const noexcept;
     void OnEnterExteriorCell(const PacketEvent<EnterExteriorCellRequest>& acMessage) const noexcept;
     void OnShiftGridCell(const PacketEvent<ShiftGridCellRequest>& acMessage) const noexcept;
@@ -112,6 +117,9 @@ private:
     entt::scoped_connection m_objectMoveConnection;
     entt::scoped_connection m_pullConnection;
     entt::scoped_connection m_grabReportConnection;
+    entt::scoped_connection m_thrownWeaponConnection;
+    //! Hands with a thrown weapon in the world (player id * 2 + hand), for one log line per throw.
+    std::set<uint64_t> m_thrown;
     entt::scoped_connection m_interiorConnection;
     entt::scoped_connection m_exteriorConnection;
     entt::scoped_connection m_gridConnection;

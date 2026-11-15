@@ -24,6 +24,8 @@
 #include <Games/Skyrim/VRModApis.h>
 #include <Messages/NotifyPull.h>
 #include <Messages/NotifyGrab.h>
+#include <Messages/RequestThrownWeapon.h>
+#include <Messages/NotifyThrownWeapon.h>
 #include <Games/Skyrim/VRBodySync.h>
 #include <Events/UpdateEvent.h>
 #include <NetImmerse/NiTransform.h>
@@ -219,6 +221,7 @@ DroppedItemService::DroppedItemService(World& aWorld, entt::dispatcher& aDispatc
     m_objectMoveConnection = aDispatcher.sink<NotifyWorldObjectMove>().connect<&DroppedItemService::OnNotifyWorldObjectMove>(this);
     m_pullConnection = aDispatcher.sink<NotifyPull>().connect<&DroppedItemService::OnNotifyPull>(this);
     m_grabConnection = aDispatcher.sink<NotifyGrab>().connect<&DroppedItemService::OnNotifyGrab>(this);
+    m_thrownWeaponConnection = aDispatcher.sink<NotifyThrownWeapon>().connect<&DroppedItemService::OnNotifyThrownWeapon>(this);
     m_updateConnection = aDispatcher.sink<UpdateEvent>().connect<&DroppedItemService::OnUpdate>(this);
 }
 
@@ -234,6 +237,9 @@ void DroppedItemService::OnDisconnected(const DisconnectedEvent&) noexcept
     m_idByRef.clear();
     m_remoteGrabs.clear();
     VRBodySync::ClearBodiesInOtherHands();
+    m_ownThrows[0] = m_ownThrows[1] = OwnThrow{};
+    while (!m_thrownCopies.empty())
+        RemoveThrownCopy(m_thrownCopies.begin()->first, "disconnected");
     m_pending.clear();
     m_announced.clear();
     m_reportedOldDrops = false;
@@ -324,6 +330,16 @@ void DroppedItemService::OnItemDropped(const ItemDroppedEvent& acEvent) noexcept
 
 void DroppedItemService::OnItemPickedUp(const ItemPickedUpEvent& acEvent) noexcept
 {
+    // A copy of another player's thrown weapon: no item. What the pick-up gives is taken away again (RunThrownWeapons).
+    for (auto& [key, copy] : m_thrownCopies)
+    {
+        if (copy.RefFormId == acEvent.RefFormId)
+        {
+            copy.Taken = true;
+            return;
+        }
+    }
+
     const auto it = m_idByRef.find(acEvent.RefFormId);
     if (it == m_idByRef.end())
     {
@@ -433,7 +449,8 @@ void DroppedItemService::OnNotifyDroppedItem(const NotifyDroppedItem& acMessage)
             return;
         for (TESObjectREFR* pRef : apCell->GetRefsByFormTypes(kItemTypes))
         {
-            if (!pRef || !pRef->baseForm || pRef->baseForm->formID != cBaseFormId || pRef->IsDisabled() || pRef->IsDeleted() || m_idByRef.count(pRef->formID))
+            if (!pRef || !pRef->baseForm || pRef->baseForm->formID != cBaseFormId || pRef->IsDisabled() || pRef->IsDeleted() || m_idByRef.count(pRef->formID) ||
+                IsThrownCopy(pRef->formID))
                 continue;
             const float distance = DistanceTo(pRef, cPosition);
             if (distance <= nearest)
@@ -569,7 +586,8 @@ void DroppedItemService::AnnounceOldDrops() noexcept
                 continue;
             ++found;
 
-            if (m_idByRef.count(pRef->formID) || m_announced.count(pRef->formID))
+            // A copy of another player's thrown weapon was dropped out of this player's inventory to exist, so the game lists it here.
+            if (m_idByRef.count(pRef->formID) || m_announced.count(pRef->formID) || IsThrownCopy(pRef->formID))
                 continue;
             m_announced.insert(pRef->formID);
 
@@ -756,6 +774,7 @@ void DroppedItemService::OnUpdate(const UpdateEvent&) noexcept
     RunPulls(now);
     RunSharedBodies();
     RunGrabReports();
+    RunThrownWeapons(now);
 }
 
 namespace
@@ -1744,4 +1763,257 @@ bool DroppedItemService::TakeOverPulled(const uint8_t aKind, const uint32_t aSer
         return true;
     }
     return false;
+}
+
+// Weapons thrown with Weapon Throw VR (Shizof, nexusmods.com/skyrimspecialedition/mods/31374; its interface is used with his leave:
+// free, open source, credit). The mod fires the weapon as a projectile from a hidden helper reference, with the projectile's model
+// set to the weapon's. No other game sees that. A launch of the same projectile there would be taken by that game's Weapon Throw VR
+// for its own player's throw (it knows its projectiles by their base form alone), so nothing is launched there: the thrower's game
+// sends where the projectile is, and the others show a copy of the weapon that only looks.
+bool DroppedItemService::IsThrownCopy(const uint32_t aFormId) const noexcept
+{
+    for (const auto& [key, copy] : m_thrownCopies)
+        if (copy.RefFormId == aFormId)
+            return true;
+    return false;
+}
+
+void DroppedItemService::EndOwnThrow(const uint8_t aHand, const char* acpWhy) noexcept
+{
+    OwnThrow& own = m_ownThrows[aHand & 1];
+    if (!own.Active)
+        return;
+    RequestThrownWeapon request{};
+    request.State = RequestThrownWeapon::kGone;
+    request.Hand = aHand & 1;
+    request.BaseId = own.BaseId;
+    m_transport.Send(request);
+    spdlog::info("Thrown: this player's {} hand's thrown weapon is no longer sent: {} (after {:.1f} s)", (aHand & 1) ? "right" : "left", acpWhy,
+                 std::chrono::duration<float>(std::chrono::steady_clock::now() - own.Since).count());
+    own = OwnThrow{};
+}
+
+void DroppedItemService::RemoveThrownCopy(const uint64_t aKey, const char* acpWhy) noexcept
+{
+    const auto it = m_thrownCopies.find(aKey);
+    if (it == m_thrownCopies.end())
+        return;
+    if (TESObjectREFR* pRef = it->second.RefFormId ? Cast<TESObjectREFR>(TESForm::GetById(it->second.RefFormId)) : nullptr; pRef && !pRef->IsDeleted())
+    {
+        pRef->Disable();
+        pRef->Delete();
+    }
+    spdlog::info("Thrown: the copy of player {}'s {} hand's thrown weapon ({:X}) is removed: {}", aKey >> 1, (aKey & 1) ? "right" : "left", it->second.RefFormId, acpWhy);
+    m_thrownCopies.erase(it);
+}
+
+void DroppedItemService::OnNotifyThrownWeapon(const NotifyThrownWeapon& acMessage) noexcept
+{
+    const uint64_t cKey = (static_cast<uint64_t>(acMessage.PlayerId) << 1) | (acMessage.Hand & 1);
+    if (acMessage.State == NotifyThrownWeapon::kGone)
+    {
+        RemoveThrownCopy(cKey, "its thrower's game says it is gone");
+        return;
+    }
+
+    const glm::vec3 cPosition(acMessage.X, acMessage.Y, acMessage.Z);
+    if (!std::isfinite(cPosition.x) || !std::isfinite(cPosition.y) || !std::isfinite(cPosition.z))
+        return;
+    for (const float cValue : acMessage.Rotation)
+        if (!std::isfinite(cValue))
+            return;
+
+    // Another thing from the same hand: the old copy goes first.
+    if (const auto it = m_thrownCopies.find(cKey); it != m_thrownCopies.end() && it->second.BaseId != acMessage.BaseId)
+        RemoveThrownCopy(cKey, "that hand threw something else");
+
+    const auto cNow = std::chrono::steady_clock::now();
+    const bool cNew = !m_thrownCopies.count(cKey);
+    ThrownCopy& copy = m_thrownCopies[cKey];
+    copy.BaseId = acMessage.BaseId;
+    // Gone to over the time until the next place is due, as a carried thing is (FollowMove); a first place or one after a pause at once.
+    const auto cSince = cNow - copy.ArrivedAt;
+    copy.Following = !cNew && cSince <= std::chrono::milliseconds(150);
+    copy.Due = cNow + cSince;
+    copy.ArrivedAt = cNow;
+    copy.SteppedAt = cNow;
+    copy.LastHeard = cNow;
+    copy.Position = cPosition;
+    std::copy(std::begin(acMessage.Rotation), std::end(acMessage.Rotation), copy.Rotation);
+    if (cNew)
+        spdlog::info("Thrown: player {}'s {} hand threw {:X}:{:X}; a copy of it is shown here", acMessage.PlayerId, (acMessage.Hand & 1) ? "right" : "left", acMessage.BaseId.ModId,
+                     acMessage.BaseId.BaseId);
+}
+
+void DroppedItemService::RunThrownWeapons(const std::chrono::steady_clock::time_point aNow) noexcept
+{
+    auto& modSystem = m_world.GetModSystem();
+
+    // 1. This player's own throws: what Weapon Throw VR reported, paired with the projectile it fired.
+    VRModApis::Thrown thrown;
+    while (VRModApis::TakeThrown(thrown))
+    {
+        if (!m_transport.IsConnected())
+            continue;
+        const uint8_t cHand = thrown.IsLeft ? 0 : 1;
+        GameId baseId{};
+        if (!modSystem.GetServerModId(thrown.WeaponFormId, baseId))
+        {
+            spdlog::info("Thrown: this player threw {:X}, which only this game has (made or enchanted here); not shown to the other players", thrown.WeaponFormId);
+            continue;
+        }
+        EndOwnThrow(cHand, "that hand threw again");
+        OwnThrow& own = m_ownThrows[cHand];
+        own.Active = true;
+        own.Handle = thrown.ProjectileHandle;
+        own.BaseId = baseId;
+        own.Since = aNow;
+        spdlog::info("Thrown: this player's {} hand threw {:X}; where it is goes to the other players", cHand ? "right" : "left", thrown.WeaponFormId);
+    }
+    bool returnedLeft = false;
+    while (VRModApis::TakeReturned(returnedLeft))
+        EndOwnThrow(returnedLeft ? 0 : 1, "Weapon Throw VR says it came back to the hand");
+
+    for (uint8_t hand = 0; hand < 2; ++hand)
+    {
+        OwnThrow& own = m_ownThrows[hand];
+        if (!own.Active)
+            continue;
+        if (!m_transport.IsConnected())
+        {
+            own = OwnThrow{};
+            continue;
+        }
+        TESObjectREFR* pRef = TESObjectREFR::GetByHandle(own.Handle);
+        const NiNode* pNode = pRef && !pRef->IsDeleted() && !pRef->IsDisabled() ? pRef->GetNiNode() : nullptr;
+        if (!pNode)
+        {
+            // Its 3D comes a moment after the launch; half a second without one and the projectile is gone.
+            if (own.MissingSince == std::chrono::steady_clock::time_point{})
+                own.MissingSince = aNow;
+            else if (aNow - own.MissingSince > std::chrono::milliseconds(500))
+                EndOwnThrow(hand, "its projectile is gone");
+            continue;
+        }
+        own.MissingSince = {};
+        if (aNow - own.Since > std::chrono::minutes(2))
+        {
+            EndOwnThrow(hand, "two minutes have passed");
+            continue;
+        }
+
+        const glm::vec3 cPosition = WorldPositionOf(pRef);
+        // Every frame while it moves, four times a second while it lies: the others drop a copy they hear nothing of for three seconds.
+        if (glm::distance(cPosition, own.LastPosition) < 0.5f && aNow - own.LastSent < std::chrono::milliseconds(250))
+            continue;
+        own.LastPosition = cPosition;
+        own.LastSent = aNow;
+
+        RequestThrownWeapon request{};
+        request.State = RequestThrownWeapon::kThere;
+        request.Hand = hand;
+        request.BaseId = own.BaseId;
+        request.X = cPosition.x;
+        request.Y = cPosition.y;
+        request.Z = cPosition.z;
+        const auto& cWorld = *reinterpret_cast<const NiTransform*>(reinterpret_cast<const uint8_t*>(pNode) + 0x7C);
+        for (int row = 0; row < 3; ++row)
+            for (int column = 0; column < 3; ++column)
+                request.Rotation[row * 3 + column] = cWorld.rotate.data[row][column];
+        m_transport.Send(request);
+    }
+
+    // 2. The copies of the other players' thrown weapons.
+    PlayerCharacter* pPlayer = PlayerCharacter::Get();
+    std::vector<std::pair<uint64_t, const char*>> ended;
+    for (auto& [key, copy] : m_thrownCopies)
+    {
+        if (aNow - copy.LastHeard > std::chrono::seconds(3))
+        {
+            ended.emplace_back(key, "nothing heard of it for three seconds");
+            continue;
+        }
+
+        TESObjectREFR* pRef = copy.RefFormId ? Cast<TESObjectREFR>(TESForm::GetById(copy.RefFormId)) : nullptr;
+        if (copy.RefFormId && (!pRef || pRef->IsDeleted() || pRef->IsDisabled()))
+        {
+            // Gone from the world here. Picked up by this player: the item that gave is no item of anyone's, and is taken away again.
+            if (copy.Taken && pPlayer)
+            {
+                if (TESBoundObject* pObject = Cast<TESBoundObject>(TESForm::GetById(modSystem.GetGameId(copy.BaseId))))
+                {
+                    ScopedInventoryOverride _;
+                    pPlayer->RemoveItem(pObject, 1, ITEM_REMOVE_REASON::kRemove, nullptr, nullptr);
+                    spdlog::info("Thrown: this player picked up the copy of another player's thrown weapon ({:X}); it is no item, so it was taken out of the inventory again",
+                                 pObject->formID);
+                }
+            }
+            copy.RefFormId = 0;
+            copy.Taken = true; // no new copy for this throw
+            continue;
+        }
+
+        if (!pRef)
+        {
+            if (copy.Taken || !pPlayer || aNow < copy.NextSpawnTry)
+                continue;
+            copy.NextSpawnTry = aNow + std::chrono::seconds(2);
+            if (DistanceTo(pPlayer, copy.Position) > kLoadedRadius)
+                continue;
+            TESBoundObject* pObject = Cast<TESBoundObject>(TESForm::GetById(modSystem.GetGameId(copy.BaseId)));
+            if (!pObject)
+            {
+                spdlog::warn("Thrown: the thrown weapon is {:X}:{:X}, which this game does not have; no copy shown", copy.BaseId.ModId, copy.BaseId.BaseId);
+                copy.Taken = true;
+                continue;
+            }
+            // Made as a remote drop is (OnNotifyDroppedItem): given to the player and dropped straight out, neither sent as a change.
+            BSPointerHandle<TESObjectREFR> handle{};
+            {
+                ScopedInventoryOverride _;
+                NiPoint3 location(copy.Position);
+                NiPoint3 rotation(glm::vec3{});
+                pPlayer->AddObjectToContainer(pObject, nullptr, 1, nullptr);
+                handle = pPlayer->RemoveItem(pObject, 1, ITEM_REMOVE_REASON::kDropping, nullptr, nullptr, &location, &rotation);
+            }
+            if (TESObjectREFR* pPlaced = TESObjectREFR::GetByHandle(handle.handle.iBits))
+            {
+                copy.RefFormId = pPlaced->formID;
+                copy.HeldStill = false;
+                spdlog::info("Thrown: the copy is {:X} (base {:X})", pPlaced->formID, pObject->formID);
+            }
+            else
+                spdlog::warn("Thrown: making the copy of {:X} produced no reference", pObject->formID);
+            continue;
+        }
+
+        NiNode* pNode = pRef->GetNiNode();
+        if (!pNode)
+            continue;
+        // Held still: it only looks. Physics would let it fall between two places.
+        if (!copy.HeldStill)
+        {
+            pRef->SetMotionType(TESObjectREFR::kMotionKeyframed);
+            copy.HeldStill = true;
+        }
+
+        const float cStep = std::chrono::duration<float>(aNow - copy.SteppedAt).count();
+        const float cLeft = std::chrono::duration<float>(copy.Due - aNow).count();
+        copy.SteppedAt = aNow;
+        const float cPart = copy.Following && cLeft > 0.f && cStep > 0.f ? std::min(1.f, cStep / (cLeft + cStep)) : 1.f;
+        const glm::vec3 cAt(pRef->position.x, pRef->position.y, pRef->position.z);
+        if (glm::distance(cAt, copy.Position) > 0.05f)
+            PlaceMovedObject(pRef, cAt + (copy.Position - cAt) * cPart, RotationOf(pRef));
+
+        // Turned as the thrower's projectile is: written into its 3D, after the placing, which turns the 3D by the reference's angles.
+        for (const uint32_t cOffset : {0x48u, 0x7Cu})
+        {
+            auto& transform = *reinterpret_cast<NiTransform*>(reinterpret_cast<uint8_t*>(pNode) + cOffset);
+            for (int row = 0; row < 3; ++row)
+                for (int column = 0; column < 3; ++column)
+                    transform.rotate.data[row][column] = copy.Rotation[row * 3 + column];
+        }
+    }
+    for (const auto& [key, cpWhy] : ended)
+        RemoveThrownCopy(key, cpWhy);
 }

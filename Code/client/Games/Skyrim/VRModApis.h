@@ -122,6 +122,35 @@ struct VrikInterface
     virtual void RestoreFingers(bool aIsLeft) = 0;
 };
 
+//! Weapon Throw VR's interface (Shizof; WeaponThrowVRinterface001.h in that mod's published source), as far as it is used.
+struct WeaponThrowInterface
+{
+    using ThrowCallback = void (*)(TESForm* apWeapon, bool aIsLeft, void* apEntryData);
+    using ReturnCallback = void (*)(TESForm* apWeapon, bool aIsLeft, void* apExtraList, void* apExtras);
+
+    virtual unsigned int GetBuildNumber() = 0;
+    // DisableAutoReturnForThrownWeaponNode takes a smart pointer by value; never called, only its place is kept. Do not call it through this.
+    virtual void Reserved1() = 0;
+    virtual void RegisterThrowCallback(ThrowCallback aCallback) = 0;
+    virtual void RegisterReturnCallback(ReturnCallback aCallback) = 0;
+};
+
+//! A weapon this player threw with Weapon Throw VR, once both the mod's report and the projectile it fired are known.
+struct Thrown
+{
+    uint32_t WeaponFormId{};
+    bool IsLeft{};
+    //! The handle of the projectile that is the flying weapon.
+    uint32_t ProjectileHandle{};
+};
+//! True, and the throw, once for each throw.
+bool TakeThrown(Thrown& aThrown) noexcept;
+//! True once for each time the mod said a thrown weapon came back to a hand.
+bool TakeReturned(bool& aIsLeft) noexcept;
+//! Called by the projectile launch hook for a launch from a reference that is no character, with a weapon and no spell:
+//! that is how Weapon Throw VR fires (Papyrus Fire from its hidden helper). Kept two seconds, to be paired with the mod's report.
+void NoteHelperLaunch(uint32_t aProjectileHandle) noexcept;
+
 //! One thing HIGGS said about a hand of this player. Position and fingers are filled for a grab only.
 struct HandEvent
 {

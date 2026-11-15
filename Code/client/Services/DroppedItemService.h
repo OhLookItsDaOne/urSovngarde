@@ -17,6 +17,7 @@ struct NotifyDroppedItemMove;
 struct NotifyWorldObjectMove;
 struct NotifyPull;
 struct NotifyGrab;
+struct NotifyThrownWeapon;
 struct UpdateEvent;
 struct TESObjectREFR;
 
@@ -54,6 +55,14 @@ private:
     void OnNotifyPull(const NotifyPull&) noexcept;
     //! What HIGGS said about another player's hand, passed on by the server.
     void OnNotifyGrab(const NotifyGrab&) noexcept;
+    //! Weapons thrown with Weapon Throw VR: sends where this player's are, and moves the copies of the other players'.
+    void RunThrownWeapons(std::chrono::steady_clock::time_point aNow) noexcept;
+    //! Where another player's thrown weapon is.
+    void OnNotifyThrownWeapon(const NotifyThrownWeapon&) noexcept;
+    void EndOwnThrow(uint8_t aHand, const char* acpWhy) noexcept;
+    void RemoveThrownCopy(uint64_t aKey, const char* acpWhy) noexcept;
+    //! Whether the reference is a copy shown for another player's thrown weapon: no item of anyone's, never shared or adopted.
+    bool IsThrownCopy(uint32_t aFormId) const noexcept;
     struct Motion;
     //! The other game put down what a hand here pulls on: this game takes it over, and the hand pulls it here.
     //! True if it did; the caller then leaves the thing to this game's physics.
@@ -170,6 +179,39 @@ private:
         std::chrono::steady_clock::time_point SharedLogAt{};
     };
     std::unordered_map<uint64_t, RemoteGrab> m_remoteGrabs;
+
+    //! This player's thrown weapons, by hand (0 left, 1 right): the projectile Weapon Throw VR fired.
+    struct OwnThrow
+    {
+        bool Active{};
+        uint32_t Handle{};
+        GameId BaseId{};
+        glm::vec3 LastPosition{};
+        std::chrono::steady_clock::time_point Since{};
+        std::chrono::steady_clock::time_point LastSent{};
+        std::chrono::steady_clock::time_point MissingSince{};
+    };
+    OwnThrow m_ownThrows[2];
+
+    //! The copies shown for other players' thrown weapons. Key: player id * 2 + hand.
+    //! A copy is a loose reference of the weapon's base that only looks: held still, moved to the places sent, removed at the end.
+    struct ThrownCopy
+    {
+        uint32_t RefFormId{};
+        GameId BaseId{};
+        glm::vec3 Position{};
+        float Rotation[9]{1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f};
+        std::chrono::steady_clock::time_point ArrivedAt{};
+        std::chrono::steady_clock::time_point Due{};
+        std::chrono::steady_clock::time_point SteppedAt{};
+        std::chrono::steady_clock::time_point LastHeard{};
+        std::chrono::steady_clock::time_point NextSpawnTry{};
+        bool Following{};
+        bool HeldStill{};
+        //! This player picked the copy up: the item it gave is taken away again, and no new copy is made for this throw.
+        bool Taken{};
+    };
+    std::unordered_map<uint64_t, ThrownCopy> m_thrownCopies;
     //! HIGGS took a thing another game was moving: see the definition.
     void TakeFromOtherGame(uint32_t aFormId, bool aIsLeft, bool aPulled) noexcept;
     //! Whether another player's hand holds this thing, by what their HIGGS said (kind and ids as in RequestGrabReport).
@@ -200,5 +242,6 @@ private:
     entt::scoped_connection m_objectMoveConnection;
     entt::scoped_connection m_pullConnection;
     entt::scoped_connection m_grabConnection;
+    entt::scoped_connection m_thrownWeaponConnection;
     entt::scoped_connection m_updateConnection;
 };

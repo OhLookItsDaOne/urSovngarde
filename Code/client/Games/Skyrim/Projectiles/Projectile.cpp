@@ -11,6 +11,7 @@
 #include <PatchCheck.h>
 #ifdef SKYRIMVR
 #include <Games/Skyrim/VRBodySync.h>
+#include <Games/Skyrim/VRModApis.h>
 #include <PlayerCharacter.h>
 #include <atomic>
 #endif
@@ -282,6 +283,10 @@ BSPointerHandle<Projectile>* TP_MAKE_THISCALL(HookLaunch, BSPointerHandle<Projec
     auto result = TiltedPhoques::ThisCall(RealLaunch, apThis, arData);
 
     TP_ASSERT(result, "No projectile handle returned.");
+
+    // Fired by a reference that is no character, from a weapon, with no spell: how Weapon Throw VR throws (VRModApis::TakeThrown).
+    if (result && arData.pShooter && !Cast<Actor>(arData.pShooter) && arData.pFromWeapon && !arData.pSpell)
+        VRModApis::NoteHelperLaunch(result->handle.iBits);
 
     TESObjectREFR* pObject = TESObjectREFR::GetByHandle(result->handle.iBits);
     Projectile* pProjectile = Cast<Projectile>(pObject);

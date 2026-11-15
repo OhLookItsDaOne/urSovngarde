@@ -75,6 +75,7 @@
 #include <Messages/NotifyPartyPlugin.h>
 #include <Messages/NotifyNpcPluginsDiffer.h>
 #include <Messages/NotifyPlayerName.h>
+#include <Messages/NotifyThrownWeapon.h>
 #include <Messages/NotifyPartyValue.h>
 #include <Messages/NotifyWarState.h>
 
@@ -91,7 +92,7 @@ struct ServerMessageFactory
             NotifyActorValueChanges, NotifyPartyJoined, NotifyPartyLeft, NotifyActorMaxValueChanges, NotifyHealthChangeBroadcast, NotifyActivate, NotifyLockChange, AssignObjectsResponse, NotifyDeathStateChange, NotifyOwnershipTransfer, NotifyObjectInventoryChanges, NotifySpellCast,
             NotifyProjectileLaunch, NotifyInterruptCast, NotifyAddTarget, NotifyScriptAnimation, NotifyDrawWeapon, NotifyMount, NotifyNewPackage, NotifyRespawn, NotifySyncExperience, NotifyEquipmentChanges, NotifyChatMessageBroadcast, TeleportCommandResponse, NotifyPlayerRespawn, NotifyDialogue,
             NotifySubtitle, NotifyPlayerDialogue, NotifyActorTeleport, NotifyPlayerLeft, NotifyPlayerJoined, NotifyDialogue, NotifySubtitle, NotifyPlayerDialogue, NotifyPlayerLevel, NotifyPlayerCellChanged, NotifyTeleport, NotifyPlayerHealthUpdate, NotifySettingsChange,
-            NotifyWeatherChange, NotifySetWaypoint, NotifyRemoveWaypoint, NotifySetTimeResult, NotifyRemoveSpell, NotifyDroppedItem, NotifyDroppedItemRemoved, NotifyDroppedItemMove, NotifyWorldObjectMove, NotifyClash, NotifyVoiceData, NotifyPlayerWhereabouts, NotifyArrowNocked, NotifyDownedState, NotifyActionEvents, NotifySleep, NotifyReferenceEnable, NotifyWarState, NotifyPartyPlugin, NotifyPartyValue, NotifyPull, NotifyGrab, NotifyNpcPluginsDiffer, NotifyPlayerName>;
+            NotifyWeatherChange, NotifySetWaypoint, NotifyRemoveWaypoint, NotifySetTimeResult, NotifyRemoveSpell, NotifyDroppedItem, NotifyDroppedItemRemoved, NotifyDroppedItemMove, NotifyWorldObjectMove, NotifyClash, NotifyVoiceData, NotifyPlayerWhereabouts, NotifyArrowNocked, NotifyDownedState, NotifyActionEvents, NotifySleep, NotifyReferenceEnable, NotifyWarState, NotifyPartyPlugin, NotifyPartyValue, NotifyPull, NotifyGrab, NotifyNpcPluginsDiffer, NotifyPlayerName, NotifyThrownWeapon>;
 
         return s_visitor(std::forward<T>(func));
     }

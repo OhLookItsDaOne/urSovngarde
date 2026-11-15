@@ -16,6 +16,8 @@
 #include <Messages/RequestGrabReport.h>
 #include <Messages/NotifyPull.h>
 #include <Messages/NotifyGrab.h>
+#include <Messages/RequestThrownWeapon.h>
+#include <Messages/NotifyThrownWeapon.h>
 #include <Messages/EnterInteriorCellRequest.h>
 #include <Messages/EnterExteriorCellRequest.h>
 #include <Messages/ShiftGridCellRequest.h>
@@ -51,6 +53,7 @@ DroppedItemService::DroppedItemService(World& aWorld, entt::dispatcher& aDispatc
     , m_objectMoveConnection(aDispatcher.sink<PacketEvent<RequestWorldObjectMove>>().connect<&DroppedItemService::OnObjectMove>(this))
     , m_pullConnection(aDispatcher.sink<PacketEvent<RequestPull>>().connect<&DroppedItemService::OnPull>(this))
     , m_grabReportConnection(aDispatcher.sink<PacketEvent<RequestGrabReport>>().connect<&DroppedItemService::OnGrabReport>(this))
+    , m_thrownWeaponConnection(aDispatcher.sink<PacketEvent<RequestThrownWeapon>>().connect<&DroppedItemService::OnThrownWeapon>(this))
     , m_interiorConnection(aDispatcher.sink<PacketEvent<EnterInteriorCellRequest>>().connect<&DroppedItemService::OnEnterInteriorCell>(this))
     , m_exteriorConnection(aDispatcher.sink<PacketEvent<EnterExteriorCellRequest>>().connect<&DroppedItemService::OnEnterExteriorCell>(this))
     , m_gridConnection(aDispatcher.sink<PacketEvent<ShiftGridCellRequest>>().connect<&DroppedItemService::OnShiftGridCell>(this))
@@ -371,6 +374,45 @@ void DroppedItemService::OnGrabReport(const PacketEvent<RequestGrabReport>& acMe
     }
     if (told)
         spdlog::info("Grab: passed on to {} player(s) around", told);
+}
+
+// A weapon thrown with Weapon Throw VR exists as a projectile in the thrower's game only. Its places are passed on as they
+// come; the other games show a copy that only looks. The server keeps nothing but which hands have one out, for the log.
+void DroppedItemService::OnThrownWeapon(const PacketEvent<RequestThrownWeapon>& acMessage) noexcept
+{
+    Player* pPlayer = acMessage.pPlayer;
+    const auto& message = acMessage.Packet;
+    const uint64_t cKey = (static_cast<uint64_t>(pPlayer->GetId()) << 1) | (message.Hand & 1);
+
+    NotifyThrownWeapon notify{};
+    notify.PlayerId = pPlayer->GetId();
+    notify.State = message.State;
+    notify.Hand = message.Hand;
+    notify.BaseId = message.BaseId;
+    notify.X = message.X;
+    notify.Y = message.Y;
+    notify.Z = message.Z;
+    std::copy(std::begin(message.Rotation), std::end(message.Rotation), notify.Rotation);
+
+    uint32_t told = 0;
+    for (Player* pOther : m_world.GetPlayerManager())
+    {
+        if (pOther != pPlayer && pOther->GetCellComponent().IsInRange(pPlayer->GetCellComponent(), false))
+        {
+            pOther->Send(notify);
+            ++told;
+        }
+    }
+
+    const char* cpHand = (message.Hand & 1) ? "right" : "left";
+    if (message.State == RequestThrownWeapon::kGone)
+    {
+        if (m_thrown.erase(cKey))
+            spdlog::info("Thrown: player {}'s {} hand's thrown {:X}:{:X} is gone again; {} player(s) around told", pPlayer->GetId(), cpHand, message.BaseId.ModId, message.BaseId.BaseId, told);
+    }
+    else if (m_thrown.insert(cKey).second)
+        spdlog::info("Thrown: player {} '{}' threw {:X}:{:X} from the {} hand; its places go to {} player(s) around", pPlayer->GetId(), pPlayer->GetUsername().c_str(), message.BaseId.ModId,
+                     message.BaseId.BaseId, cpHand, told);
 }
 
 // A hand on something another player's game is moving: passed on to that game, which pulls the thing toward the hand.
