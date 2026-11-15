@@ -87,20 +87,16 @@ jobs:
               run: xmake config --plat=windows --arch=${{ matrix.arch }} --mode="$BUILD_MODE" --yes -vD
 
             # Build the client
-            # A push builds what urSovngarde ships, as release.yml does: the VR client (through its launcher), the
-            # server, the menu's process and the tests. Upstream's flat-Skyrim client is never shipped and took about
-            # half of the 21 minutes `xmake -y` needed (2026-10-10). The playable-build packaging below still wants
-            # everything, so it keeps the full build.
+            # Only what urSovngarde ships from Windows: the VR client (through its launcher), the menu's process, the
+            # SKSE plugin that fetches the HIGGS, PLANCK and VRIK interfaces, and the tests. Upstream's flat-Skyrim
+            # client is never shipped and took about half of the 21 minutes `xmake -y` needed (2026-10-10); the server
+            # is built and shipped from Linux (linux.yml).
             - name: Build with xmake
               run: |
-                  if [ "${{ inputs.upload-build-for-next-job }}" = "true" ]; then
-                      xmake -y
-                  else
-                      xmake build -y SkyrimImmersiveLauncherVR
-                      xmake build -y SkyrimServerRunner
-                      xmake build -y TPProcess
-                      xmake build -y TPTests
-                  fi
+                  xmake build -y SkyrimImmersiveLauncherVR
+                  xmake build -y TPProcess
+                  xmake build -y VRBridge
+                  xmake build -y TPTests
                   echo "STR_BUILD_DIR=build/windows/${{ matrix.arch }}/${BUILD_MODE}/" >> "$GITHUB_ENV"
 
             # The encoding round trips and the rest of TPTests
@@ -110,12 +106,10 @@ jobs:
             # Create distrib
             - name: Output distrib binaries via xmake
               run: |
-                  if [ "${{ inputs.upload-build-for-next-job }}" = "true" ]; then
-                      xmake install -o distrib
-                  else
-                      xmake install -o distrib SkyrimTogetherClientVR
-                      xmake install -o distrib TPProcess
-                  fi
+                  # The launcher's install brings the DLLs of the packages it links; the client's brings CEF, Discord and the cursor.
+                  xmake install -o distrib SkyrimImmersiveLauncherVR
+                  xmake install -o distrib SkyrimTogetherClientVR
+                  xmake install -o distrib TPProcess
                   cp -rf distrib/bin/* "$STR_BUILD_DIR"
 
             # Building the Together UI
