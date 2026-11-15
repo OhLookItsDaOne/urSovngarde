@@ -117,7 +117,18 @@ private:
         std::chrono::steady_clock::time_point PulledUnheldSince{};
         //! A 3D load in a fresh drop's first two seconds is part of the throw, not a cell reload.
         std::chrono::steady_clock::time_point FreshDropUntil{};
+        //! The other side's last place and rotation, on the way to which this game moves it frame by frame (FollowMove).
+        glm::vec3 FollowPosition{};
+        glm::vec3 FollowRotation{};
+        std::chrono::steady_clock::time_point FollowArrivedAt{};
+        std::chrono::steady_clock::time_point FollowDue{};
+        std::chrono::steady_clock::time_point FollowSteppedAt{};
+        bool Following{};
     };
+    //! A place another game sent for a thing it moves: gone to over the time until its next place is due, not in one jump.
+    void FollowMove(TESObjectREFR* apRef, Motion& aMotion, const glm::vec3& acPosition, const glm::vec3& acRotation, std::chrono::steady_clock::time_point aNow) noexcept;
+    //! One frame's part of that way.
+    void StepFollow(TESObjectREFR* apRef, Motion& aMotion, std::chrono::steady_clock::time_point aNow) noexcept;
     std::unordered_map<uint32_t, Motion> m_motion;
 
     //! Objects placed in the world near the player, by reference id, watched for moves here or held for another player.

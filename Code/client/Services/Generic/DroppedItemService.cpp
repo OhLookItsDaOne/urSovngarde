@@ -1,4 +1,5 @@
 #include <Services/DroppedItemService.h>
+#include <cmath>
 
 #include <World.h>
 #include <Components.h>
@@ -595,6 +596,74 @@ void DroppedItemService::AnnounceOldDrops() noexcept
     }
 }
 
+// The other game sends a thing's place as often as it draws a frame, and this game may draw three times as many.
+// Placed at each arrival, the thing jumped and stood in turn (two players, 2026-11-15: 32 frames a second there, 90 and more here).
+// So a place is gone to over the time in which the next one is due, in every frame's part, position and rotation alike.
+void DroppedItemService::FollowMove(TESObjectREFR* apRef, Motion& aMotion, const glm::vec3& acPosition, const glm::vec3& acRotation,
+                                    const std::chrono::steady_clock::time_point aNow) noexcept
+{
+    const auto cSince = aNow - aMotion.FollowArrivedAt;
+    aMotion.FollowArrivedAt = aNow;
+    aMotion.FollowPosition = acPosition;
+    aMotion.FollowRotation = acRotation;
+    aMotion.FollowSteppedAt = aNow;
+
+    // A first place, one after a pause, or one far off (a throw, a teleport): there at once, as before.
+    const glm::vec3 cAt(apRef->position.x, apRef->position.y, apRef->position.z);
+    if (cSince > std::chrono::milliseconds(150) || glm::distance(cAt, acPosition) > 70.f)
+    {
+        aMotion.Following = false;
+        if (VRModApis::KnowsGrabs())
+            VRBodySync::PinBody(apRef, &acPosition);
+        PlaceMovedObject(apRef, acPosition, acRotation);
+        return;
+    }
+    aMotion.Following = true;
+    aMotion.FollowDue = aNow + cSince;
+}
+
+void DroppedItemService::StepFollow(TESObjectREFR* apRef, Motion& aMotion, const std::chrono::steady_clock::time_point aNow) noexcept
+{
+    if (!aMotion.Following)
+    {
+        // With HIGGS the thing is a body physics may move: kept where it was put.
+        if (VRModApis::KnowsGrabs())
+            VRBodySync::PinBody(apRef, nullptr);
+        return;
+    }
+
+    const float cStep = std::chrono::duration<float>(aNow - aMotion.FollowSteppedAt).count();
+    const float cLeft = std::chrono::duration<float>(aMotion.FollowDue - aNow).count();
+    aMotion.FollowSteppedAt = aNow;
+    if (!(cStep > 0.f))
+        return;
+    const float cPart = cLeft > 0.f ? std::min(1.f, cStep / (cLeft + cStep)) : 1.f;
+
+    const glm::vec3 cAt(apRef->position.x, apRef->position.y, apRef->position.z);
+    const glm::vec3 cPosition = cAt + (aMotion.FollowPosition - cAt) * cPart;
+    // Each angle the short way round.
+    glm::vec3 rotation(apRef->rotation.x, apRef->rotation.y, apRef->rotation.z);
+    for (int i = 0; i < 3; ++i)
+    {
+        constexpr float cPi = 3.14159265f;
+        float turn = std::fmod(aMotion.FollowRotation[i] - rotation[i], 2.f * cPi);
+        if (turn > cPi)
+            turn -= 2.f * cPi;
+        else if (turn < -cPi)
+            turn += 2.f * cPi;
+        rotation[i] += turn * cPart;
+    }
+    if (cPart >= 1.f)
+    {
+        aMotion.Following = false;
+        rotation = aMotion.FollowRotation;
+    }
+
+    if (VRModApis::KnowsGrabs())
+        VRBodySync::PinBody(apRef, &cPosition);
+    PlaceMovedObject(apRef, cPosition, rotation);
+}
+
 void DroppedItemService::OnUpdate(const UpdateEvent&) noexcept
 {
     if (!m_transport.IsConnected())
@@ -641,8 +710,8 @@ void DroppedItemService::OnUpdate(const UpdateEvent&) noexcept
                 spdlog::info("DroppedItem: {} stopped being moved over there without coming to rest; released it here", id);
         }
 
-        if (motion.Held && VRModApis::KnowsGrabs())
-            VRBodySync::PinBody(pRef, nullptr);
+        if (motion.Held)
+            StepFollow(pRef, motion, now);
 
         if (motion.Held || now < motion.QuietUntil)
         {
@@ -848,8 +917,8 @@ void DroppedItemService::UpdateWorldObjects(const std::chrono::steady_clock::tim
             motion.HeldRebuilds = 0;
         }
 
-        if (motion.Held && VRModApis::KnowsGrabs())
-            VRBodySync::PinBody(pRef, nullptr);
+        if (motion.Held)
+            StepFollow(pRef, motion, aNow);
 
         if (motion.Held || aNow < motion.QuietUntil)
         {
@@ -987,9 +1056,7 @@ void DroppedItemService::OnNotifyWorldObjectMove(const NotifyWorldObjectMove& ac
     const glm::vec3 position(acMessage.Position);
     const NiNode* pNodeBefore = pRef->GetNiNode();
     // With HIGGS the thing stays a body physics may move, pinned where the other game has it (HoldStill). Before the placing: see PinBody.
-    if (VRModApis::KnowsGrabs())
-        VRBodySync::PinBody(pRef, &position);
-    PlaceMovedObject(pRef, position, acMessage.Rotation);
+    FollowMove(pRef, motion, position, acMessage.Rotation, now);
     ++motion.HeldMoves;
     if (const NiNode* pNodeAfter = pRef->GetNiNode(); pNodeBefore && pNodeAfter != pNodeBefore)
     {
@@ -1047,9 +1114,7 @@ void DroppedItemService::OnNotifyDroppedItemMove(const NotifyDroppedItemMove& ac
     const glm::vec3 position(acMessage.Position);
     const NiNode* pNodeBefore = pRef->GetNiNode();
     // With HIGGS the thing stays a body physics may move, pinned where the other game has it (HoldStill). Before the placing: see PinBody.
-    if (VRModApis::KnowsGrabs())
-        VRBodySync::PinBody(pRef, &position);
-    PlaceMovedObject(pRef, position, acMessage.Rotation);
+    FollowMove(pRef, motion, position, acMessage.Rotation, now);
 
     // A rebuilt 3D has a dynamic body again, which would fall, so it is held again.
     // Logged once, to learn whether a move ever rebuilds it.
