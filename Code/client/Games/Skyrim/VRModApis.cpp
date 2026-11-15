@@ -2,6 +2,8 @@
 
 #include "VRModApis.h"
 
+#include <Utils.h>
+
 #include <TESObjectREFR.h>
 
 #include <chrono>
@@ -132,6 +134,15 @@ void Poll() noexcept
 
     if (!pState || pState->Size < sizeof(BridgeState) || pState->Stage < 3)
     {
+        // Said on the screen too, every two minutes: without the bridge this game guesses what its hands hold, a thing another player
+        // moves cannot be taken, and the other players never learn what this player holds. A player does not read the log.
+        static auto s_nextOnScreen = s_start + std::chrono::seconds(45);
+        if (cNow >= s_nextOnScreen)
+        {
+            s_nextOnScreen = cNow + std::chrono::minutes(2);
+            Utils::ShowHudMessage(pState ? "urSovngarde: the VR bridge did not start. Grabbing with other players will not work. Is SKSE VR running?"
+                                         : "urSovngarde: urSovngardeBridge.dll is missing. Install 'urSovngarde mod' as a mod (Data/SKSE/Plugins). Grabbing with other players will not work.");
+        }
         if (!s_saidMissing && cNow - s_start > std::chrono::seconds(30))
         {
             s_saidMissing = true;
