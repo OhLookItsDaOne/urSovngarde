@@ -44,21 +44,18 @@ const char* Side(bool aIsLeft) noexcept
 }
 
 // TEMPORARY: what HIGGS reports, in the log, until the shared grab is built on it.
+// HIGGS calls this just before it marks the hand as holding, and it gives the grabbed node's name only for a hand that holds.
+// So the name is read on the next update (FinishEvents), and the grab is logged there.
 void OnGrabbed(bool aIsLeft, TESObjectREFR* apRefr)
 {
     const VRModApis::Transform cGrab = s_pHiggs->GetGrabTransform(aIsLeft);
-    const VRModApis::NodeName cNode = s_pHiggs->GetGrabbedNodeName(aIsLeft);
     float fingers[5]{};
     s_pHiggs->GetFingerValues(aIsLeft, fingers);
-    spdlog::info("Higgs: {} hand grabbed {:X} at its node '{}'; node in hand space at ({:.1f}, {:.1f}, {:.1f}), scale {:.2f}; fingers {:.2f} {:.2f} {:.2f} {:.2f} {:.2f}",
-                 Side(aIsLeft), apRefr ? apRefr->formID : 0, cNode.pData ? cNode.pData : "", cGrab.Translation[0], cGrab.Translation[1], cGrab.Translation[2], cGrab.Scale,
-                 fingers[0], fingers[1], fingers[2], fingers[3], fingers[4]);
 
     VRModApis::HandEvent event;
     event.Event = VRModApis::HandEvent::kGrabbed;
     event.IsLeft = aIsLeft;
     event.FormId = apRefr ? apRefr->formID : 0;
-    event.NodeName = cNode.pData ? cNode.pData : "";
     std::copy(std::begin(cGrab.Translation), std::end(cGrab.Translation), event.Grab);
     std::copy(std::begin(fingers), std::end(fingers), event.Fingers);
     Queue(std::move(event));
@@ -66,14 +63,42 @@ void OnGrabbed(bool aIsLeft, TESObjectREFR* apRefr)
 
 void OnDropped(bool aIsLeft, TESObjectREFR* apRefr)
 {
-    spdlog::info("Higgs: {} hand let go of {:X}", Side(aIsLeft), apRefr ? apRefr->formID : 0);
     Queue({VRModApis::HandEvent::kLetGo, aIsLeft, apRefr ? apRefr->formID : 0});
 }
 
 void OnPulled(bool aIsLeft, TESObjectREFR* apRefr)
 {
-    spdlog::info("Higgs: {} hand pulled {:X} toward itself", Side(aIsLeft), apRefr ? apRefr->formID : 0);
     Queue({VRModApis::HandEvent::kPulled, aIsLeft, apRefr ? apRefr->formID : 0});
+}
+// Each new event gets its time, a grab also its node's name, and all go into the log, in the order HIGGS said them.
+void FinishEvents() noexcept
+{
+    std::scoped_lock _{s_eventLock};
+    for (auto& event : s_events)
+    {
+        if (event.Ready)
+            continue;
+        event.Ready = true;
+        event.At = std::chrono::steady_clock::now();
+
+        if (event.Event == VRModApis::HandEvent::kLetGo)
+            spdlog::info("Higgs: {} hand let go of {:X}", Side(event.IsLeft), event.FormId);
+        else if (event.Event == VRModApis::HandEvent::kPulled)
+            spdlog::info("Higgs: {} hand pulled {:X} toward itself", Side(event.IsLeft), event.FormId);
+        else
+        {
+            const TESObjectREFR* pHeld = s_pHiggs->GetGrabbedObject(event.IsLeft);
+            const bool cStillHeld = pHeld && pHeld->formID == event.FormId;
+            if (cStillHeld)
+            {
+                const VRModApis::NodeName cNode = s_pHiggs->GetGrabbedNodeName(event.IsLeft);
+                event.NodeName = cNode.pData ? cNode.pData : "";
+            }
+            spdlog::info("Higgs: {} hand grabbed {:X} at its node '{}'{}; node in hand space at ({:.1f}, {:.1f}, {:.1f}); fingers {:.2f} {:.2f} {:.2f} {:.2f} {:.2f}", Side(event.IsLeft),
+                         event.FormId, event.NodeName, cStillHeld ? "" : " (let go again before the name could be read)", event.Grab[0], event.Grab[1], event.Grab[2], event.Fingers[0],
+                         event.Fingers[1], event.Fingers[2], event.Fingers[3], event.Fingers[4]);
+        }
+    }
 }
 } // namespace
 
@@ -82,7 +107,11 @@ namespace VRModApis
 void Poll() noexcept
 {
     if (s_done)
+    {
+        if (s_pHiggs)
+            FinishEvents();
         return;
+    }
 
     const auto cNow = std::chrono::steady_clock::now();
     static const auto s_start = cNow;
@@ -132,9 +161,15 @@ void Poll() noexcept
 
 void TakeHandEvents(std::vector<HandEvent>& aEvents) noexcept
 {
+    const auto cNow = std::chrono::steady_clock::now();
     std::scoped_lock _{s_eventLock};
-    aEvents.insert(aEvents.end(), std::make_move_iterator(s_events.begin()), std::make_move_iterator(s_events.end()));
-    s_events.clear();
+    auto it = s_events.begin();
+    for (; it != s_events.end() && it->Ready; ++it)
+    {
+        if (cNow - it->At < std::chrono::seconds(2))
+            aEvents.push_back(std::move(*it));
+    }
+    s_events.erase(s_events.begin(), it);
 }
 
 HiggsInterface* Higgs() noexcept

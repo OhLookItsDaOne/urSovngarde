@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -136,9 +137,13 @@ struct HandEvent
     std::string NodeName{};
     float Grab[3]{};
     float Fingers[5]{};
+    //! Set by Poll once the grabbed node's name has been read and the event is in the log; only then is it handed out.
+    bool Ready{};
+    std::chrono::steady_clock::time_point At{};
 };
 
 //! Moves what HIGGS said since the last call into aEvents, oldest first. HIGGS may say it on another thread than the caller's.
+//! Anything older than two seconds is left out: it happened while nobody asked, such as before the player connected.
 void TakeHandEvents(std::vector<HandEvent>& aEvents) noexcept;
 
 //! Looks for the bridge until it has the interfaces, at most once a second; call it every frame from the game's update.
