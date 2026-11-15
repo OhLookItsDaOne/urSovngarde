@@ -91,9 +91,9 @@
 #include <Games/TES.h>
 #include <AI/AIProcess.h>
 #include <Games/Skyrim/Interface/UI.h>
+#include <Games/Skyrim/VRModApis.h>
 #ifdef SKYRIMVR
 #include <Games/Skyrim/VRBodySync.h>
-#include <Games/Skyrim/VRModApis.h>
 
 #endif
 
