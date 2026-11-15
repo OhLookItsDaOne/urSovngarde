@@ -44,6 +44,7 @@
 #include <Messages/RequestPull.h>
 #include <Messages/NotifyPull.h>
 #include <Messages/NotifyGrab.h>
+#include <Messages/RequestGrabReport.h>
 #include <Messages/RequestDroppedItemMove.h>
 #include <Messages/RequestDroppedItemAdd.h>
 #include <Messages/RequestDroppedItemRemove.h>
@@ -3055,6 +3056,51 @@ bool Bot::StepCommand(const Command& acCommand, const bool aFirstTick) noexcept
         request.AtRest = args[3] == "rest";
         SendMsg(request);
         spdlog::info("[script] moved dropped item {} to ({:.0f}, {:.0f}, {:.0f}){}", id, place.x, place.y, place.z, request.AtRest ? ", put down" : ", still held");
+        return true;
+    }
+
+    // "holditem [height]": holds this bot's drop at the bot's own place, that far above its feet (90: about a hand), and says so again
+    // each time it is called. Unlike moveitem it does not start from where another game last had the item.
+    if (name == "holditem")
+    {
+        if (m_drops.empty())
+        {
+            spdlog::warn("[script] holditem: nothing lying here that the server has mentioned");
+            return true;
+        }
+        const uint32_t id = DropToHandle();
+        const glm::vec3 place = m_position + glm::vec3(0.f, 0.f, arg(0, 90.f));
+        m_dropPlaces[id] = place;
+
+        RequestDroppedItemMove request{};
+        request.Id = id;
+        request.Position = place;
+        request.AtRest = false;
+        SendMsg(request);
+        return true;
+    }
+
+    // "grabreport grabbed|letgo [left|right]": says what a player's HIGGS says when a hand closes on this bot's drop or opens.
+    // The server then counts the item as in this bot's hand, and tells the players around.
+    if (name == "grabreport")
+    {
+        if (args.empty() || (args[0] != "grabbed" && args[0] != "letgo") || m_drops.empty())
+        {
+            spdlog::error("[script] grabreport needs grabbed|letgo and a drop of this bot's, e.g. 'grabreport grabbed right'");
+            return true;
+        }
+        RequestGrabReport request{};
+        request.Event = args[0] == "grabbed" ? RequestGrabReport::kGrabbed : RequestGrabReport::kLetGo;
+        request.Hand = args.size() > 1 && args[1] == "left" ? 0 : 1;
+        request.Kind = RequestGrabReport::kDroppedItem;
+        request.ServerId = DropToHandle();
+        if (request.Event == RequestGrabReport::kGrabbed)
+        {
+            request.NodeName = "BotHand";
+            request.GrabRotation[0] = request.GrabRotation[4] = request.GrabRotation[8] = 1.f;
+        }
+        SendMsg(request);
+        spdlog::info("[script] reported: {} hand {} dropped item {}", request.Hand ? "right" : "left", args[0] == "grabbed" ? "grabbed" : "let go of", request.ServerId);
         return true;
     }
 
