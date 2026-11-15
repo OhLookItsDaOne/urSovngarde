@@ -125,6 +125,93 @@ bool HandPressed(const bool aRightHand) noexcept
 
 } // namespace VRHaptics
 
+namespace
+{
+vr::IVRCompositor* GetVRCompositor() noexcept
+{
+    static vr::IVRCompositor* s_pCompositor = nullptr;
+    if (s_pCompositor || !GetVRSystem())
+        return s_pCompositor;
+
+    using TGetGenericInterface = void*(const char*, vr::EVRInitError*);
+    const HMODULE hOpenVR = GetModuleHandleW(L"openvr_api.dll");
+    auto* pGetInterface = hOpenVR ? reinterpret_cast<TGetGenericInterface*>(GetProcAddress(hOpenVR, "VR_GetGenericInterface")) : nullptr;
+    if (!pGetInterface)
+        return nullptr;
+
+    vr::EVRInitError error = vr::VRInitError_None;
+    s_pCompositor = static_cast<vr::IVRCompositor*>(pGetInterface(vr::IVRCompositor_Version, &error));
+    return s_pCompositor;
+}
+
+struct FrameTimingSum
+{
+    uint32_t Frames = 0;
+    double GpuMs = 0.0;
+    float GpuMaxMs = 0.f;
+    double CpuMs = 0.0;
+    // Frames SteamVR had to show more than once, because the next one was not ready in time.
+    uint32_t Late = 0;
+    uint32_t Dropped = 0;
+    uint32_t Missed = 0;
+};
+FrameTimingSum s_timing;
+uint32_t s_lastFrameIndex = 0;
+} // namespace
+
+namespace VRHaptics
+{
+void SampleFrameTiming() noexcept
+{
+    vr::IVRCompositor* pCompositor = GetVRCompositor();
+    if (!pCompositor)
+        return;
+
+    static vr::Compositor_FrameTiming s_frames[128];
+    for (auto& frame : s_frames)
+        frame.m_nSize = sizeof(vr::Compositor_FrameTiming);
+    const uint32_t cCount = pCompositor->GetFrameTimings(s_frames, static_cast<uint32_t>(std::size(s_frames)));
+
+    uint32_t newest = s_lastFrameIndex;
+    uint32_t oldest = 0xFFFFFFFF;
+    for (uint32_t i = 0; i < cCount; ++i)
+    {
+        const auto& frame = s_frames[i];
+        oldest = std::min(oldest, frame.m_nFrameIndex);
+        if (frame.m_nFrameIndex <= s_lastFrameIndex)
+            continue;
+        newest = std::max(newest, frame.m_nFrameIndex);
+        ++s_timing.Frames;
+        s_timing.GpuMs += frame.m_flTotalRenderGpuMs;
+        s_timing.GpuMaxMs = std::max(s_timing.GpuMaxMs, frame.m_flTotalRenderGpuMs);
+        s_timing.CpuMs += frame.m_flClientFrameIntervalMs;
+        s_timing.Late += frame.m_nNumFramePresents > 1;
+        s_timing.Dropped += frame.m_nNumDroppedFrames;
+    }
+    // Frames between the last one counted and the oldest SteamVR still had were not seen.
+    if (s_lastFrameIndex != 0 && cCount != 0 && oldest > s_lastFrameIndex + 1)
+        s_timing.Missed += oldest - s_lastFrameIndex - 1;
+    s_lastFrameIndex = newest;
+}
+
+std::string TakeFrameTimingSummary() noexcept
+{
+    const FrameTimingSum cSum = s_timing;
+    s_timing = {};
+    if (cSum.Frames == 0)
+        return {};
+
+    float hz = 0.f;
+    if (vr::IVRSystem* pSystem = GetVRSystem())
+        hz = pSystem->GetFloatTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_DisplayFrequency_Float);
+
+    return fmt::format("; SteamVR: headset {:.0f} Hz ({:.1f} ms a frame), graphics card avg {:.1f} ms, most {:.1f} ms, game frame avg {:.1f} ms, {} of {} frames shown again because the "
+                       "next was late, {} dropped{}",
+                       hz, hz > 0.f ? 1000.f / hz : 0.f, cSum.GpuMs / cSum.Frames, cSum.GpuMaxMs, cSum.CpuMs / cSum.Frames, cSum.Late, cSum.Frames, cSum.Dropped,
+                       cSum.Missed ? fmt::format(" ({} frames not seen)", cSum.Missed) : std::string());
+}
+} // namespace VRHaptics
+
 #else
 
 namespace VRHaptics
@@ -142,6 +229,15 @@ Grips GripsHeld() noexcept
 bool HandPressed(bool) noexcept
 {
     return false;
+}
+
+void SampleFrameTiming() noexcept
+{
+}
+
+std::string TakeFrameTimingSummary() noexcept
+{
+    return {};
 }
 } // namespace VRHaptics
 

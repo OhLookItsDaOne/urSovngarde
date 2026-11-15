@@ -3,6 +3,7 @@
 #include "World.h"
 #include <CrashHandler.h>
 #include <PerfScope.h>
+#include <Games/Skyrim/VRHaptics.h>
 
 #include <Services/DiscoveryService.h>
 #include <Services/InputService.h>
@@ -139,6 +140,14 @@ void World::ReportPerformance(double aFrameMs, double aUpdateMs) noexcept
     if (m_perfIntervalStart == std::chrono::steady_clock::time_point{})
         m_perfIntervalStart = now;
 
+    // What SteamVR measured: the graphics card's share, which the frame gaps above cannot tell from the game's.
+    static std::chrono::steady_clock::time_point s_nextTimingSample;
+    if (now >= s_nextTimingSample)
+    {
+        s_nextTimingSample = now + std::chrono::milliseconds(500);
+        VRHaptics::SampleFrameTiming();
+    }
+
     if (now - m_perfIntervalStart < kInterval || m_perfFrameTimes.empty())
         return;
 
@@ -178,9 +187,9 @@ void World::ReportPerformance(double aFrameMs, double aUpdateMs) noexcept
         }
     }
 
-    spdlog::info("Perf last {} s: {} frames, avg {:.1f} ms ({:.0f} fps), p95 {:.1f} ms, p99 {:.1f} ms, {} frames over 50 ms; mod update avg {:.2f} ms, max {:.1f} ms, longest frame {:.0f} ms{}{}",
+    spdlog::info("Perf last {} s: {} frames, avg {:.1f} ms ({:.0f} fps), p95 {:.1f} ms, p99 {:.1f} ms, {} frames over 50 ms; mod update avg {:.2f} ms, max {:.1f} ms, longest frame {:.0f} ms{}{}{}",
                  std::chrono::duration_cast<std::chrono::seconds>(now - m_perfIntervalStart).count(), frames, averageMs, 1000.0 / averageMs, percentile(0.95),
-                 percentile(0.99), over50, m_perfUpdateTotalMs / frames, m_perfUpdateMaxMs, m_perfFrameTimes.back(), hooks, pause);
+                 percentile(0.99), over50, m_perfUpdateTotalMs / frames, m_perfUpdateMaxMs, m_perfFrameTimes.back(), hooks, VRHaptics::TakeFrameTimingSummary(), pause);
 
     m_perfFrameTimes.clear();
     m_perfUpdateTotalMs = 0.0;

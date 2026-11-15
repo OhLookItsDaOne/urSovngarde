@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 //! Controller haptics, and the grip buttons, straight to OpenVR.
 //!
@@ -30,5 +31,14 @@ Grips GripsHeld() noexcept;
 //! Whether that controller's grip or trigger is pressed, read from OpenVR; reading never takes the press from the game.
 //! Either one, since HIGGS can be set to grab with either.
 bool HandPressed(bool aRightHand) noexcept;
+
+//! Reads from SteamVR the frames it has shown since the last call; call it about once a second.
+//! SteamVR keeps only its newest frames, so a longer gap loses some.
+void SampleFrameTiming() noexcept;
+
+//! What SampleFrameTiming gathered since the last call of this, as text for the log, and starts over.
+//! Says how long the graphics card and the game took per frame against what the headset allows, and how many frames came late.
+//! Empty if SteamVR gave nothing.
+std::string TakeFrameTimingSummary() noexcept;
 
 } // namespace VRHaptics
