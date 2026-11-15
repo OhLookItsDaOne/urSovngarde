@@ -26,7 +26,7 @@ namespace
 {
 // TEMPORARY: logs which actions flood the stream, and how many of them the game refused on the sending actor.
 // Logged once per actor and action every ten seconds, when one actor performs the same action more than ten times in a second.
-void NoteActionRate(uint32_t aActorId, uint32_t aActionId, const char* acpEventName, bool aWorked) noexcept
+void NoteActionRate(uint32_t aActorId, uint32_t aActionId, const char* acpEventName, bool aWorked, uint32_t aWeaponState) noexcept
 {
     struct Rate
     {
@@ -48,8 +48,9 @@ void NoteActionRate(uint32_t aActorId, uint32_t aActionId, const char* acpEventN
         if (rate.Count > 10 && now >= rate.NextReport)
         {
             rate.NextReport = now + std::chrono::seconds(10);
-            spdlog::info("ActionFlood: actor {:X} performed action {:X} ({}) {} times in a second, {} of them refused by the game here and not sent",
-                         aActorId, aActionId, acpEventName ? acpEventName : "?", rate.Count, rate.Failed);
+            // Weapon state: 0 sheathed, 1 wanting to draw, 2 drawing, 3 drawn, 4 wanting to sheathe, 5 sheathing.
+            spdlog::info("ActionFlood: actor {:X} performed action {:X} ({}) {} times in a second, {} of them refused by the game here and not sent; weapon state {}",
+                         aActorId, aActionId, acpEventName ? acpEventName : "?", rate.Count, rate.Failed, aWeaponState);
         }
         rate.WindowStart = now;
         rate.Count = 0;
@@ -127,7 +128,7 @@ uint8_t TP_MAKE_THISCALL(HookPerformAction, ActorMediator, TESActionData* apActi
             pExtension->LatestAnimation = action;
         }
 
-        NoteActionRate(action.ActorId, action.ActionId, apAction->eventName.AsAscii(), res != 0);
+        NoteActionRate(action.ActorId, action.ActionId, apAction->eventName.AsAscii(), res != 0, (pActor->actorState.flags2 >> 5) & 7);
 
         // An action the game refused here did not happen, so it is not sent.
         // Otherwise other players would replay something the owner's actor never did, and refused actions are often retried every frame.

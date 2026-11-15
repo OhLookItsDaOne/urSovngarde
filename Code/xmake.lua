@@ -3,6 +3,7 @@ if is_plat("windows") then
     includes("immersive_elf")
     includes("immersive_launcher")
     includes("tp_process")
+    includes("vr_bridge")
 end
 
 includes("common")

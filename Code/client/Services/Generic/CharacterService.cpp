@@ -93,6 +93,7 @@
 #include <Games/Skyrim/Interface/UI.h>
 #ifdef SKYRIMVR
 #include <Games/Skyrim/VRBodySync.h>
+#include <Games/Skyrim/VRModApis.h>
 
 #endif
 
@@ -1170,7 +1171,13 @@ void CharacterService::ReconcileActorData(
         m_weaponDrawUpdates.erase(apActor->formID);
 
         if (apActor->actorState.IsWeaponDrawn() != acActorData.IsWeaponDrawn)
+        {
+            // TEMPORARY: whether an own NPC stuck wanting to draw or sheathe (see ActionFlood) got that from here.
+            const uint32_t cBefore = (apActor->actorState.flags2 >> 5) & 7;
             apActor->SetWeaponDrawnEx(acActorData.IsWeaponDrawn);
+            spdlog::info("WeaponTakeover: own NPC {:X} set to weapon {} as the server has it; its weapon state went from {} to {}, 3D {}", apActor->formID,
+                         acActorData.IsWeaponDrawn ? "drawn" : "sheathed", cBefore, (apActor->actorState.flags2 >> 5) & 7, apActor->GetNiNode() ? "yes" : "no");
+        }
     }
     else
         m_weaponDrawUpdates[apActor->formID] = {acActorData.IsWeaponDrawn};
@@ -1618,6 +1625,7 @@ void CharacterService::OnUpdate(const UpdateEvent& acUpdateEvent) noexcept
     RunPendingLines();
     RunSceneLines();
     RunTakeoverDiag(m_world);
+    VRModApis::Poll();
 
     {
         PerfScope perfScope("CharacterService::RunFactionsUpdates");
