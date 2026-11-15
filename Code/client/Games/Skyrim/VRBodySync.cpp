@@ -2497,11 +2497,73 @@ void DrivePullsBeforeStep(void* apHkpWorld, const float aSeconds) noexcept
     }
 }
 
+// Pins: see PinBody. EXPERIMENTAL, as the pulls are.
+struct Pin
+{
+    void* pRoot = nullptr;     // the thing's 3D, referenced while pinned
+    uint8_t* pHavok = nullptr; // its first body physics may move
+    float Target[3]{};         // where that body belongs, in Havok units
+    float Offset[3]{};         // the body's place minus the place of the thing's 3D, in Havok units, when it was first pinned
+    std::chrono::steady_clock::time_point At{};
+};
+std::mutex s_pinsLock;
+std::vector<Pin> s_pins;
+
+void DrivePinsBeforeStep(void* apHkpWorld, const float aSeconds) noexcept
+{
+    if (!apHkpWorld || !(aSeconds > 0.f))
+        return;
+
+    std::array<Pin, 32> pins;
+    size_t count = 0;
+    {
+        std::lock_guard pinsLock(s_pinsLock);
+        if (s_pins.empty())
+            return;
+        const auto cNow = std::chrono::steady_clock::now();
+        for (const Pin& pin : s_pins)
+            if (count < pins.size() && pin.pHavok && cNow - pin.At < std::chrono::milliseconds(300) && At<void*>(pin.pHavok, kHkWorldOffset) == apHkpWorld)
+                pins[count++] = pin;
+    }
+    if (count == 0)
+        return;
+
+    POINTER_SKYRIMSE(THkpEntityActivate, s_activate, 60096, 60096);
+    void* pBhkWorld = At<void*>(apHkpWorld, kBhkWorldOfHkpWorldOffset);
+    if (!s_activate.Get() || !pBhkWorld)
+        return;
+    const auto* pLock = reinterpret_cast<const volatile uint32_t*>(static_cast<uint8_t*>(pBhkWorld) + kWorldLockOffset);
+    if (pLock[0] != GetCurrentThreadId() && pLock[1] != 0)
+        return;
+    WorldWriteLock lock(pBhkWorld);
+    if (!lock.Held())
+        return;
+
+    for (size_t i = 0; i < count; ++i)
+    {
+        uint8_t* pHavok = pins[i].pHavok;
+        if (!IsPullable(pHavok))
+            continue;
+        s_activate.Get()(pHavok);
+
+        // The speed that puts it back in this one step, at most 20 m/s; it has not gone far, only as far as one step's fall or a push.
+        const float* pAt = reinterpret_cast<const float*>(pHavok + kBodyTranslationOffset);
+        glm::vec3 wanted = (glm::vec3{pins[i].Target[0], pins[i].Target[1], pins[i].Target[2]} - glm::vec3{pAt[0], pAt[1], pAt[2]}) / aSeconds;
+        if (const float speed = glm::length(wanted); speed > 20.f)
+            wanted *= 20.f / speed;
+        float* pLinear = reinterpret_cast<float*>(pHavok + kAngularVelocityOffset - 0x10);
+        float* pAngular = reinterpret_cast<float*>(pHavok + kAngularVelocityOffset);
+        pLinear[0] = wanted.x, pLinear[1] = wanted.y, pLinear[2] = wanted.z;
+        pAngular[0] = 0.f, pAngular[1] = 0.f, pAngular[2] = 0.f;
+    }
+}
+
 // Replaces the call to hkpWorld::stepDeltaTime in bhkWorld::Update, VR 0xDFB722, only if that instruction is a call.
 // HIGGS hooks the same call (src/hooks.cpp, prePhysicsStepHookLoc); whichever patches second calls the other.
 int HookStepDeltaTime(void* apHkpWorld, float aSeconds)
 {
     DriveWeaponBodiesBeforeStep(apHkpWorld, aSeconds);
+    DrivePinsBeforeStep(apHkpWorld, aSeconds);
     DrivePullsBeforeStep(apHkpWorld, aSeconds);
     return s_stepDeltaTime(apHkpWorld, aSeconds);
 }
@@ -4604,6 +4666,80 @@ void ExpirePulls() noexcept
         static_cast<NiRefObject*>(it->first)->DecRef();
         it = s_retiredPullRoots.erase(it);
     }
+}
+
+bool PinBody(TESObjectREFR* apRef, const glm::vec3* apPlace) noexcept
+{
+    POINTER_SKYRIMSE(float, s_havokScale, 231896, 231896);
+    const float cScale = s_havokScale.Get() ? *s_havokScale.Get() : 0.f;
+    void* pRoot = apRef ? static_cast<void*>(apRef->GetNiNode()) : nullptr;
+    if (!pRoot || !(cScale > 0.f))
+        return false;
+    const auto cNow = std::chrono::steady_clock::now();
+
+    std::lock_guard pinsLock(s_pinsLock);
+    // Pins not kept are dropped here; their 3D is let go of a second later (ExpirePulls), as for a pull.
+    for (auto it = s_pins.begin(); it != s_pins.end();)
+    {
+        if (it->pRoot != pRoot && cNow - it->At > std::chrono::milliseconds(500))
+        {
+            s_retiredPullRoots.emplace_back(it->pRoot, cNow);
+            it = s_pins.erase(it);
+        }
+        else
+            ++it;
+    }
+
+    auto pin = std::find_if(s_pins.begin(), s_pins.end(), [pRoot](const Pin& acPin) { return acPin.pRoot == pRoot; });
+    if (pin == s_pins.end())
+    {
+        uint8_t* pFirst = nullptr;
+        TiltedPhoques::Vector<void*> queue;
+        queue.push_back(pRoot);
+        for (size_t head = 0; head < queue.size() && head < 512 && !pFirst; ++head)
+        {
+            void* pObject = queue[head];
+            if (uint8_t* pBody = HavokBodyOfLive(pObject); pBody && At<void*>(pBody, kHkWorldOffset) && IsPullable(pBody))
+                pFirst = pBody;
+            void* pNode = AsNode(pObject);
+            void** pChildren = pNode ? At<void**>(pNode, kChildrenOffset + 0x8) : nullptr;
+            const uint16_t capacity = pNode ? At<uint16_t>(pNode, kChildrenOffset + 0x10) : 0;
+            for (uint16_t i = 0; pChildren && i < capacity; ++i)
+                if (pChildren[i])
+                    queue.push_back(pChildren[i]);
+        }
+        if (!pFirst)
+            return false;
+
+        Pin fresh{};
+        fresh.pRoot = pRoot;
+        fresh.pHavok = pFirst;
+        // Where the body sits against the reference's 3D, and until a place is given, where it is now.
+        const float* pAt = reinterpret_cast<const float*>(pFirst + kBodyTranslationOffset);
+        const glm::vec3 cRootAt = ToGlm(At<NiTransform>(pRoot, kWorldOffset).translate) * cScale;
+        fresh.Offset[0] = pAt[0] - cRootAt.x, fresh.Offset[1] = pAt[1] - cRootAt.y, fresh.Offset[2] = pAt[2] - cRootAt.z;
+        fresh.Target[0] = pAt[0], fresh.Target[1] = pAt[1], fresh.Target[2] = pAt[2];
+        static_cast<NiRefObject*>(pRoot)->IncRef();
+        s_pins.push_back(fresh);
+        pin = std::prev(s_pins.end());
+    }
+    if (apPlace)
+    {
+        pin->Target[0] = apPlace->x * cScale + pin->Offset[0];
+        pin->Target[1] = apPlace->y * cScale + pin->Offset[1];
+        pin->Target[2] = apPlace->z * cScale + pin->Offset[2];
+    }
+    pin->At = cNow;
+    return true;
+}
+
+void UnpinBody(TESObjectREFR* apRef) noexcept
+{
+    void* pRoot = apRef ? static_cast<void*>(apRef->GetNiNode()) : nullptr;
+    std::lock_guard pinsLock(s_pinsLock);
+    for (Pin& pin : s_pins)
+        if (pin.pRoot == pRoot)
+            pin.At = {};
 }
 
 bool PullBody(const uint64_t aKey, TESObjectREFR* apRef, const glm::vec3& acHand) noexcept

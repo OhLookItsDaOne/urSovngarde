@@ -159,6 +159,8 @@ private:
         std::chrono::steady_clock::time_point SharedLogAt{};
     };
     std::unordered_map<uint64_t, RemoteGrab> m_remoteGrabs;
+    //! HIGGS took a thing another game was moving: see the definition.
+    void TakeFromOtherGame(uint32_t aFormId, bool aIsLeft, bool aPulled) noexcept;
     //! Whether another player's hand holds this thing, by what their HIGGS said (kind and ids as in RequestGrabReport).
     bool IsInAnotherHand(uint8_t aKind, uint32_t aServerId, const GameId& acObjectId) const noexcept;
     //! Whether this player has the thing in a hand: HIGGS holds it, or it was just taken and HIGGS is about to.

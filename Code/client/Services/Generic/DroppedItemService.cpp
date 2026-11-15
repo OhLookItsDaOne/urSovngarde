@@ -80,6 +80,15 @@ constexpr float kRestartAngle = 0.3f;
 // A move from the other side further than this is a jump (a load, a teleport), made with MoveTo; nearer ones move the 3D in place.
 constexpr float kMoveInPlaceDistance = 1000.f;
 
+// A thing another game moves must not fall or roll here between that game's moves.
+// Without HIGGS its body is made keyframed. With HIGGS it is pinned instead (VRBodySync::PinBody, after each placing and every frame):
+// HIGGS takes only bodies physics may move, so a keyframed thing could not be selected, grabbed or pulled until the other game let go.
+void HoldStill(TESObjectREFR* apRef) noexcept
+{
+    if (!VRModApis::KnowsGrabs())
+        apRef->SetMotionType(TESObjectREFR::kMotionKeyframed);
+}
+
 // Puts an object the other side moves where it says, without building its 3D again when it only moved a little.
 void PlaceMovedObject(TESObjectREFR* apRef, const glm::vec3& acPosition, const glm::vec3& acRotation) noexcept
 {
@@ -632,6 +641,9 @@ void DroppedItemService::OnUpdate(const UpdateEvent&) noexcept
                 spdlog::info("DroppedItem: {} stopped being moved over there without coming to rest; released it here", id);
         }
 
+        if (motion.Held && VRModApis::KnowsGrabs())
+            VRBodySync::PinBody(pRef, nullptr);
+
         if (motion.Held || now < motion.QuietUntil)
         {
             motion.LastPosition = position;
@@ -836,6 +848,9 @@ void DroppedItemService::UpdateWorldObjects(const std::chrono::steady_clock::tim
             motion.HeldRebuilds = 0;
         }
 
+        if (motion.Held && VRModApis::KnowsGrabs())
+            VRBodySync::PinBody(pRef, nullptr);
+
         if (motion.Held || aNow < motion.QuietUntil)
         {
             motion.LastPosition = position;
@@ -964,20 +979,23 @@ void DroppedItemService::OnNotifyWorldObjectMove(const NotifyWorldObjectMove& ac
     }
     if (!motion.Held)
     {
-        pRef->SetMotionType(TESObjectREFR::kMotionKeyframed);
+        HoldStill(pRef);
         motion.Held = true;
         spdlog::info("WorldObject: {:X} is being moved over there; holding it here and following", cFormId);
     }
 
     const glm::vec3 position(acMessage.Position);
     const NiNode* pNodeBefore = pRef->GetNiNode();
+    // With HIGGS the thing stays a body physics may move, pinned where the other game has it (HoldStill). Before the placing: see PinBody.
+    if (VRModApis::KnowsGrabs())
+        VRBodySync::PinBody(pRef, &position);
     PlaceMovedObject(pRef, position, acMessage.Rotation);
     ++motion.HeldMoves;
     if (const NiNode* pNodeAfter = pRef->GetNiNode(); pNodeBefore && pNodeAfter != pNodeBefore)
     {
         ++motion.HeldRebuilds;
         if (pNodeAfter)
-            pRef->SetMotionType(TESObjectREFR::kMotionKeyframed);
+            HoldStill(pRef);
     }
 
     motion.LastRemote = now;
@@ -1021,20 +1039,23 @@ void DroppedItemService::OnNotifyDroppedItemMove(const NotifyDroppedItemMove& ac
     // Also for a lone "put down": it is placed exactly, then let go.
     if (!motion.Held)
     {
-        pRef->SetMotionType(TESObjectREFR::kMotionKeyframed);
+        HoldStill(pRef);
         motion.Held = true;
         spdlog::info("DroppedItem: {} ({:X}) is being moved over there; holding it here and following", acMessage.Id, it->second);
     }
 
     const glm::vec3 position(acMessage.Position);
     const NiNode* pNodeBefore = pRef->GetNiNode();
+    // With HIGGS the thing stays a body physics may move, pinned where the other game has it (HoldStill). Before the placing: see PinBody.
+    if (VRModApis::KnowsGrabs())
+        VRBodySync::PinBody(pRef, &position);
     PlaceMovedObject(pRef, position, acMessage.Rotation);
 
     // A rebuilt 3D has a dynamic body again, which would fall, so it is held again.
     // Logged once, to learn whether a move ever rebuilds it.
     if (const NiNode* pNodeAfter = pRef->GetNiNode(); pNodeBefore && pNodeAfter && pNodeAfter != pNodeBefore)
     {
-        pRef->SetMotionType(TESObjectREFR::kMotionKeyframed);
+        HoldStill(pRef);
         static bool s_reported = false;
         if (!s_reported)
         {
@@ -1167,6 +1188,11 @@ void DroppedItemService::RunPulls(const std::chrono::steady_clock::time_point aN
         if (!cPressed)
             continue;
 
+        // With HIGGS nothing is guessed from the button: what another game moves stays a body HIGGS can take (HoldStill),
+        // and its grab or pull is what takes the thing over (TakeFromOtherGame).
+        if (VRModApis::KnowsGrabs())
+            continue;
+
         // What HIGGS says this hand holds. A hand that holds one thing is not pulling at another next to it.
         // The thing itself is let through: handed to another game while in this hand, HIGGS may still call it held.
         const uint32_t cHiggsHeld = VRModApis::HeldByHand(side);
@@ -1235,40 +1261,6 @@ void DroppedItemService::RunPulls(const std::chrono::steady_clock::time_point aN
         if (found.FormId == 0)
             continue;
 
-        // A new press takes it at once: it becomes this game's to simulate, and HIGGS is told to take it into the hand.
-        // Nobody else has it in a hand (it flies, rolls, or was just let go): the server gives this player the hold on HIGGS's report.
-        // Another player has it in a hand: both hold it from now on, each in their own game (SharedMove).
-        if (cEdge && found.Kind != RequestPull::kActor && VRModApis::KnowsGrabs())
-        {
-            const bool cShared = IsInAnotherHand(found.Kind, found.ServerId, found.ObjectId);
-            TESObjectREFR* pRef = Cast<TESObjectREFR>(TESForm::GetById(found.FormId));
-            Motion* pMotion = nullptr;
-            if (found.Kind == RequestPull::kWorldObject)
-            {
-                if (const auto cMotion = m_objectMotion.find(found.FormId); cMotion != m_objectMotion.end())
-                    pMotion = &cMotion->second;
-            }
-            else if (const auto cMotion = m_motion.find(found.ServerId); cMotion != m_motion.end())
-                pMotion = &cMotion->second;
-
-            if (pRef && pMotion)
-            {
-                if (pMotion->Held)
-                    pRef->SetMotionType(TESObjectREFR::kMotionDynamic);
-                pMotion->Held = false;
-                pMotion->Moving = true;
-                pMotion->LastLocalMove = aNow;
-                pMotion->QuietUntil = {};
-                pMotion->TakenUntil = aNow + std::chrono::milliseconds(500);
-                pMotion->LastPosition = WorldPositionOf(pRef);
-                pMotion->LastRotation = RotationOf(pRef);
-                VRModApis::Higgs()->GrabObject(pRef, side == 0);
-                spdlog::info("GrabNow: this player's {} hand pressed {:.0f} units from {:X}, which another game moved and {}; taken here and given to HIGGS", side ? "right" : "left",
-                             nearest, found.FormId, cShared ? "another player has in a hand: held by both now" : "nobody held");
-                continue;
-            }
-        }
-
         found.Active = true;
         found.WasPressed = true;
         found.Since = aNow;
@@ -1290,6 +1282,9 @@ void DroppedItemService::RunGrabReports() noexcept
 
     for (const auto& event : s_events)
     {
+        if (event.Event != VRModApis::HandEvent::kLetGo)
+            TakeFromOtherGame(event.FormId, event.IsLeft, event.Event == VRModApis::HandEvent::kPulled);
+
         RequestGrabReport report{};
         report.Event = event.Event;
         report.Hand = event.IsLeft ? 0 : 1;
@@ -1345,6 +1340,45 @@ bool DroppedItemService::IsInAnotherHand(const uint8_t aKind, const uint32_t aSe
             return true;
     }
     return false;
+}
+
+// HIGGS grabbed a thing, or began pulling it to the hand, that another game was moving and this one kept pinned: it is this game's to
+// simulate from this moment. The server gives this player the hold on the same report, unless another player has it in a hand too;
+// then both hold it (SharedMove).
+void DroppedItemService::TakeFromOtherGame(const uint32_t aFormId, const bool aIsLeft, const bool aPulled) noexcept
+{
+    Motion* pMotion = nullptr;
+    uint8_t kind = RequestPull::kDroppedItem;
+    uint32_t serverId = 0;
+    GameId objectId{};
+    if (const auto cItem = m_idByRef.find(aFormId); cItem != m_idByRef.end())
+    {
+        serverId = cItem->second;
+        if (const auto cMotion = m_motion.find(serverId); cMotion != m_motion.end())
+            pMotion = &cMotion->second;
+    }
+    else if (const auto cMotion = m_objectMotion.find(aFormId); cMotion != m_objectMotion.end())
+    {
+        pMotion = &cMotion->second;
+        kind = RequestPull::kWorldObject;
+        m_world.GetModSystem().GetServerModId(aFormId, objectId);
+    }
+    TESObjectREFR* pRef = Cast<TESObjectREFR>(TESForm::GetById(aFormId));
+    if (!pMotion || !pRef || !pMotion->Held)
+        return;
+
+    const auto cNow = std::chrono::steady_clock::now();
+    VRBodySync::UnpinBody(pRef);
+    pMotion->Held = false;
+    pMotion->Moving = true;
+    pMotion->LastLocalMove = cNow;
+    pMotion->QuietUntil = {};
+    // A pulled thing flies to the hand first, and HIGGS calls it held only when it arrives.
+    pMotion->TakenUntil = cNow + std::chrono::milliseconds(aPulled ? 2000 : 500);
+    pMotion->LastPosition = WorldPositionOf(pRef);
+    pMotion->LastRotation = RotationOf(pRef);
+    spdlog::info("GrabNow: this player's {} hand {} {:X}, which another game moved and {}; this game runs it now", aIsLeft ? "left" : "right", aPulled ? "pulls" : "grabbed", aFormId,
+                 IsInAnotherHand(kind, serverId, objectId) ? "another player has in a hand: held by both now" : "nobody held");
 }
 
 bool DroppedItemService::SharedMove(const uint8_t aKind, const uint32_t aServerId, const GameId& acObjectId, TESObjectREFR* apRef, Motion& aMotion, const glm::vec3& acPosition,

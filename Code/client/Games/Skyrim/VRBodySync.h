@@ -125,6 +125,14 @@ bool CopyHandPosition(Actor* apCopy, uint8_t aSide, glm::vec3& aOut) noexcept;
 void SetBodyInAnotherHand(uint64_t aHand, uint32_t aFormId) noexcept;
 void ClearBodiesInOtherHands() noexcept;
 bool IsBodyInAnotherHand(uint32_t aFormId) noexcept;
+//! Keeps a thing another game moves where it is, without making its body keyframed: before each physics step its body is sped
+//! to where it belongs, and its spin is stopped. A keyframed body would do the same, but HIGGS takes only bodies physics may move,
+//! and a pinned one stays such a body: a hand can select, grab and pull it.
+//! apPlace: where the other game has the reference now; call it with that BEFORE placing the reference there (the first call measures
+//! how far the body sits from the reference's 3D, which a placing in progress would falsify). Null keeps the pin as it is;
+//! call it at least every 300 ms. False if the thing has no such body.
+bool PinBody(TESObjectREFR* apRef, const glm::vec3* apPlace) noexcept;
+void UnpinBody(TESObjectREFR* apRef) noexcept;
 //! In the game that moves the thing: pull its body nearest acHand toward acHand until EndPull, or until this is not called for 300 ms.
 //! aKey names the hand (player id << 1 | side). False if the thing has no body to pull near that hand.
 bool PullBody(uint64_t aKey, TESObjectREFR* apRef, const glm::vec3& acHand) noexcept;
