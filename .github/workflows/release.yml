@@ -82,6 +82,7 @@ jobs:
           xmake build SkyrimImmersiveLauncherVR
           xmake build SkyrimServerRunner
           xmake build TPProcess
+          xmake build VRBridge
 
       # The encoding round trips and the rest of TPTests, as windows.yml runs them: a tag whose branch run was skipped
       # or failed must not publish a release with a broken message.

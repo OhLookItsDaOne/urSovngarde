@@ -74,6 +74,12 @@ Copy-Item (Join-Path $PSScriptRoot 'host-server.*') $server
 
 # Game files, installed as an MO2 mod.
 Copy-Item (Join-Path $RepoRoot 'GameFiles\Skyrim') (Join-Path $staging 'urSovngarde mod') -Recurse
+# The SKSE plugin that fetches the HIGGS, PLANCK and VRIK interfaces for the client (Code/vr_bridge, target VRBridge).
+$bridge = Join-Path $buildFolder 'urSovngardeBridge.dll'
+if (-not (Test-Path $bridge)) { throw "urSovngardeBridge.dll is not in $buildFolder; build the target VRBridge first." }
+$plugins = Join-Path $staging 'urSovngarde mod\SKSE\Plugins'
+New-Item -ItemType Directory -Force $plugins | Out-Null
+Copy-Item $bridge $plugins
 
 # Never VR_MULTIPLAYER_GUIDE.md: it carries the host's public IP, PC name and router settings.
 Copy-Item (Join-Path $PSScriptRoot 'README-release.md') (Join-Path $staging 'README.md')

@@ -137,10 +137,12 @@ jobs:
               run: |
                   mkdir -p str-build/urSovngarde str-pdb
                   mv "$STR_BUILD_DIR"/* str-build/urSovngarde/
-                  cp -r GameFiles/Skyrim/* str-build/
+                  # The same two folders as a release (Tools/VR/make-release.ps1), so the install instructions fit a test
+                  # build too: "urSovngarde" is the program, "urSovngarde mod" is installed as a mod (it lands in Data).
+                  mkdir -p "str-build/urSovngarde mod/SKSE/Plugins"
+                  cp -r GameFiles/Skyrim/* "str-build/urSovngarde mod/"
                   # The SKSE plugin that fetches the HIGGS, PLANCK and VRIK interfaces (Code/vr_bridge) goes where SKSE loads plugins from.
-                  mkdir -p str-build/SKSE/Plugins
-                  mv str-build/urSovngarde/urSovngardeBridge.dll str-build/SKSE/Plugins/
+                  mv str-build/urSovngarde/urSovngardeBridge.dll "str-build/urSovngarde mod/SKSE/Plugins/"
 
             - name: Remove unnecessary build files, keep .pdb
               if: ${{ inputs.upload-build-for-next-job }}
