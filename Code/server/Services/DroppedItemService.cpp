@@ -13,6 +13,7 @@
 #include <Messages/RequestWorldObjectMove.h>
 #include <Messages/NotifyWorldObjectMove.h>
 #include <Messages/RequestPull.h>
+#include <Messages/RequestGrabReport.h>
 #include <Messages/NotifyPull.h>
 #include <Messages/EnterInteriorCellRequest.h>
 #include <Messages/EnterExteriorCellRequest.h>
@@ -48,6 +49,7 @@ DroppedItemService::DroppedItemService(World& aWorld, entt::dispatcher& aDispatc
     , m_moveConnection(aDispatcher.sink<PacketEvent<RequestDroppedItemMove>>().connect<&DroppedItemService::OnMove>(this))
     , m_objectMoveConnection(aDispatcher.sink<PacketEvent<RequestWorldObjectMove>>().connect<&DroppedItemService::OnObjectMove>(this))
     , m_pullConnection(aDispatcher.sink<PacketEvent<RequestPull>>().connect<&DroppedItemService::OnPull>(this))
+    , m_grabReportConnection(aDispatcher.sink<PacketEvent<RequestGrabReport>>().connect<&DroppedItemService::OnGrabReport>(this))
     , m_interiorConnection(aDispatcher.sink<PacketEvent<EnterInteriorCellRequest>>().connect<&DroppedItemService::OnEnterInteriorCell>(this))
     , m_exteriorConnection(aDispatcher.sink<PacketEvent<EnterExteriorCellRequest>>().connect<&DroppedItemService::OnEnterExteriorCell>(this))
     , m_gridConnection(aDispatcher.sink<PacketEvent<ShiftGridCellRequest>>().connect<&DroppedItemService::OnShiftGridCell>(this))
@@ -196,6 +198,47 @@ void DroppedItemService::OnObjectMove(const PacketEvent<RequestWorldObjectMove>&
         if (pPlayer != acMessage.pPlayer && pPlayer->GetCellComponent().IsInRange(cell, false))
             pPlayer->Send(notify);
     }
+}
+
+// TEMPORARY: what HIGGS told a player's game about one of its hands, logged as it arrived, to compare with that player's own log.
+void DroppedItemService::OnGrabReport(const PacketEvent<RequestGrabReport>& acMessage) const noexcept
+{
+    const auto& message = acMessage.Packet;
+    const Player* pPlayer = acMessage.pPlayer;
+    const char* cpHand = message.Hand == 0 ? "left" : "right";
+
+    std::string what;
+    if (message.Kind == RequestGrabReport::kActor)
+    {
+        const auto cEntity = static_cast<entt::entity>(message.ServerId);
+        const auto* pOwnerComponent = m_world.valid(cEntity) ? m_world.try_get<OwnerComponent>(cEntity) : nullptr;
+        const Player* pOwner = pOwnerComponent ? pOwnerComponent->GetOwner() : nullptr;
+        what = fmt::format("character {:X} ({})", message.ServerId,
+                           !pOwnerComponent ? "not known here" : !pOwner ? "no owner" : pOwner == pPlayer ? "their own" : fmt::format("owned by player {}", pOwner->GetId()));
+    }
+    else if (message.Kind == RequestGrabReport::kWorldObject)
+    {
+        const uint64_t cKey = (static_cast<uint64_t>(message.ObjectId.ModId) << 32) | message.ObjectId.BaseId;
+        const Player* pHolder = HolderOf(m_objectHolds, cKey);
+        what = fmt::format("placed object {:X}:{:X} ({})", message.ObjectId.ModId, message.ObjectId.BaseId,
+                           !pHolder ? "no holder" : pHolder == pPlayer ? "they hold it" : fmt::format("held by player {}", pHolder->GetId()));
+    }
+    else if (message.Kind == RequestGrabReport::kDroppedItem)
+    {
+        const Player* pHolder = HolderOf(m_itemHolds, message.ServerId);
+        what = fmt::format("dropped item {} ({})", message.ServerId,
+                           !pHolder ? "no holder" : pHolder == pPlayer ? "they hold it" : fmt::format("held by player {}", pHolder->GetId()));
+    }
+    else
+        what = "something only their game has";
+
+    if (message.Event == RequestGrabReport::kGrabbed)
+        spdlog::info("Grab: player {} '{}' {} hand grabbed {} (their reference {:X}) at node '{}', node in hand space at ({:.1f}, {:.1f}, {:.1f}); fingers {} {} {} {} {} of 255", pPlayer->GetId(),
+                     pPlayer->GetUsername().c_str(), cpHand, what, message.FormId, message.NodeName.c_str(), message.GrabX, message.GrabY, message.GrabZ, message.Fingers & 0xFF,
+                     (message.Fingers >> 8) & 0xFF, (message.Fingers >> 16) & 0xFF, (message.Fingers >> 24) & 0xFF, (message.Fingers >> 32) & 0xFF);
+    else
+        spdlog::info("Grab: player {} '{}' {} hand {} {} (their reference {:X})", pPlayer->GetId(), pPlayer->GetUsername().c_str(), cpHand,
+                     message.Event == RequestGrabReport::kLetGo ? "let go of" : "pulled toward itself", what, message.FormId);
 }
 
 // A hand on something another player's game is moving: passed on to that game, which pulls the thing toward the hand.

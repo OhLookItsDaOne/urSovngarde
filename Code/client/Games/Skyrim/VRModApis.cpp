@@ -5,6 +5,7 @@
 #include <TESObjectREFR.h>
 
 #include <chrono>
+#include <mutex>
 
 namespace
 {
@@ -25,6 +26,18 @@ VRModApis::PlanckInterface* s_pPlanck = nullptr;
 VRModApis::VrikInterface* s_pVrik = nullptr;
 bool s_done = false;
 
+std::mutex s_eventLock;
+std::vector<VRModApis::HandEvent> s_events;
+
+void Queue(VRModApis::HandEvent&& aEvent) noexcept
+{
+    std::scoped_lock _{s_eventLock};
+    // Nobody takes them while not in the game; the newest are the ones worth having.
+    if (s_events.size() >= 64)
+        s_events.erase(s_events.begin());
+    s_events.push_back(std::move(aEvent));
+}
+
 const char* Side(bool aIsLeft) noexcept
 {
     return aIsLeft ? "left" : "right";
@@ -40,16 +53,27 @@ void OnGrabbed(bool aIsLeft, TESObjectREFR* apRefr)
     spdlog::info("Higgs: {} hand grabbed {:X} at its node '{}'; node in hand space at ({:.1f}, {:.1f}, {:.1f}), scale {:.2f}; fingers {:.2f} {:.2f} {:.2f} {:.2f} {:.2f}",
                  Side(aIsLeft), apRefr ? apRefr->formID : 0, cNode.pData ? cNode.pData : "", cGrab.Translation[0], cGrab.Translation[1], cGrab.Translation[2], cGrab.Scale,
                  fingers[0], fingers[1], fingers[2], fingers[3], fingers[4]);
+
+    VRModApis::HandEvent event;
+    event.Event = VRModApis::HandEvent::kGrabbed;
+    event.IsLeft = aIsLeft;
+    event.FormId = apRefr ? apRefr->formID : 0;
+    event.NodeName = cNode.pData ? cNode.pData : "";
+    std::copy(std::begin(cGrab.Translation), std::end(cGrab.Translation), event.Grab);
+    std::copy(std::begin(fingers), std::end(fingers), event.Fingers);
+    Queue(std::move(event));
 }
 
 void OnDropped(bool aIsLeft, TESObjectREFR* apRefr)
 {
     spdlog::info("Higgs: {} hand let go of {:X}", Side(aIsLeft), apRefr ? apRefr->formID : 0);
+    Queue({VRModApis::HandEvent::kLetGo, aIsLeft, apRefr ? apRefr->formID : 0});
 }
 
 void OnPulled(bool aIsLeft, TESObjectREFR* apRefr)
 {
     spdlog::info("Higgs: {} hand pulled {:X} toward itself", Side(aIsLeft), apRefr ? apRefr->formID : 0);
+    Queue({VRModApis::HandEvent::kPulled, aIsLeft, apRefr ? apRefr->formID : 0});
 }
 } // namespace
 
@@ -104,6 +128,13 @@ void Poll() noexcept
         s_pHiggs->AddDroppedCallback(OnDropped);
         s_pHiggs->AddPulledCallback(OnPulled);
     }
+}
+
+void TakeHandEvents(std::vector<HandEvent>& aEvents) noexcept
+{
+    std::scoped_lock _{s_eventLock};
+    aEvents.insert(aEvents.end(), std::make_move_iterator(s_events.begin()), std::make_move_iterator(s_events.end()));
+    s_events.clear();
 }
 
 HiggsInterface* Higgs() noexcept

@@ -19,6 +19,8 @@
 #include <Messages/RequestWorldObjectMove.h>
 #include <Messages/NotifyWorldObjectMove.h>
 #include <Messages/RequestPull.h>
+#include <Messages/RequestGrabReport.h>
+#include <Games/Skyrim/VRModApis.h>
 #include <Messages/NotifyPull.h>
 #include <Games/Skyrim/VRBodySync.h>
 #include <Events/UpdateEvent.h>
@@ -667,6 +669,7 @@ void DroppedItemService::OnUpdate(const UpdateEvent&) noexcept
 
     UpdateWorldObjects(now);
     RunPulls(now);
+    RunGrabReports();
 }
 
 namespace
@@ -1221,6 +1224,59 @@ void DroppedItemService::RunPulls(const std::chrono::steady_clock::time_point aN
         spdlog::info("PullDiag: this player's {} hand pressed {:.0f} units from {:X}, which another game is moving ({}); sending the hand there", side ? "right" : "left",
                      nearest, pull.FormId, pull.Kind == RequestPull::kActor ? "a body" : pull.Kind == RequestPull::kWorldObject ? "a placed object" : "a dropped item");
         send(true);
+    }
+}
+
+// TEMPORARY: what HIGGS reports goes to the server as it is, and the server logs it, so both ends can be compared.
+void DroppedItemService::RunGrabReports() noexcept
+{
+    static std::vector<VRModApis::HandEvent> s_events;
+    s_events.clear();
+    VRModApis::TakeHandEvents(s_events);
+    if (s_events.empty() || !m_transport.IsConnected())
+        return;
+
+    for (const auto& event : s_events)
+    {
+        RequestGrabReport report{};
+        report.Event = event.Event;
+        report.Hand = event.IsLeft ? 0 : 1;
+        report.Kind = RequestGrabReport::kUnknown;
+        report.FormId = event.FormId;
+        report.NodeName = event.NodeName.c_str();
+        report.GrabX = event.Grab[0];
+        report.GrabY = event.Grab[1];
+        report.GrabZ = event.Grab[2];
+        for (int i = 0; i < 5; ++i)
+            report.Fingers |= static_cast<uint64_t>(std::clamp(event.Fingers[i], 0.f, 1.f) * 255.f + 0.5f) << (8 * i);
+
+        // What the server knows the thing as: a character, a dropped item, or a placed reference.
+        TESObjectREFR* pRef = Cast<TESObjectREFR>(TESForm::GetById(event.FormId));
+        if (Cast<Actor>(pRef))
+        {
+            for (const auto cEntity : m_world.view<FormIdComponent>())
+            {
+                if (m_world.get<FormIdComponent>(cEntity).Id != event.FormId)
+                    continue;
+                if (const auto* pRemote = m_world.try_get<RemoteComponent>(cEntity))
+                    report.ServerId = pRemote->Id;
+                else if (const auto* pLocal = m_world.try_get<LocalComponent>(cEntity))
+                    report.ServerId = pLocal->Id;
+                else
+                    break;
+                report.Kind = RequestGrabReport::kActor;
+                break;
+            }
+        }
+        else if (const auto cItem = std::find_if(m_refById.begin(), m_refById.end(), [&](const auto& acPair) { return acPair.second == event.FormId; }); cItem != m_refById.end())
+        {
+            report.Kind = RequestGrabReport::kDroppedItem;
+            report.ServerId = cItem->first;
+        }
+        else if (pRef && !pRef->IsTemporary() && m_world.GetModSystem().GetServerModId(event.FormId, report.ObjectId))
+            report.Kind = RequestGrabReport::kWorldObject;
+
+        m_transport.Send(report);
     }
 }
 

@@ -74,6 +74,7 @@ enum ClientOpcode : unsigned char
     kRequestPartyValue,
     kRequestActorPresence,
     kRequestPull,
+    kRequestGrabReport,
     kClientOpcodeMax
 };
 

@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
+#include <vector>
 
 struct TESObjectREFR;
 struct TESForm;
@@ -118,6 +120,26 @@ struct VrikInterface
     virtual void SetFingerRange(bool aIsLeft, float aMin0, float aMax0, float aMin1, float aMax1, float aMin2, float aMax2, float aMin3, float aMax3, float aMin4, float aMax4) = 0;
     virtual void RestoreFingers(bool aIsLeft) = 0;
 };
+
+//! One thing HIGGS said about a hand of this player. Position and fingers are filled for a grab only.
+struct HandEvent
+{
+    enum : uint8_t
+    {
+        kGrabbed,
+        kLetGo,
+        kPulled
+    };
+    uint8_t Event{};
+    bool IsLeft{};
+    uint32_t FormId{};
+    std::string NodeName{};
+    float Grab[3]{};
+    float Fingers[5]{};
+};
+
+//! Moves what HIGGS said since the last call into aEvents, oldest first. HIGGS may say it on another thread than the caller's.
+void TakeHandEvents(std::vector<HandEvent>& aEvents) noexcept;
 
 //! Looks for the bridge until it has the interfaces, at most once a second; call it every frame from the game's update.
 //! Says once in the log what arrived, or after 30 s that the bridge is not there.

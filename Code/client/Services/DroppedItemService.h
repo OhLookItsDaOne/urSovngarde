@@ -44,6 +44,8 @@ private:
     void UpdateWorldObjects(std::chrono::steady_clock::time_point aNow) noexcept;
     //! A hand of this player's on something another player's game is moving: its position is sent there, which pulls the thing toward it.
     void RunPulls(std::chrono::steady_clock::time_point aNow) noexcept;
+    //! Sends what HIGGS said about this player's hands (grabbed, let go, pulled) to the server, which logs it.
+    void RunGrabReports() noexcept;
     //! Another player's hand on something this game is moving.
     void OnNotifyPull(const NotifyPull&) noexcept;
     struct Motion;
