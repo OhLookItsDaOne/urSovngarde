@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <vector>
 
 #include <Structs/Quaternion_NetQuantize.h>
 
@@ -53,6 +54,17 @@ struct VRPose
     //! No bones, only RootPosition: for a body without a humanoid rig (a Dwarven sphere, a spider).
     //! The receiver shifts the whole node tree instead of posing named bones.
     bool NoBones{false};
+
+    //! With NoBones: every bone of the skeleton's own bone list, in that list's order, so that an animal's body bends for the
+    //! other players as it does for the one who moves it. Rotation is the bone's world rotation; Offset is from RootPosition to
+    //! the bone in world axes, in quarter units. Empty when the body has no such list or more than kMaxParts bones.
+    struct Part
+    {
+        Quaternion_NetQuantize Rotation{};
+        int16_t Offset[3]{};
+    };
+    static constexpr size_t kMaxParts = 200;
+    std::vector<Part> Parts{};
 
     bool HasLegs{false}; // the entries from kPelvis on are valid
     std::array<Quaternion_NetQuantize, kBoneCount> Bones{};

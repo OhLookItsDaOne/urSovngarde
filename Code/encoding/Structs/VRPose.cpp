@@ -49,7 +49,14 @@ bool VRPose::operator==(const VRPose& acRhs) const noexcept
     if (HasSpellAim && !std::equal(std::begin(SpellAim), std::end(SpellAim), std::begin(acRhs.SpellAim)))
         return false;
     if (NoBones)
+    {
+        if (Parts.size() != acRhs.Parts.size())
+            return false;
+        for (size_t i = 0; i < Parts.size(); ++i)
+            if (Parts[i].Rotation != acRhs.Parts[i].Rotation || !std::equal(std::begin(Parts[i].Offset), std::end(Parts[i].Offset), std::begin(acRhs.Parts[i].Offset)))
+                return false;
         return true;
+    }
 
     // Compared only with bones: a boneless pose does not send HasLegs, so comparing it would always report a change.
     if (HasLegs != acRhs.HasLegs)
@@ -78,6 +85,17 @@ void VRPose::Serialize(TiltedPhoques::Buffer::Writer& aWriter) const noexcept
         const size_t count = HasLegs ? kBoneCount : kUpperBoneCount;
         for (size_t i = 0; i < count; ++i)
             Bones[i].Serialize(aWriter);
+    }
+    else
+    {
+        const size_t cParts = std::min(Parts.size(), kMaxParts);
+        aWriter.WriteBits(cParts, 8);
+        for (size_t i = 0; i < cParts; ++i)
+        {
+            Parts[i].Rotation.Serialize(aWriter);
+            for (const int16_t value : Parts[i].Offset)
+                aWriter.WriteBits(static_cast<uint16_t>(value), 16);
+        }
     }
     aWriter.WriteBits(HasFingers ? 1 : 0, 1);
     if (HasFingers)
@@ -175,6 +193,25 @@ void VRPose::Deserialize(TiltedPhoques::Buffer::Reader& aReader) noexcept
         const size_t count = HasLegs ? kBoneCount : kUpperBoneCount;
         for (size_t i = 0; i < count; ++i)
             Bones[i].Deserialize(aReader);
+    }
+    Parts.clear();
+    if (NoBones)
+    {
+        uint64_t parts = 0;
+        aReader.ReadBits(parts, 8);
+        if (parts > kMaxParts)
+            parts = 0;
+        Parts.resize(parts);
+        for (Part& part : Parts)
+        {
+            part.Rotation.Deserialize(aReader);
+            for (int16_t& value : part.Offset)
+            {
+                uint64_t bits = 0;
+                aReader.ReadBits(bits, 16);
+                value = static_cast<int16_t>(static_cast<uint16_t>(bits));
+            }
+        }
     }
     uint64_t hasFingers = 0;
     aReader.ReadBits(hasFingers, 1);

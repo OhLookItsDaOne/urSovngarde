@@ -485,6 +485,13 @@ struct RemotePose
 {
     // The whole pose is a position and nothing else (see VRPose::NoBones): a skeleton the bone search cannot read.
     bool NoBones = false;
+    // With NoBones: the skeleton's own bone list as the owner has it (see VRPose::Parts); offsets in units from RootPosition.
+    struct Part
+    {
+        glm::quat Rotation{};
+        glm::vec3 Offset{};
+    };
+    std::vector<Part> Parts{}; // std: filled while a message is handled, kept after it
     bool HasLegs = false;
     std::array<glm::quat, VRPose::kBoneCount> Bones{};
     // Kept from the last update that carried them (see VRPose::HasFingers).
@@ -3747,17 +3754,70 @@ void OnFrameEnd() noexcept
 
             const glm::vec3 offset = wanted - ToGlm(At<NiTransform>(pRoot, kWorldOffset).translate);
             // Half a cell apart is a desync, not a drag.
-            if (glm::dot(offset, offset) > 2048.f * 2048.f || glm::dot(offset, offset) < 0.0001f)
+            if (glm::dot(offset, offset) > 2048.f * 2048.f)
                 continue;
 
-            ShiftTree(pRoot, offset);
+            if (glm::dot(offset, offset) >= 0.0001f)
+                ShiftTree(pRoot, offset);
+
+            // Its bones, where the owner sent them and this skeleton has the same bone list: each one put where the owner has
+            // it, so the body bends here as it does there. The list is looked up once a second, not every frame.
+            struct PartList
+            {
+                void* pRoot = nullptr;
+                uint8_t* pArray = nullptr;
+                uint32_t Count = 0;
+                std::chrono::steady_clock::time_point Until{};
+            };
+            static std::unordered_map<uint32_t, PartList> s_partLists;
+            uint32_t bent = 0;
+            uint32_t listed = 0;
+            if (!pose.Parts.empty())
+            {
+                PartList& list = s_partLists[formId];
+                if (list.pRoot != pRoot || now >= list.Until)
+                {
+                    list.pRoot = pRoot;
+                    list.pArray = GetBoneArray(FindByRtti(pRoot, "BSFlattenedBoneTree"), list.Count);
+                    list.Until = now + std::chrono::seconds(1);
+                }
+                listed = list.pArray ? list.Count : 0;
+                if (list.pArray && list.Count == pose.Parts.size())
+                {
+                    for (uint32_t i = 0; i < list.Count; ++i)
+                    {
+                        const RemotePose::Part& part = pose.Parts[i];
+                        if (!std::isfinite(part.Rotation.w) || !std::isfinite(part.Rotation.x) || !std::isfinite(part.Rotation.y) || !std::isfinite(part.Rotation.z))
+                            continue;
+                        uint8_t* pEntry = list.pArray + static_cast<size_t>(i) * kBoneEntrySize;
+                        const NiMatrix3 cRotation = FromGlm(glm::mat3_cast(glm::normalize(part.Rotation)));
+                        const NiPoint3 cPlace = FromGlm(wanted + part.Offset);
+                        NiTransform& entryWorld = At<NiTransform>(pEntry, kBoneEntryWorld);
+                        entryWorld.rotate = cRotation;
+                        entryWorld.translate = cPlace;
+                        if (void* pNode = At<void*>(pEntry, kBoneEntryNode); pNode && IsReadable(pNode, kNiAVObjectSize))
+                        {
+                            NiTransform& nodeWorld = At<NiTransform>(pNode, kWorldOffset);
+                            nodeWorld.rotate = cRotation;
+                            nodeWorld.translate = cPlace;
+                        }
+                        ++bent;
+                    }
+                }
+            }
 
             static std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> s_nextBoneless;
             auto& nextBoneless = s_nextBoneless[formId];
             if (now >= nextBoneless)
             {
                 nextBoneless = now + std::chrono::seconds(5);
-                spdlog::info("VRBodySync: body {:X} has no humanoid skeleton; moved its whole tree {:.1f} units to where its owner has it", formId, glm::length(offset));
+                if (bent)
+                    spdlog::info("VRBodySync: body {:X} has no humanoid skeleton; moved it {:.1f} units to where its owner has it and set its {} bones as its owner has them", formId,
+                                 glm::length(offset), bent);
+                else
+                    spdlog::info("VRBodySync: body {:X} has no humanoid skeleton; moved its whole tree {:.1f} units to where its owner has it, not bent (its owner sent {} bones, "
+                                 "this skeleton lists {})",
+                                 formId, glm::length(offset), pose.Parts.size(), listed);
             }
             continue;
         }
@@ -6108,7 +6168,9 @@ bool CaptureBodyPose(Actor* apActor, VRPose& aOutPose) noexcept
         std::chrono::steady_clock::time_point MovedAt{};
         bool Placed = false;
         bool Sent = false;
-        bool Boneless = false; // a skeleton this bone search cannot read; the root position is sent on its own
+        bool Boneless = false; // a skeleton this bone search cannot read; the root position is sent with the skeleton's own bone list
+        uint8_t* pPartArray = nullptr; // that list, looked up with the bones (every 5 s), or null
+        uint32_t PartCount = 0;
         bool LegsFound = false;
     };
     static std::unordered_map<uint32_t, BodyCapture> s_bodies;
@@ -6137,6 +6199,9 @@ bool CaptureBodyPose(Actor* apActor, VRPose& aOutPose) noexcept
             capture.Nodes = BoneNodes{};
             capture.VTables = {};
             capture.Boneless = true;
+            capture.pPartArray = GetBoneArray(FindByRtti(pRoot, "BSFlattenedBoneTree"), capture.PartCount);
+            if (capture.PartCount > VRPose::kMaxParts)
+                capture.pPartArray = nullptr;
             capture.RefreshAt = now + std::chrono::seconds(5);
             capture.Sent = false;
         }
@@ -6186,8 +6251,34 @@ bool CaptureBodyPose(Actor* apActor, VRPose& aOutPose) noexcept
     // It is sent every time rather than on change, because the change test below compares bones.
     if (capture.Boneless)
     {
+        // How it is bent: every bone of the skeleton's own list, as a world rotation and a place against the root.
+        aOutPose.Parts.clear();
+        if (capture.pPartArray)
+        {
+            aOutPose.Parts.resize(capture.PartCount);
+            for (uint32_t i = 0; i < capture.PartCount; ++i)
+            {
+                uint8_t* pEntry = capture.pPartArray + static_cast<size_t>(i) * kBoneEntrySize;
+                void* pNode = At<void*>(pEntry, kBoneEntryNode);
+                const NiTransform& world = pNode && IsReadable(pNode, kNiAVObjectSize) ? At<NiTransform>(pNode, kWorldOffset) : At<NiTransform>(pEntry, kBoneEntryWorld);
+                const glm::vec3 cOffset = (ToGlm(world.translate) - rootPosition) * 4.f;
+                // A bone further from the root than the message can say (8000 units), or not a number: the body is sent unbent.
+                if (!(std::fabs(cOffset.x) < 32000.f && std::fabs(cOffset.y) < 32000.f && std::fabs(cOffset.z) < 32000.f))
+                {
+                    aOutPose.Parts.clear();
+                    break;
+                }
+                VRPose::Part& part = aOutPose.Parts[i];
+                part.Rotation = glm::normalize(glm::quat_cast(ToGlm(world.rotate)));
+                part.Offset[0] = static_cast<int16_t>(std::lround(cOffset.x));
+                part.Offset[1] = static_cast<int16_t>(std::lround(cOffset.y));
+                part.Offset[2] = static_cast<int16_t>(std::lround(cOffset.z));
+            }
+        }
+
         if (!capture.Sent)
-            spdlog::info("VRBodySync: body {:X} is being moved here and has no humanoid skeleton; sending where it is, not how it is bent", apActor->formID);
+            spdlog::info("VRBodySync: body {:X} is being moved here and has no humanoid skeleton; sending where it is and its {} bones (0: this skeleton has no bone list, or over {})",
+                         apActor->formID, aOutPose.Parts.size(), VRPose::kMaxParts);
         capture.Sent = true;
 
         aOutPose.NoBones = true;
@@ -6322,6 +6413,18 @@ void SetRemotePose(Actor* apActor, const VRPose& acPose) noexcept
     std::unique_lock lock(s_posesLock);
     RemotePose& pose = s_poses[apActor->formID];
     pose.NoBones = acPose.NoBones;
+    pose.Parts.clear();
+    if (acPose.NoBones)
+    {
+        pose.Parts.reserve(acPose.Parts.size());
+        for (const VRPose::Part& part : acPose.Parts)
+        {
+            RemotePose::Part copy;
+            copy.Rotation = part.Rotation;
+            copy.Offset = glm::vec3(static_cast<float>(part.Offset[0]), static_cast<float>(part.Offset[1]), static_cast<float>(part.Offset[2])) * 0.25f;
+            pose.Parts.push_back(copy);
+        }
+    }
     pose.HasLegs = acPose.NoBones ? false : acPose.HasLegs;
     if (!acPose.NoBones)
         for (uint32_t i = 0; i < (acPose.HasLegs ? VRPose::kBoneCount : VRPose::kUpperBoneCount); ++i)
