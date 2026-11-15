@@ -158,6 +158,10 @@ jobs:
               if: ${{ inputs.upload-build-for-next-job }}
               run: |
                   mkdir -p release-assets
+                  # The mod folder goes in as a zip of its own, ready to hand to a mod manager: no zipping by hand after unpacking.
+                  # Its contents sit at the zip's root, so they land in Data.
+                  (cd "str-build/urSovngarde mod" && 7z a -tzip "../urSovngarde mod.zip" .)
+                  rm -rf "str-build/urSovngarde mod"
                   (cd str-build && 7z a -tzip \
                     "../release-assets/urSovngarde-${ARTIFACT_VERSION}-windows-${{ matrix.arch }}.zip" \
                     .)
