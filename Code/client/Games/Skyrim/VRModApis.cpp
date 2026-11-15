@@ -172,6 +172,19 @@ void TakeHandEvents(std::vector<HandEvent>& aEvents) noexcept
     s_events.erase(s_events.begin(), it);
 }
 
+uint32_t HeldByHand(const uint8_t aSide) noexcept
+{
+    if (!s_pHiggs || aSide > 1)
+        return 0;
+    const TESObjectREFR* pHeld = s_pHiggs->GetGrabbedObject(aSide == 0);
+    return pHeld ? pHeld->formID : 0;
+}
+
+bool KnowsGrabs() noexcept
+{
+    return s_pHiggs != nullptr;
+}
+
 HiggsInterface* Higgs() noexcept
 {
     return s_pHiggs;

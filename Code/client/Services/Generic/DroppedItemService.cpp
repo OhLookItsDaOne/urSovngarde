@@ -1155,6 +1155,11 @@ void DroppedItemService::RunPulls(const std::chrono::steady_clock::time_point aN
         if (!cPressed)
             continue;
 
+        // What HIGGS says this hand holds. A hand that holds one thing is not pulling at another next to it.
+        // The thing itself is let through: handed to another game while in this hand, HIGGS may still call it held.
+        const uint32_t cHiggsHeld = VRModApis::HeldByHand(side);
+        const auto otherInHand = [&](const uint32_t aFormId) { return cHiggsHeld != 0 && cHiggsHeld != aFormId; };
+
         // The nearest thing under the hand that another game is moving right now.
         // A new press takes anything; a press already held takes only what this hand was just carrying, which the referee gave to another game.
         const auto carriedHere = [&](const Motion& acMotion) { return aNow - acMotion.LastLocalMove < std::chrono::seconds(1); };
@@ -1162,7 +1167,7 @@ void DroppedItemService::RunPulls(const std::chrono::steady_clock::time_point aN
         float nearest = cGrabReach;
         for (auto& [formId, motion] : m_objectMotion)
         {
-            if (!motion.Held || !(cEdge || carriedHere(motion)))
+            if (!motion.Held || !(cEdge || carriedHere(motion)) || otherInHand(formId))
                 continue;
             TESObjectREFR* pRef = Cast<TESObjectREFR>(TESForm::GetById(formId));
             GameId objectId{};
@@ -1180,7 +1185,7 @@ void DroppedItemService::RunPulls(const std::chrono::steady_clock::time_point aN
         for (const auto& [id, refFormId] : m_refById)
         {
             const auto cMotion = m_motion.find(id);
-            if (cMotion == m_motion.end() || !cMotion->second.Held || !(cEdge || carriedHere(cMotion->second)))
+            if (cMotion == m_motion.end() || !cMotion->second.Held || !(cEdge || carriedHere(cMotion->second)) || otherInHand(refFormId))
                 continue;
             TESObjectREFR* pRef = Cast<TESObjectREFR>(TESForm::GetById(refFormId));
             if (!pRef || !IsStillOurs(pRef, cMotion->second) || pRef->IsDeleted() || pRef->IsDisabled())
@@ -1201,7 +1206,7 @@ void DroppedItemService::RunPulls(const std::chrono::steady_clock::time_point aN
                 const uint32_t cFormId = view.get<FormIdComponent>(cEntity).Id;
                 Actor* pActor = Cast<Actor>(TESForm::GetById(cFormId));
                 // A body its owner is carrying; one that lies still is taken over by grabbing it, as before (IsRemoteBodyGrabbedHere).
-                if (!cEdge || !pActor || !pActor->actorState.IsDead() || !VRBodySync::IsBodyMovedByOwner(cFormId))
+                if (!cEdge || !pActor || !pActor->actorState.IsDead() || !VRBodySync::IsBodyMovedByOwner(cFormId) || otherInHand(cFormId))
                     continue;
                 if (const float cApart = VRBodySync::NearestNodeTo(pActor, hand); cApart < nearest)
                 {
@@ -1349,10 +1354,15 @@ void DroppedItemService::OnNotifyPull(const NotifyPull& acMessage) noexcept
 
     // With no hand of this player's on it, the other player has it alone, and their own game should run it: no delay for them.
     // Said as a put-down, which the referee takes as letting go; their game takes it over (TakeOverPulled).
+    // This game simulates it, so HIGGS knows whether a hand here holds it; without HIGGS, a pressed hand within 60 units is the guess.
     bool held = false;
     for (uint8_t side = 0; side < 2; ++side)
-        if (glm::vec3 hand{}; VRBodySync::PressedHand(side, hand) && VRBodySync::NearestNodeTo(pRef, hand) <= 60.f)
+    {
+        if (VRModApis::KnowsGrabs())
+            held = held || VRModApis::HeldByHand(side) == pRef->formID;
+        else if (glm::vec3 hand{}; VRBodySync::PressedHand(side, hand) && VRBodySync::NearestNodeTo(pRef, hand) <= 60.f)
             held = true;
+    }
     if (held)
     {
         pMotion->PulledUnheldSince = {};

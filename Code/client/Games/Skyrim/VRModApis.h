@@ -150,6 +150,12 @@ void TakeHandEvents(std::vector<HandEvent>& aEvents) noexcept;
 //! Says once in the log what arrived, or after 30 s that the bridge is not there.
 void Poll() noexcept;
 
+//! The reference HIGGS says this player's hand holds right now (0 left, 1 right), or 0: nothing, or HIGGS is not there.
+//! Ask KnowsGrabs first: without HIGGS a 0 says nothing. Call it on the game's main thread.
+//! HIGGS takes only what this game simulates; a thing held still here for another player's game never shows up.
+uint32_t HeldByHand(uint8_t aSide) noexcept;
+bool KnowsGrabs() noexcept;
+
 //! Null until Poll has found them, and for good if that mod is not installed.
 HiggsInterface* Higgs() noexcept;
 PlanckInterface* Planck() noexcept;

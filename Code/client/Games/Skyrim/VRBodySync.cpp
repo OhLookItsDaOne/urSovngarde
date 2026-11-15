@@ -2,6 +2,7 @@
 
 #include <Games/Skyrim/VRBodySync.h>
 #include <Games/Skyrim/VRHaptics.h>
+#include <Games/Skyrim/VRModApis.h>
 #include <Games/Skyrim/GameSound.h>
 
 #include <Actor.h>
@@ -5836,6 +5837,22 @@ bool IsRemoteBodyGrabbedHere(Actor* apActor, const glm::vec3& acOwnerPosition) n
         watch.LastMoved = {};
         watch.Reported = false;
         return false;
+    }
+
+    // HIGGS knows whether a hand of this player's holds the body; the motion test below is the guess for a game without it.
+    if (VRModApis::KnowsGrabs())
+    {
+        const bool cHeld = VRModApis::HeldByHand(0) == apActor->formID || VRModApis::HeldByHand(1) == apActor->formID;
+        if (!cHeld)
+        {
+            watch.Reported = false;
+            return false;
+        }
+        if (watch.Reported)
+            return false;
+        watch.Reported = true;
+        spdlog::info("Body {:X}: HIGGS says a hand of this player's holds it", apActor->formID);
+        return true;
     }
 
     // The same 4 units CaptureBodyPose uses: a settled ragdoll still twitches.
