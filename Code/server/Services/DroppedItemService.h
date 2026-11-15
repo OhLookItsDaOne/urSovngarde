@@ -96,6 +96,10 @@ private:
 
     //! What each hand holds by its player's HIGGS. Key: player id * 2 + hand; value: the kind (RequestGrabReport's) and the thing's hold key.
     std::map<uint64_t, std::pair<uint8_t, uint64_t>> m_grabs;
+    //! Whether a hand of this player's holds the thing, by m_grabs.
+    bool HasInHand(const Player* apPlayer, uint8_t aKind, uint64_t aThing) const noexcept;
+    //! Another player than apPlayer who has the thing in a hand and is still connected, or null.
+    Player* OtherHandOn(const Player* apPlayer, uint8_t aKind, uint64_t aThing) noexcept;
 
     World& m_world;
     std::map<uint32_t, Item> m_items;

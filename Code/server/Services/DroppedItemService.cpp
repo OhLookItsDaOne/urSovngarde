@@ -142,6 +142,21 @@ void DroppedItemService::OnMove(const PacketEvent<RequestDroppedItemMove>& acMes
     if (it == m_items.end())
         return; // picked up meanwhile
 
+    // Held by two players: the one who is not the holder sends its moves too. They go only to the others with a hand on it,
+    // whose games pull their copy toward it; everyone else follows the holder.
+    if (const Player* pHolder = HolderOf(m_itemHolds, message.Id); pHolder && pHolder != acMessage.pPlayer && HasInHand(acMessage.pPlayer, RequestGrabReport::kDroppedItem, message.Id))
+    {
+        NotifyDroppedItemMove second{};
+        second.Id = message.Id;
+        second.Position = message.Position;
+        second.Rotation = message.Rotation;
+        second.AtRest = false;
+        for (Player* pPlayer : m_world.GetPlayerManager())
+            if (pPlayer != acMessage.pPlayer && HasInHand(pPlayer, RequestGrabReport::kDroppedItem, message.Id))
+                pPlayer->Send(second);
+        return;
+    }
+
     if (!TakeHold(m_itemHolds, message.Id, acMessage.pPlayer, message.AtRest, "dropped item"))
         return;
 
@@ -171,6 +186,21 @@ void DroppedItemService::OnObjectMove(const PacketEvent<RequestWorldObjectMove>&
 {
     const auto& message = acMessage.Packet;
     const uint64_t cKey = (static_cast<uint64_t>(message.ObjectId.ModId) << 32) | message.ObjectId.BaseId;
+
+    // As for a dropped item (OnMove): the second of two players holding it.
+    if (const Player* pHolder = HolderOf(m_objectHolds, cKey); !message.Taken && pHolder && pHolder != acMessage.pPlayer && HasInHand(acMessage.pPlayer, RequestGrabReport::kWorldObject, cKey))
+    {
+        NotifyWorldObjectMove second{};
+        second.ObjectId = message.ObjectId;
+        second.CellId = message.CellId;
+        second.WorldSpaceId = message.WorldSpaceId;
+        second.Position = message.Position;
+        second.Rotation = message.Rotation;
+        for (Player* pPlayer : m_world.GetPlayerManager())
+            if (pPlayer != acMessage.pPlayer && HasInHand(pPlayer, RequestGrabReport::kWorldObject, cKey))
+                pPlayer->Send(second);
+        return;
+    }
 
     // Taken into an inventory: nobody holds it any more, whoever did.
     if (message.Taken)
@@ -250,7 +280,26 @@ void DroppedItemService::OnGrabReport(const PacketEvent<RequestGrabReport>& acMe
         const uint64_t cThing = cObject ? (static_cast<uint64_t>(message.ObjectId.ModId) << 32) | message.ObjectId.BaseId : message.ServerId;
 
         if (message.Event == RequestGrabReport::kLetGo || message.Kind == RequestGrabReport::kUnknown)
+        {
             m_grabs.erase(cHand);
+
+            // The holder let go of a thing another player still has in a hand: that player's game is the one to follow now.
+            if ((cObject || message.Kind == RequestGrabReport::kDroppedItem) && !HasInHand(pPlayer, message.Kind, cThing))
+            {
+                auto& holds = cObject ? m_objectHolds : m_itemHolds;
+                if (HolderOf(holds, cThing) == pPlayer)
+                {
+                    if (const Player* pOther = OtherHandOn(pPlayer, message.Kind, cThing))
+                    {
+                        Hold& hold = holds[cThing];
+                        hold.PlayerId = pOther->GetId();
+                        hold.LastMove = std::chrono::steady_clock::now();
+                        spdlog::info("Referee: player {:X} let go of {} {:X}, which player {:X} still has in a hand; it is theirs now", pPlayer->GetId(), cObject ? "world object" : "dropped item",
+                                     cThing, pOther->GetId());
+                    }
+                }
+            }
+        }
         else
         {
             m_grabs[cHand] = {message.Kind, cThing};
@@ -398,6 +447,30 @@ bool DroppedItemService::TakeHold(std::map<uint64_t, Hold>& aHolds, const uint64
     hold.PlayerId = apPlayer->GetId();
     hold.LastMove = cNow;
     return true;
+}
+
+bool DroppedItemService::HasInHand(const Player* apPlayer, const uint8_t aKind, const uint64_t aThing) const noexcept
+{
+    for (uint64_t hand = 0; hand < 2; ++hand)
+    {
+        const auto cGrab = m_grabs.find((static_cast<uint64_t>(apPlayer->GetId()) << 1) | hand);
+        if (cGrab != m_grabs.end() && cGrab->second.first == aKind && cGrab->second.second == aThing)
+            return true;
+    }
+    return false;
+}
+
+Player* DroppedItemService::OtherHandOn(const Player* apPlayer, const uint8_t aKind, const uint64_t aThing) noexcept
+{
+    for (const auto& [hand, grab] : m_grabs)
+    {
+        const uint32_t cOther = static_cast<uint32_t>(hand >> 1);
+        if (cOther == apPlayer->GetId() || grab.first != aKind || grab.second != aThing)
+            continue;
+        if (Player* pOther = m_world.GetPlayerManager().GetById(cOther))
+            return pOther;
+    }
+    return nullptr;
 }
 
 Player* DroppedItemService::HolderOf(const std::map<uint64_t, Hold>& acHolds, const uint64_t aKey) const noexcept

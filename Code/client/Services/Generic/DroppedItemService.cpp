@@ -949,8 +949,8 @@ void DroppedItemService::OnNotifyWorldObjectMove(const NotifyWorldObjectMove& ac
 
     const auto now = std::chrono::steady_clock::now();
     Motion& motion = m_objectMotion[cFormId];
-    // In this player's hand: the game that moved it before is still sending for a moment, until the referee has given it over.
-    if (IsInOwnHand(cFormId, motion, now))
+    // In this player's hand: not followed. See SharedMove.
+    if (SharedMove(RequestPull::kWorldObject, 0, acMessage.ObjectId, pRef, motion, glm::vec3(acMessage.Position), now))
         return;
     if (acMessage.AtRest)
     {
@@ -1003,7 +1003,7 @@ void DroppedItemService::OnNotifyDroppedItemMove(const NotifyDroppedItemMove& ac
     const auto now = std::chrono::steady_clock::now();
 
     // As for a world object (OnNotifyWorldObjectMove).
-    if (IsInOwnHand(it->second, motion, now))
+    if (SharedMove(RequestPull::kDroppedItem, acMessage.Id, GameId{}, pRef, motion, glm::vec3(acMessage.Position), now))
         return;
 
     if (acMessage.AtRest)
@@ -1232,11 +1232,12 @@ void DroppedItemService::RunPulls(const std::chrono::steady_clock::time_point aN
         if (found.FormId == 0)
             continue;
 
-        // Nobody has it in a hand (it flies, rolls, or was just let go): a new press takes it at once.
-        // It becomes this game's to simulate, HIGGS is told to take it into the hand, and the server gives this player the hold on HIGGS's report.
-        // With another player's hand on it, the hand is sent over there as before (below).
-        if (cEdge && found.Kind != RequestPull::kActor && VRModApis::KnowsGrabs() && !IsInAnotherHand(found.Kind, found.ServerId, found.ObjectId))
+        // A new press takes it at once: it becomes this game's to simulate, and HIGGS is told to take it into the hand.
+        // Nobody else has it in a hand (it flies, rolls, or was just let go): the server gives this player the hold on HIGGS's report.
+        // Another player has it in a hand: both hold it from now on, each in their own game (SharedMove).
+        if (cEdge && found.Kind != RequestPull::kActor && VRModApis::KnowsGrabs())
         {
+            const bool cShared = IsInAnotherHand(found.Kind, found.ServerId, found.ObjectId);
             TESObjectREFR* pRef = Cast<TESObjectREFR>(TESForm::GetById(found.FormId));
             Motion* pMotion = nullptr;
             if (found.Kind == RequestPull::kWorldObject)
@@ -1259,8 +1260,8 @@ void DroppedItemService::RunPulls(const std::chrono::steady_clock::time_point aN
                 pMotion->LastPosition = WorldPositionOf(pRef);
                 pMotion->LastRotation = RotationOf(pRef);
                 VRModApis::Higgs()->GrabObject(pRef, side == 0);
-                spdlog::info("GrabNow: this player's {} hand pressed {:.0f} units from {:X}, which another game moved and nobody held; taken here and given to HIGGS", side ? "right" : "left",
-                             nearest, found.FormId);
+                spdlog::info("GrabNow: this player's {} hand pressed {:.0f} units from {:X}, which another game moved and {}; taken here and given to HIGGS", side ? "right" : "left",
+                             nearest, found.FormId, cShared ? "another player has in a hand: held by both now" : "nobody held");
                 continue;
             }
         }
@@ -1341,6 +1342,31 @@ bool DroppedItemService::IsInAnotherHand(const uint8_t aKind, const uint32_t aSe
             return true;
     }
     return false;
+}
+
+bool DroppedItemService::SharedMove(const uint8_t aKind, const uint32_t aServerId, const GameId& acObjectId, TESObjectREFR* apRef, Motion& aMotion, const glm::vec3& acPosition,
+                                    const std::chrono::steady_clock::time_point aNow) noexcept
+{
+    if (!apRef || !IsInOwnHand(apRef->formID, aMotion, aNow))
+        return false;
+
+    // Nobody else holds it: these are the last moves of the game that had it before, until the referee has given it over. Ignored.
+    if (!IsInAnotherHand(aKind, aServerId, acObjectId))
+        return true;
+
+    // EXPERIMENTAL: only where it is, not how it is turned; each hand turns its own copy.
+    // The key names this thing, not a hand: two things held by both are pulled separately.
+    const uint64_t cKey = 0xC000000000000000ull | (static_cast<uint64_t>(apRef->formID) << 1);
+    const bool cPulled = VRBodySync::PullBody(cKey, apRef, acPosition);
+    // Carried, not put down, while the other player moves it under this hand.
+    aMotion.LastLocalMove = aNow;
+    if (aNow - aMotion.SharedLogAt > std::chrono::seconds(2))
+    {
+        aMotion.SharedLogAt = aNow;
+        spdlog::info("Shared: {:X} is in this player's hand and in another player's; their game has it {:.0f} units from where it is here{}", apRef->formID,
+                     glm::distance(acPosition, WorldPositionOf(apRef)), cPulled ? ", pulled toward it" : ", not pulled");
+    }
+    return true;
 }
 
 bool DroppedItemService::IsInOwnHand(const uint32_t aFormId, const Motion& acMotion, const std::chrono::steady_clock::time_point aNow) const noexcept
