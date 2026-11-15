@@ -202,7 +202,7 @@ void DroppedItemService::OnObjectMove(const PacketEvent<RequestWorldObjectMove>&
 }
 
 // TEMPORARY: what HIGGS told a player's game about one of its hands, logged as it arrived, to compare with that player's own log.
-void DroppedItemService::OnGrabReport(const PacketEvent<RequestGrabReport>& acMessage) const noexcept
+void DroppedItemService::OnGrabReport(const PacketEvent<RequestGrabReport>& acMessage) noexcept
 {
     const auto& message = acMessage.Packet;
     const Player* pPlayer = acMessage.pPlayer;
@@ -240,6 +240,58 @@ void DroppedItemService::OnGrabReport(const PacketEvent<RequestGrabReport>& acMe
     else
         spdlog::info("Grab: player {} '{}' {} hand {} {} (their reference {:X})", pPlayer->GetId(), pPlayer->GetUsername().c_str(), cpHand,
                      message.Event == RequestGrabReport::kLetGo ? "let go of" : "pulled toward itself", what, message.FormId);
+
+    // The referee: a hand that really closes on a thing no other hand holds gets it at once, whoever moved it until now.
+    // A thrown item is caught this way without waiting for its thrower's game to let go.
+    if (message.Event != RequestGrabReport::kPulled)
+    {
+        const uint64_t cHand = (static_cast<uint64_t>(pPlayer->GetId()) << 1) | (message.Hand & 1);
+        const bool cObject = message.Kind == RequestGrabReport::kWorldObject;
+        const uint64_t cThing = cObject ? (static_cast<uint64_t>(message.ObjectId.ModId) << 32) | message.ObjectId.BaseId : message.ServerId;
+
+        if (message.Event == RequestGrabReport::kLetGo || message.Kind == RequestGrabReport::kUnknown)
+            m_grabs.erase(cHand);
+        else
+        {
+            m_grabs[cHand] = {message.Kind, cThing};
+
+            if (cObject || message.Kind == RequestGrabReport::kDroppedItem)
+            {
+                uint32_t otherHolder = 0;
+                bool inAnotherHand = false;
+                for (auto it = m_grabs.begin(); it != m_grabs.end();)
+                {
+                    const uint32_t cOther = static_cast<uint32_t>(it->first >> 1);
+                    if (!m_world.GetPlayerManager().GetById(cOther))
+                    {
+                        it = m_grabs.erase(it);
+                        continue;
+                    }
+                    if (cOther != pPlayer->GetId() && it->second.first == message.Kind && it->second.second == cThing)
+                    {
+                        inAnotherHand = true;
+                        otherHolder = cOther;
+                    }
+                    ++it;
+                }
+
+                auto& holds = cObject ? m_objectHolds : m_itemHolds;
+                const Player* pBefore = HolderOf(holds, cThing);
+                if (inAnotherHand)
+                    spdlog::info("Referee: player {:X} grabbed {} {:X}, which player {:X} has in a hand too; the hold stays as it is", pPlayer->GetId(), cObject ? "world object" : "dropped item",
+                                 cThing, otherHolder);
+                else
+                {
+                    if (pBefore && pBefore != pPlayer)
+                        spdlog::info("Referee: player {:X} grabbed {} {:X} out of player {:X}'s motion; it is theirs now", pPlayer->GetId(), cObject ? "world object" : "dropped item", cThing,
+                                     pBefore->GetId());
+                    Hold& hold = holds[cThing];
+                    hold.PlayerId = pPlayer->GetId();
+                    hold.LastMove = std::chrono::steady_clock::now();
+                }
+            }
+        }
+    }
 
     // Passed on to the players around, so each game knows what the others' hands hold. A thing only their game has means nothing to anyone else.
     if (message.Kind == RequestGrabReport::kUnknown)

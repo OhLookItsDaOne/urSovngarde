@@ -222,6 +222,7 @@ void DroppedItemService::OnDisconnected(const DisconnectedEvent&) noexcept
     // Ids belong to one server session's view; a reconnect gets them again with the next cell entry.
     m_refById.clear();
     m_idByRef.clear();
+    m_remoteGrabs.clear();
     m_pending.clear();
     m_announced.clear();
     m_reportedOldDrops = false;
@@ -948,6 +949,9 @@ void DroppedItemService::OnNotifyWorldObjectMove(const NotifyWorldObjectMove& ac
 
     const auto now = std::chrono::steady_clock::now();
     Motion& motion = m_objectMotion[cFormId];
+    // In this player's hand: the game that moved it before is still sending for a moment, until the referee has given it over.
+    if (IsInOwnHand(cFormId, motion, now))
+        return;
     if (acMessage.AtRest)
     {
         // A put-down from the game that had it before, while this player carries it: it is this game's now, and stays in the hand.
@@ -997,6 +1001,10 @@ void DroppedItemService::OnNotifyDroppedItemMove(const NotifyDroppedItemMove& ac
         return;
 
     const auto now = std::chrono::steady_clock::now();
+
+    // As for a world object (OnNotifyWorldObjectMove).
+    if (IsInOwnHand(it->second, motion, now))
+        return;
 
     if (acMessage.AtRest)
     {
@@ -1224,6 +1232,39 @@ void DroppedItemService::RunPulls(const std::chrono::steady_clock::time_point aN
         if (found.FormId == 0)
             continue;
 
+        // Nobody has it in a hand (it flies, rolls, or was just let go): a new press takes it at once.
+        // It becomes this game's to simulate, HIGGS is told to take it into the hand, and the server gives this player the hold on HIGGS's report.
+        // With another player's hand on it, the hand is sent over there as before (below).
+        if (cEdge && found.Kind != RequestPull::kActor && VRModApis::KnowsGrabs() && !IsInAnotherHand(found.Kind, found.ServerId, found.ObjectId))
+        {
+            TESObjectREFR* pRef = Cast<TESObjectREFR>(TESForm::GetById(found.FormId));
+            Motion* pMotion = nullptr;
+            if (found.Kind == RequestPull::kWorldObject)
+            {
+                if (const auto cMotion = m_objectMotion.find(found.FormId); cMotion != m_objectMotion.end())
+                    pMotion = &cMotion->second;
+            }
+            else if (const auto cMotion = m_motion.find(found.ServerId); cMotion != m_motion.end())
+                pMotion = &cMotion->second;
+
+            if (pRef && pMotion)
+            {
+                if (pMotion->Held)
+                    pRef->SetMotionType(TESObjectREFR::kMotionDynamic);
+                pMotion->Held = false;
+                pMotion->Moving = true;
+                pMotion->LastLocalMove = aNow;
+                pMotion->QuietUntil = {};
+                pMotion->TakenUntil = aNow + std::chrono::milliseconds(500);
+                pMotion->LastPosition = WorldPositionOf(pRef);
+                pMotion->LastRotation = RotationOf(pRef);
+                VRModApis::Higgs()->GrabObject(pRef, side == 0);
+                spdlog::info("GrabNow: this player's {} hand pressed {:.0f} units from {:X}, which another game moved and nobody held; taken here and given to HIGGS", side ? "right" : "left",
+                             nearest, found.FormId);
+                continue;
+            }
+        }
+
         found.Active = true;
         found.WasPressed = true;
         found.Since = aNow;
@@ -1286,6 +1327,27 @@ void DroppedItemService::RunGrabReports() noexcept
 
         m_transport.Send(report);
     }
+}
+
+bool DroppedItemService::IsInAnotherHand(const uint8_t aKind, const uint32_t aServerId, const GameId& acObjectId) const noexcept
+{
+    // RequestPull and RequestGrabReport number the kinds differently.
+    const uint8_t cKind = aKind == RequestPull::kWorldObject ? RequestGrabReport::kWorldObject : aKind == RequestPull::kDroppedItem ? RequestGrabReport::kDroppedItem : RequestGrabReport::kActor;
+    for (const auto& [key, grab] : m_remoteGrabs)
+    {
+        if (grab.Kind != cKind)
+            continue;
+        if (cKind == RequestGrabReport::kWorldObject ? grab.ObjectId == acObjectId : grab.ServerId == aServerId)
+            return true;
+    }
+    return false;
+}
+
+bool DroppedItemService::IsInOwnHand(const uint32_t aFormId, const Motion& acMotion, const std::chrono::steady_clock::time_point aNow) const noexcept
+{
+    if (aNow < acMotion.TakenUntil)
+        return true;
+    return VRModApis::KnowsGrabs() && (VRModApis::HeldByHand(0) == aFormId || VRModApis::HeldByHand(1) == aFormId);
 }
 
 // Kept per player and hand, for placing the thing in the copy's hand and for the hand as a second grip (both still to be built on it).

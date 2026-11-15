@@ -106,6 +106,8 @@ private:
         bool RemoteAtRest{};
         //! Its 3D was there on the last pass. A cell loading settles every item in it, which is not a move.
         bool Loaded{};
+        //! This player just took it out of another game's motion (RunPulls): until then that game's last moves of it are not followed.
+        std::chrono::steady_clock::time_point TakenUntil{};
         //! Since when another player's hand pulls it here while no hand of this player's is on it; empty while one is.
         std::chrono::steady_clock::time_point PulledUnheldSince{};
         //! A 3D load in a fresh drop's first two seconds is part of the throw, not a cell reload.
@@ -150,6 +152,10 @@ private:
         std::chrono::steady_clock::time_point Since{};
     };
     std::unordered_map<uint64_t, RemoteGrab> m_remoteGrabs;
+    //! Whether another player's hand holds this thing, by what their HIGGS said (kind and ids as in RequestGrabReport).
+    bool IsInAnotherHand(uint8_t aKind, uint32_t aServerId, const GameId& acObjectId) const noexcept;
+    //! Whether this player has the thing in a hand: HIGGS holds it, or it was just taken and HIGGS is about to.
+    bool IsInOwnHand(uint32_t aFormId, const Motion& acMotion, std::chrono::steady_clock::time_point aNow) const noexcept;
 
     //! Old drops already announced this session, so a cell change does not send them again.
     std::unordered_set<uint32_t> m_announced;

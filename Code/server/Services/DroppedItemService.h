@@ -49,7 +49,7 @@ private:
     void OnMove(const PacketEvent<RequestDroppedItemMove>& acMessage) noexcept;
     void OnObjectMove(const PacketEvent<RequestWorldObjectMove>& acMessage) noexcept;
     void OnPull(const PacketEvent<RequestPull>& acMessage) const noexcept;
-    void OnGrabReport(const PacketEvent<RequestGrabReport>& acMessage) const noexcept;
+    void OnGrabReport(const PacketEvent<RequestGrabReport>& acMessage) noexcept;
     void OnEnterInteriorCell(const PacketEvent<EnterInteriorCellRequest>& acMessage) const noexcept;
     void OnEnterExteriorCell(const PacketEvent<EnterExteriorCellRequest>& acMessage) const noexcept;
     void OnShiftGridCell(const PacketEvent<ShiftGridCellRequest>& acMessage) const noexcept;
@@ -93,6 +93,9 @@ private:
     Player* HolderOf(const std::map<uint64_t, Hold>& acHolds, uint64_t aKey) const noexcept;
     std::map<uint64_t, Hold> m_objectHolds;
     std::map<uint64_t, Hold> m_itemHolds;
+
+    //! What each hand holds by its player's HIGGS. Key: player id * 2 + hand; value: the kind (RequestGrabReport's) and the thing's hold key.
+    std::map<uint64_t, std::pair<uint8_t, uint64_t>> m_grabs;
 
     World& m_world;
     std::map<uint32_t, Item> m_items;
