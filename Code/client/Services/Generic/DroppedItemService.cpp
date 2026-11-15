@@ -223,6 +223,7 @@ void DroppedItemService::OnDisconnected(const DisconnectedEvent&) noexcept
     m_refById.clear();
     m_idByRef.clear();
     m_remoteGrabs.clear();
+    VRBodySync::ClearBodiesInOtherHands();
     m_pending.clear();
     m_announced.clear();
     m_reportedOldDrops = false;
@@ -672,6 +673,7 @@ void DroppedItemService::OnUpdate(const UpdateEvent&) noexcept
 
     UpdateWorldObjects(now);
     RunPulls(now);
+    RunSharedBodies();
     RunGrabReports();
 }
 
@@ -1216,7 +1218,8 @@ void DroppedItemService::RunPulls(const std::chrono::steady_clock::time_point aN
                 const uint32_t cFormId = view.get<FormIdComponent>(cEntity).Id;
                 Actor* pActor = Cast<Actor>(TESForm::GetById(cFormId));
                 // A body its owner is carrying; one that lies still is taken over by grabbing it, as before (IsRemoteBodyGrabbedHere).
-                if (!cEdge || !pActor || !pActor->actorState.IsDead() || !VRBodySync::IsBodyMovedByOwner(cFormId) || otherInHand(cFormId))
+                // With HIGGS the hand takes this game's copy of the body itself, and the two games pull on each other (RunSharedBodies).
+                if (VRModApis::KnowsGrabs() || !cEdge || !pActor || !pActor->actorState.IsDead() || !VRBodySync::IsBodyMovedByOwner(cFormId) || otherInHand(cFormId))
                     continue;
                 if (const float cApart = VRBodySync::NearestNodeTo(pActor, hand); cApart < nearest)
                 {
@@ -1421,6 +1424,7 @@ void DroppedItemService::OnNotifyGrab(const NotifyGrab& acMessage) noexcept
             spdlog::info("RemoteGrab: player {}'s {} hand let go of {} {:X} (here {:X}); no grab of it was known here", acMessage.PlayerId, cpHand, cpKind, acMessage.ServerId, formId);
             return;
         }
+        VRBodySync::SetBodyInAnotherHand(cKey, 0);
         spdlog::info("RemoteGrab: player {}'s {} hand let go of {} {:X} (here {:X}) after {:.1f} s", acMessage.PlayerId, cpHand, cpKind, acMessage.ServerId, formId,
                      std::chrono::duration<float>(std::chrono::steady_clock::now() - cGrab->second.Since).count());
         m_remoteGrabs.erase(cGrab);
@@ -1443,7 +1447,55 @@ void DroppedItemService::OnNotifyGrab(const NotifyGrab& acMessage) noexcept
 
     spdlog::info("RemoteGrab: player {}'s {} hand grabbed {} {:X} (here {:X}{}) at node '{}', node in hand space at ({:.1f}, {:.1f}, {:.1f})", acMessage.PlayerId, cpHand, cpKind,
                  acMessage.ServerId, formId, formId ? "" : ", not loaded here", grab.NodeName, grab.Position[0], grab.Position[1], grab.Position[2]);
+    VRBodySync::SetBodyInAnotherHand(cKey, acMessage.Kind == RequestGrabReport::kActor ? formId : 0);
     m_remoteGrabs[cKey] = std::move(grab);
+}
+
+// EXPERIMENTAL. The other player's hand is read from their copy here, so nothing more is sent for it.
+void DroppedItemService::RunSharedBodies() noexcept
+{
+    for (auto& [key, grab] : m_remoteGrabs)
+    {
+        if (grab.Kind != RequestGrabReport::kActor || grab.FormId == 0)
+            continue;
+        Actor* pBody = Cast<Actor>(TESForm::GetById(grab.FormId));
+        if (!pBody || pBody->formID == 0x14 || !pBody->actorState.IsDead() || !pBody->GetNiNode())
+            continue;
+
+        // Only where this game simulates the body: its owner's game, or one whose player has it in a hand too.
+        bool mine = VRModApis::KnowsGrabs() && (VRModApis::HeldByHand(0) == grab.FormId || VRModApis::HeldByHand(1) == grab.FormId);
+        const char* cpWhy = "this player holds it too";
+        if (!mine)
+        {
+            auto view = m_world.view<LocalComponent, FormIdComponent>();
+            for (const auto cEntity : view)
+                if (view.get<FormIdComponent>(cEntity).Id == grab.FormId)
+                    mine = true;
+            cpWhy = "this game owns it";
+        }
+        if (!mine)
+            continue;
+
+        Actor* pCopy = nullptr;
+        {
+            auto view = m_world.view<FormIdComponent, PlayerComponent>();
+            for (const auto cEntity : view)
+                if (view.get<PlayerComponent>(cEntity).Id == static_cast<uint32_t>(key >> 1))
+                    pCopy = Cast<Actor>(TESForm::GetById(view.get<FormIdComponent>(cEntity).Id));
+        }
+        glm::vec3 hand{};
+        if (!pCopy || pCopy->formID == 0x14 || !VRBodySync::CopyHandPosition(pCopy, static_cast<uint8_t>(key & 1), hand))
+            continue;
+
+        const bool cPulled = VRBodySync::PullBody(key, pBody, hand);
+        const auto cNow = std::chrono::steady_clock::now();
+        if (cNow - grab.SharedLogAt > std::chrono::seconds(2))
+        {
+            grab.SharedLogAt = cNow;
+            spdlog::info("SharedBody: player {}'s {} hand holds body {:X} at '{}', and {}; its nearest part is {:.0f} units from that hand here{}", key >> 1, (key & 1) ? "right" : "left",
+                         grab.FormId, grab.NodeName, cpWhy, VRBodySync::NearestNodeTo(pBody, hand), cPulled ? ", pulled toward it" : ", not pulled");
+        }
+    }
 }
 
 void DroppedItemService::OnNotifyPull(const NotifyPull& acMessage) noexcept

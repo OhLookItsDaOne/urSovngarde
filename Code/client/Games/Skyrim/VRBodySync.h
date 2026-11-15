@@ -119,6 +119,12 @@ bool PressedHand(uint8_t aSide, glm::vec3& aAt) noexcept;
 float NearestNodeTo(TESObjectREFR* apRef, const glm::vec3& acPoint) noexcept;
 //! Whether the owner's bones moved this dead body here in the last two seconds: its owner is carrying it.
 bool IsBodyMovedByOwner(uint32_t aFormId) noexcept;
+//! Where a hand of another player's copy is in the world, left (0) or right (1): the copy's hand bone.
+bool CopyHandPosition(Actor* apCopy, uint8_t aSide, glm::vec3& aOut) noexcept;
+//! What other players' hands hold of the characters here, as their HIGGS said it. aHand: player id * 2 + hand; aFormId 0: that hand let go.
+void SetBodyInAnotherHand(uint64_t aHand, uint32_t aFormId) noexcept;
+void ClearBodiesInOtherHands() noexcept;
+bool IsBodyInAnotherHand(uint32_t aFormId) noexcept;
 //! In the game that moves the thing: pull its body nearest acHand toward acHand until EndPull, or until this is not called for 300 ms.
 //! aKey names the hand (player id << 1 | side). False if the thing has no body to pull near that hand.
 bool PullBody(uint64_t aKey, TESObjectREFR* apRef, const glm::vec3& acHand) noexcept;

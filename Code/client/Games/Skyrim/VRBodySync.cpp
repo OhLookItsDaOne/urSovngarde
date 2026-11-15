@@ -3646,6 +3646,14 @@ void OnFrameEnd() noexcept
                 s_bodyPosedByOwnerAt[formId] = now;
             }
 
+            // In this player's hand: this game simulates its own copy there, and the other player's hand pulls on it (RunSharedBodies).
+            // The owner's bones written over it would tear it out of the hand at every frame end.
+            if (VRModApis::KnowsGrabs() && (VRModApis::HeldByHand(0) == formId || VRModApis::HeldByHand(1) == formId))
+            {
+                whyNotPosed("it is in this player's hand");
+                continue;
+            }
+
             // The other half of the sender's line, so one log shows the whole chain.
             static std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> s_nextSaid;
             auto& next = s_nextSaid[formId];
@@ -4511,6 +4519,46 @@ float NearestNodeTo(TESObjectREFR* apRef, const glm::vec3& acPoint) noexcept
                 queue.push_back(pChildren[i]);
     }
     return nearest;
+}
+
+bool CopyHandPosition(Actor* apCopy, const uint8_t aSide, glm::vec3& aOut) noexcept
+{
+    void* pRoot = apCopy && aSide <= 1 ? static_cast<void*>(apCopy->GetNiNode()) : nullptr;
+    void* pHand = FindShallowest(pRoot, kHandNames[aSide <= 1 ? aSide : 0]);
+    if (!pHand)
+        return false;
+    aOut = ToGlm(At<NiTransform>(pHand, kWorldOffset).translate);
+    return true;
+}
+
+namespace
+{
+std::mutex s_otherHandsLock;
+std::unordered_map<uint64_t, uint32_t> s_otherHands;
+} // namespace
+
+void SetBodyInAnotherHand(const uint64_t aHand, const uint32_t aFormId) noexcept
+{
+    std::scoped_lock lock(s_otherHandsLock);
+    if (aFormId)
+        s_otherHands[aHand] = aFormId;
+    else
+        s_otherHands.erase(aHand);
+}
+
+void ClearBodiesInOtherHands() noexcept
+{
+    std::scoped_lock lock(s_otherHandsLock);
+    s_otherHands.clear();
+}
+
+bool IsBodyInAnotherHand(const uint32_t aFormId) noexcept
+{
+    std::scoped_lock lock(s_otherHandsLock);
+    for (const auto& [hand, formId] : s_otherHands)
+        if (formId == aFormId)
+            return true;
+    return false;
 }
 
 void EndPull(const uint64_t aKey) noexcept
@@ -5812,6 +5860,24 @@ bool IsRemoteBodyGrabbedHere(Actor* apActor, const glm::vec3& acOwnerPosition) n
         return false;
     }
 
+    // HIGGS knows whether a hand of this player's holds the body; everything below is the guess for a game without it.
+    // A grab wins at once, also while the owner's game still moves the body. Unless another player has it in a hand too:
+    // then both hold it, each in their own game (DroppedItemService::RunSharedBodies), and it is asked for when they let go.
+    if (VRModApis::KnowsGrabs())
+    {
+        const bool cHeld = VRModApis::HeldByHand(0) == apActor->formID || VRModApis::HeldByHand(1) == apActor->formID;
+        if (!cHeld || IsBodyInAnotherHand(apActor->formID))
+        {
+            watch.Reported = false;
+            return false;
+        }
+        if (watch.Reported)
+            return false;
+        watch.Reported = true;
+        spdlog::info("Body {:X}: HIGGS says a hand of this player's holds it, and no other player's does", apActor->formID);
+        return true;
+    }
+
     // Sampled every 100 ms, as the owner samples its own bodies (CaptureBodyPose, at the snapshot rate).
     // Per frame, the 4-unit step below would need 240 units a second at 60 fps, which a hand dragging a body never reaches.
     if (now - watch.SampledAt < std::chrono::milliseconds(100))
@@ -5837,22 +5903,6 @@ bool IsRemoteBodyGrabbedHere(Actor* apActor, const glm::vec3& acOwnerPosition) n
         watch.LastMoved = {};
         watch.Reported = false;
         return false;
-    }
-
-    // HIGGS knows whether a hand of this player's holds the body; the motion test below is the guess for a game without it.
-    if (VRModApis::KnowsGrabs())
-    {
-        const bool cHeld = VRModApis::HeldByHand(0) == apActor->formID || VRModApis::HeldByHand(1) == apActor->formID;
-        if (!cHeld)
-        {
-            watch.Reported = false;
-            return false;
-        }
-        if (watch.Reported)
-            return false;
-        watch.Reported = true;
-        spdlog::info("Body {:X}: HIGGS says a hand of this player's holds it", apActor->formID);
-        return true;
     }
 
     // The same 4 units CaptureBodyPose uses: a settled ragdoll still twitches.
