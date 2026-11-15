@@ -2506,7 +2506,7 @@ struct Pin
     void* pRoot = nullptr;     // the thing's 3D, referenced while pinned
     uint8_t* pHavok = nullptr; // its first body physics may move
     float Target[3]{};         // where that body belongs, in Havok units
-    float Offset[3]{};         // the body's place minus the place of the thing's 3D, in Havok units, when it was first pinned
+    float Offset[3]{};         // from the thing's 3D to the body, in Havok units, in the 3D's own axes, when it was first pinned
     std::chrono::steady_clock::time_point At{};
 };
 std::mutex s_pinsLock;
@@ -4717,8 +4717,14 @@ bool PinBody(TESObjectREFR* apRef, const glm::vec3* apPlace) noexcept
         fresh.pHavok = pFirst;
         // Where the body sits against the reference's 3D, and until a place is given, where it is now.
         const float* pAt = reinterpret_cast<const float*>(pFirst + kBodyTranslationOffset);
-        const glm::vec3 cRootAt = ToGlm(At<NiTransform>(pRoot, kWorldOffset).translate) * cScale;
-        fresh.Offset[0] = pAt[0] - cRootAt.x, fresh.Offset[1] = pAt[1] - cRootAt.y, fresh.Offset[2] = pAt[2] - cRootAt.z;
+        // Kept in the 3D's own axes: a sword's body sits well away from its 3D's origin, and in world axes that offset was
+        // wrong as soon as the sword turned. The pin then drove the body off the place the move had just put it, every
+        // step, and it shook (two players, 2026-11-15: swords shook, bows a little, small things not).
+        const auto& cRootWorld = At<NiTransform>(pRoot, kWorldOffset);
+        const glm::vec3 cRootAt = ToGlm(cRootWorld.translate) * cScale;
+        const glm::vec3 cOffset = glm::transpose(ToGlm(cRootWorld.rotate)) * (glm::vec3{pAt[0], pAt[1], pAt[2]} - cRootAt);
+        fresh.Offset[0] = cOffset.x, fresh.Offset[1] = cOffset.y, fresh.Offset[2] = cOffset.z;
+        spdlog::info("Pin: {:X} is pinned for another game; its body is {:.1f} units from its 3D's origin", apRef->formID, glm::length(cOffset) / cScale);
         fresh.Target[0] = pAt[0], fresh.Target[1] = pAt[1], fresh.Target[2] = pAt[2];
         static_cast<NiRefObject*>(pRoot)->IncRef();
         s_pins.push_back(fresh);
@@ -4726,9 +4732,11 @@ bool PinBody(TESObjectREFR* apRef, const glm::vec3* apPlace) noexcept
     }
     if (apPlace)
     {
-        pin->Target[0] = apPlace->x * cScale + pin->Offset[0];
-        pin->Target[1] = apPlace->y * cScale + pin->Offset[1];
-        pin->Target[2] = apPlace->z * cScale + pin->Offset[2];
+        // Turned as the 3D is turned now. That is the turn of the frame before; it changes little in one frame.
+        const glm::vec3 cOffset = ToGlm(At<NiTransform>(pRoot, kWorldOffset).rotate) * glm::vec3{pin->Offset[0], pin->Offset[1], pin->Offset[2]};
+        pin->Target[0] = apPlace->x * cScale + cOffset.x;
+        pin->Target[1] = apPlace->y * cScale + cOffset.y;
+        pin->Target[2] = apPlace->z * cScale + cOffset.z;
     }
     pin->At = cNow;
     return true;
