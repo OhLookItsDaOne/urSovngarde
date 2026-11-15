@@ -726,6 +726,9 @@ void GameServer::OnDisconnection(const ConnectionId_t aConnectionId, EDisconnect
             std::erase(ownerComponent.InvalidOwners, pPlayer);
             if (ownerComponent.GetOwner() == pPlayer)
             {
+                // The leaver's character goes with it, so no NPC is handed on fighting it.
+                if (playerCharacter)
+                    m_pWorld->GetPresenceService().ForgetFightWith(entity, *playerCharacter);
                 m_pWorld->GetDispatcher().enqueue(OwnershipTransferEvent(entity));
             }
         }

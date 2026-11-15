@@ -16,6 +16,7 @@
 #include <Combat/CombatController.h>
 #include <CrashHandler.h>
 #include <RecentModelChanges.h>
+#include <SceneLines.h>
 
 #include <Events/HealthChangeEvent.h>
 #include <Events/InventoryChangeEvent.h>
@@ -522,6 +523,12 @@ void Actor::StopCombat() noexcept
 {
     PAPYRUS_FUNCTION(void, Actor, StopCombat);
     s_pStopCombat(this);
+}
+
+bool Actor::IsHostileToActor(Actor* apActor) noexcept
+{
+    PAPYRUS_FUNCTION(bool, Actor, IsHostileToActor, Actor*);
+    return apActor && s_pIsHostileToActor(this, apActor);
 }
 
 bool Actor::RemoveSpell(MagicItem* apSpell) noexcept
@@ -1809,6 +1816,9 @@ float TP_MAKE_THISCALL(HookSpeakSoundFunction, Actor, const char* apName, uint32
 
     if (cShouldSync)
         World::Get().GetRunner().Trigger(DialogueEvent(apThis->formID, apName, sceneId, scenePhase));
+    // A copy speaking in a scene shows the scene runs here too, so lines of it from the speakers' owners are left to it.
+    else if (sceneId && pSpeakerExtension && pSpeakerExtension->IsRemote())
+        SceneLines::NoteCopyLine(sceneId);
 
     return TiltedPhoques::ThisCall(RealSpeakSoundFunction, apThis, apName, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
 }
