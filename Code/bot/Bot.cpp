@@ -485,6 +485,19 @@ void Bot::Tick() noexcept
         }
         if (!m_replaying && !m_quiet && now - m_lastMovement >= kMovementPeriod)
             SendMovement();
+        // "carryitem": the drop is said to be at this bot's hand 20 times a second, as a game sends a thing its player carries.
+        if (m_carryHeight >= 0.f && !m_drops.empty() && now - m_lastCarry >= std::chrono::milliseconds(50))
+        {
+            m_lastCarry = now;
+            const uint32_t id = DropToHandle();
+            const glm::vec3 place = m_position + glm::vec3(0.f, 0.f, m_carryHeight);
+            m_dropPlaces[id] = place;
+            RequestDroppedItemMove request{};
+            request.Id = id;
+            request.Position = place;
+            request.AtRest = false;
+            SendMsg(request);
+        }
         if (m_speechNext < m_speech.size())
             UpdateSpeech(now);
         if (m_healthRestorePending && now >= m_healthRestoreAt)
@@ -3080,11 +3093,25 @@ bool Bot::StepCommand(const Command& acCommand, const bool aFirstTick) noexcept
         return true;
     }
 
+    // "carryitem <height>|off": from now on this bot's drop goes where the bot goes, that far above its feet, until "carryitem off".
+    if (name == "carryitem")
+    {
+        m_carryHeight = !args.empty() && args[0] == "off" ? -1.f : arg(0, 90.f);
+        spdlog::info("[script] carryitem: {}", m_carryHeight < 0.f ? std::string("off") : fmt::format("the drop goes along, {:.0f} units above the feet", m_carryHeight));
+        return true;
+    }
+
+    // "grabreport grabbed|letgo [left|right] [npc]": with "npc" the hand is on the NPC this bot owns (its body), not on the drop.
     // "grabreport grabbed|letgo [left|right]": says what a player's HIGGS says when a hand closes on this bot's drop or opens.
     // The server then counts the item as in this bot's hand, and tells the players around.
     if (name == "grabreport")
     {
-        if (args.empty() || (args[0] != "grabbed" && args[0] != "letgo") || m_drops.empty())
+        const bool cNpc = args.size() > 2 && args[2] == "npc";
+        uint32_t npcId = kNoId;
+        for (const auto& actor : m_actors)
+            if (actor.OwnedByUs && !actor.IsPlayer && actor.ServerId != m_serverId)
+                npcId = actor.ServerId;
+        if (args.empty() || (args[0] != "grabbed" && args[0] != "letgo") || (cNpc ? npcId == kNoId : m_drops.empty()))
         {
             spdlog::error("[script] grabreport needs grabbed|letgo and a drop of this bot's, e.g. 'grabreport grabbed right'");
             return true;
@@ -3092,15 +3119,16 @@ bool Bot::StepCommand(const Command& acCommand, const bool aFirstTick) noexcept
         RequestGrabReport request{};
         request.Event = args[0] == "grabbed" ? RequestGrabReport::kGrabbed : RequestGrabReport::kLetGo;
         request.Hand = args.size() > 1 && args[1] == "left" ? 0 : 1;
-        request.Kind = RequestGrabReport::kDroppedItem;
-        request.ServerId = DropToHandle();
+        request.Kind = cNpc ? RequestGrabReport::kActor : RequestGrabReport::kDroppedItem;
+        request.ServerId = cNpc ? npcId : DropToHandle();
         if (request.Event == RequestGrabReport::kGrabbed)
         {
             request.NodeName = "BotHand";
             request.GrabRotation[0] = request.GrabRotation[4] = request.GrabRotation[8] = 1.f;
         }
         SendMsg(request);
-        spdlog::info("[script] reported: {} hand {} dropped item {}", request.Hand ? "right" : "left", args[0] == "grabbed" ? "grabbed" : "let go of", request.ServerId);
+        spdlog::info("[script] reported: {} hand {} {} {:X}", request.Hand ? "right" : "left", args[0] == "grabbed" ? "grabbed" : "let go of", cNpc ? "its NPC" : "dropped item",
+                     request.ServerId);
         return true;
     }
 

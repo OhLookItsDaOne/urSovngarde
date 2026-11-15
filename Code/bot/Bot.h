@@ -221,6 +221,9 @@ private:
     BotOptions m_options;
     std::vector<Command> m_script;
     float m_reportEvery{};
+    //! "carryitem": this bot's drop goes along with it, this far above its feet; negative while off.
+    float m_carryHeight{-1.f};
+    Clock::time_point m_lastCarry{};
     std::chrono::steady_clock::time_point m_nextReport{};
     size_t m_listenOffset{};
     std::chrono::steady_clock::time_point m_listenNext{};
