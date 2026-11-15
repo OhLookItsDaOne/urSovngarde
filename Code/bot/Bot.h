@@ -225,6 +225,9 @@ private:
     float m_reportEvery{};
     //! "carryitem": this bot's drop goes along with it, this far above its feet; negative while off.
     float m_carryHeight{-1.f};
+    //! How far in front of the bot and to its right the carried drop is held: a hand held out, not the middle of the body.
+    float m_carryForward{};
+    float m_carryRight{};
     Clock::time_point m_lastCarry{};
     std::chrono::steady_clock::time_point m_nextReport{};
     size_t m_listenOffset{};

@@ -505,7 +505,9 @@ void Bot::Tick() noexcept
         {
             m_lastCarry = now;
             const uint32_t id = DropToHandle();
-            const glm::vec3 place = m_position + glm::vec3(0.f, 0.f, m_carryHeight);
+            const glm::vec3 cForward{std::sin(m_yaw), std::cos(m_yaw), 0.f};
+            const glm::vec3 cRight{std::cos(m_yaw), -std::sin(m_yaw), 0.f};
+            const glm::vec3 place = m_position + cForward * m_carryForward + cRight * m_carryRight + glm::vec3(0.f, 0.f, m_carryHeight);
             m_dropPlaces[id] = place;
             RequestDroppedItemMove request{};
             request.Id = id;
@@ -3197,10 +3199,13 @@ bool Bot::StepCommand(const Command& acCommand, const bool aFirstTick) noexcept
         return true;
     }
 
-    // "carryitem <height>|off": from now on this bot's drop goes where the bot goes, that far above its feet, until "carryitem off".
+    // "carryitem <height> [forward] [right]|off": from now on this bot's drop goes where the bot goes, that far above its feet and that far
+    // in front of it and to its right (as it faces), until "carryitem off". Without the offsets it sits inside the bot's copy.
     if (name == "carryitem")
     {
         m_carryHeight = !args.empty() && args[0] == "off" ? -1.f : arg(0, 90.f);
+        m_carryForward = arg(1, 0.f);
+        m_carryRight = arg(2, 0.f);
         spdlog::info("[script] carryitem: {}", m_carryHeight < 0.f ? std::string("off") : fmt::format("the drop goes along, {:.0f} units above the feet", m_carryHeight));
         return true;
     }
