@@ -4,9 +4,12 @@
 
 #include <Structs/GameId.h>
 
+#include <algorithm>
+#include <iterator>
+
 //! What HIGGS told this player's game about one of its hands: it grabbed a thing, let it go, or pulled it toward itself.
 //! Read from HIGGS's mod interface, so it is what the hand really holds and not a guess from buttons and distances.
-//! TEMPORARY in this form: the server only logs it, so that both ends of the report can be compared.
+//! The server logs it and passes it to the players around as NotifyGrab.
 struct RequestGrabReport final : ClientMessage
 {
     static constexpr ClientOpcode Opcode = kRequestGrabReport;
@@ -37,7 +40,8 @@ struct RequestGrabReport final : ClientMessage
     bool operator==(const RequestGrabReport& acRhs) const noexcept
     {
         return GetOpcode() == acRhs.GetOpcode() && Event == acRhs.Event && Hand == acRhs.Hand && Kind == acRhs.Kind && ServerId == acRhs.ServerId && ObjectId == acRhs.ObjectId &&
-               FormId == acRhs.FormId && NodeName == acRhs.NodeName && GrabX == acRhs.GrabX && GrabY == acRhs.GrabY && GrabZ == acRhs.GrabZ && Fingers == acRhs.Fingers;
+               FormId == acRhs.FormId && NodeName == acRhs.NodeName && GrabX == acRhs.GrabX && GrabY == acRhs.GrabY && GrabZ == acRhs.GrabZ && Fingers == acRhs.Fingers &&
+               std::equal(std::begin(GrabRotation), std::end(GrabRotation), std::begin(acRhs.GrabRotation));
     }
 
     uint8_t Event{};
@@ -54,6 +58,8 @@ struct RequestGrabReport final : ClientMessage
     float GrabX{};
     float GrabY{};
     float GrabZ{};
+    //! How that node is turned in the hand's space: the game's rotation matrix, three rows of three. Zero unless grabbed.
+    float GrabRotation[9]{};
     //! How far each finger is curled, thumb first, in the low five bytes: 0 fully curled to 255 fully open. Zero unless grabbed.
     uint64_t Fingers{};
 };

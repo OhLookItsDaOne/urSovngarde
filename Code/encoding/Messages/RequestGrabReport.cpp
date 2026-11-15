@@ -13,6 +13,8 @@ void RequestGrabReport::SerializeRaw(TiltedPhoques::Buffer::Writer& aWriter) con
     Serialization::WriteFloat(aWriter, GrabY);
     Serialization::WriteFloat(aWriter, GrabZ);
     Serialization::WriteVarInt(aWriter, Fingers);
+    for (const float cValue : GrabRotation)
+        Serialization::WriteFloat(aWriter, cValue);
 }
 
 void RequestGrabReport::DeserializeRaw(TiltedPhoques::Buffer::Reader& aReader) noexcept
@@ -34,4 +36,6 @@ void RequestGrabReport::DeserializeRaw(TiltedPhoques::Buffer::Reader& aReader) n
     GrabY = Serialization::ReadFloat(aReader);
     GrabZ = Serialization::ReadFloat(aReader);
     Fingers = Serialization::ReadVarInt(aReader);
+    for (float& value : GrabRotation)
+        value = Serialization::ReadFloat(aReader);
 }

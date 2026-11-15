@@ -43,6 +43,7 @@
 #include <Messages/RequestWorldObjectMove.h>
 #include <Messages/RequestPull.h>
 #include <Messages/NotifyPull.h>
+#include <Messages/NotifyGrab.h>
 #include <Messages/RequestDroppedItemMove.h>
 #include <Messages/RequestDroppedItemAdd.h>
 #include <Messages/RequestDroppedItemRemove.h>
@@ -1400,6 +1401,18 @@ void Bot::HandleMessage(const ServerMessage& acMessage) noexcept
         if (message.Id.ModId == m_skyrimModId)
             m_locks[message.Id.BaseId] = message.IsLocked;
         spdlog::info("Lock of {:X}:{:X} {} in another game, relayed here", message.Id.ModId, message.Id.BaseId, message.IsLocked ? "locked" : "unlocked");
+        return;
+    }
+
+    // What another player's HIGGS said about a hand, passed on by the server: logged as it came.
+    if (opcode == NotifyGrab::Opcode)
+    {
+        const auto& message = static_cast<const NotifyGrab&>(acMessage);
+        spdlog::info("Grab relayed: player {}'s {} hand {} {} {:X} / {:X}:{:X} at node '{}', node in hand space at ({:.1f}, {:.1f}, {:.1f}), rotation rows ({:.2f} {:.2f} {:.2f}) ({:.2f} {:.2f} {:.2f}) ({:.2f} {:.2f} {:.2f})",
+                     message.PlayerId, message.Hand ? "right" : "left", message.Event == 0 ? "grabbed" : message.Event == 1 ? "let go of" : "pulled toward itself",
+                     message.Kind == 0 ? "character" : message.Kind == 1 ? "world object" : "dropped item", message.ServerId, message.ObjectId.ModId, message.ObjectId.BaseId,
+                     message.NodeName.c_str(), message.GrabX, message.GrabY, message.GrabZ, message.GrabRotation[0], message.GrabRotation[1], message.GrabRotation[2],
+                     message.GrabRotation[3], message.GrabRotation[4], message.GrabRotation[5], message.GrabRotation[6], message.GrabRotation[7], message.GrabRotation[8]);
         return;
     }
 

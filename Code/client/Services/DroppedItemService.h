@@ -16,6 +16,7 @@ struct NotifyDroppedItemRemoved;
 struct NotifyDroppedItemMove;
 struct NotifyWorldObjectMove;
 struct NotifyPull;
+struct NotifyGrab;
 struct UpdateEvent;
 struct TESObjectREFR;
 
@@ -48,6 +49,8 @@ private:
     void RunGrabReports() noexcept;
     //! Another player's hand on something this game is moving.
     void OnNotifyPull(const NotifyPull&) noexcept;
+    //! What HIGGS said about another player's hand, passed on by the server.
+    void OnNotifyGrab(const NotifyGrab&) noexcept;
     struct Motion;
     //! The other game put down what a hand here pulls on: this game takes it over, and the hand pulls it here.
     //! True if it did; the caller then leaves the thing to this game's physics.
@@ -131,6 +134,23 @@ private:
     };
     HandPull m_handPulls[2];
 
+    //! What another player's hand holds, as that player's HIGGS said it. Key: player id * 2 + hand (0 left, 1 right).
+    struct RemoteGrab
+    {
+        //! RequestGrabReport's kind and ids, and the reference it is in this game (0 if it is not loaded here).
+        uint8_t Kind{};
+        uint32_t ServerId{};
+        GameId ObjectId{};
+        uint32_t FormId{};
+        std::string NodeName{};
+        //! The grabbed node in the hand's space: where it is and how it is turned (the game's matrix, three rows of three).
+        float Position[3]{};
+        float Rotation[9]{};
+        float Fingers[5]{};
+        std::chrono::steady_clock::time_point Since{};
+    };
+    std::unordered_map<uint64_t, RemoteGrab> m_remoteGrabs;
+
     //! Old drops already announced this session, so a cell change does not send them again.
     std::unordered_set<uint32_t> m_announced;
     //! What the player dropped while not connected (reference and item), announced once connected.
@@ -149,5 +169,6 @@ private:
     entt::scoped_connection m_moveConnection;
     entt::scoped_connection m_objectMoveConnection;
     entt::scoped_connection m_pullConnection;
+    entt::scoped_connection m_grabConnection;
     entt::scoped_connection m_updateConnection;
 };

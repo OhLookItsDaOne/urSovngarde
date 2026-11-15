@@ -150,5 +150,6 @@ enum ServerOpcode : unsigned char
     kNotifyPartyPlugin,
     kNotifyPartyValue,
     kNotifyPull,
+    kNotifyGrab,
     kServerOpcodeMax
 };

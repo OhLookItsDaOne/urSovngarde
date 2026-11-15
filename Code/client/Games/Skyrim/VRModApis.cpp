@@ -58,6 +58,7 @@ void OnGrabbed(bool aIsLeft, TESObjectREFR* apRefr)
     event.FormId = apRefr ? apRefr->formID : 0;
     std::copy(std::begin(cGrab.Translation), std::end(cGrab.Translation), event.Grab);
     std::copy(std::begin(fingers), std::end(fingers), event.Fingers);
+    std::copy(std::begin(cGrab.Rotation), std::end(cGrab.Rotation), event.GrabRotation);
     Queue(std::move(event));
 }
 

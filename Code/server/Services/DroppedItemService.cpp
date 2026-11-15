@@ -15,6 +15,7 @@
 #include <Messages/RequestPull.h>
 #include <Messages/RequestGrabReport.h>
 #include <Messages/NotifyPull.h>
+#include <Messages/NotifyGrab.h>
 #include <Messages/EnterInteriorCellRequest.h>
 #include <Messages/EnterExteriorCellRequest.h>
 #include <Messages/ShiftGridCellRequest.h>
@@ -239,6 +240,36 @@ void DroppedItemService::OnGrabReport(const PacketEvent<RequestGrabReport>& acMe
     else
         spdlog::info("Grab: player {} '{}' {} hand {} {} (their reference {:X})", pPlayer->GetId(), pPlayer->GetUsername().c_str(), cpHand,
                      message.Event == RequestGrabReport::kLetGo ? "let go of" : "pulled toward itself", what, message.FormId);
+
+    // Passed on to the players around, so each game knows what the others' hands hold. A thing only their game has means nothing to anyone else.
+    if (message.Kind == RequestGrabReport::kUnknown)
+        return;
+
+    NotifyGrab notify{};
+    notify.PlayerId = pPlayer->GetId();
+    notify.Event = message.Event;
+    notify.Hand = message.Hand;
+    notify.Kind = message.Kind;
+    notify.ServerId = message.ServerId;
+    notify.ObjectId = message.ObjectId;
+    notify.NodeName = message.NodeName;
+    notify.GrabX = message.GrabX;
+    notify.GrabY = message.GrabY;
+    notify.GrabZ = message.GrabZ;
+    std::copy(std::begin(message.GrabRotation), std::end(message.GrabRotation), notify.GrabRotation);
+    notify.Fingers = message.Fingers;
+
+    uint32_t told = 0;
+    for (Player* pOther : m_world.GetPlayerManager())
+    {
+        if (pOther != pPlayer && pOther->GetCellComponent().IsInRange(pPlayer->GetCellComponent(), false))
+        {
+            pOther->Send(notify);
+            ++told;
+        }
+    }
+    if (told)
+        spdlog::info("Grab: passed on to {} player(s) around", told);
 }
 
 // A hand on something another player's game is moving: passed on to that game, which pulls the thing toward the hand.

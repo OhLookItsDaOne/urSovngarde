@@ -22,6 +22,7 @@
 #include <Messages/RequestGrabReport.h>
 #include <Games/Skyrim/VRModApis.h>
 #include <Messages/NotifyPull.h>
+#include <Messages/NotifyGrab.h>
 #include <Games/Skyrim/VRBodySync.h>
 #include <Events/UpdateEvent.h>
 #include <NetImmerse/NiTransform.h>
@@ -207,6 +208,7 @@ DroppedItemService::DroppedItemService(World& aWorld, entt::dispatcher& aDispatc
     m_moveConnection = aDispatcher.sink<NotifyDroppedItemMove>().connect<&DroppedItemService::OnNotifyDroppedItemMove>(this);
     m_objectMoveConnection = aDispatcher.sink<NotifyWorldObjectMove>().connect<&DroppedItemService::OnNotifyWorldObjectMove>(this);
     m_pullConnection = aDispatcher.sink<NotifyPull>().connect<&DroppedItemService::OnNotifyPull>(this);
+    m_grabConnection = aDispatcher.sink<NotifyGrab>().connect<&DroppedItemService::OnNotifyGrab>(this);
     m_updateConnection = aDispatcher.sink<UpdateEvent>().connect<&DroppedItemService::OnUpdate>(this);
 }
 
@@ -1252,6 +1254,7 @@ void DroppedItemService::RunGrabReports() noexcept
         report.GrabX = event.Grab[0];
         report.GrabY = event.Grab[1];
         report.GrabZ = event.Grab[2];
+        std::copy(std::begin(event.GrabRotation), std::end(event.GrabRotation), report.GrabRotation);
         for (int i = 0; i < 5; ++i)
             report.Fingers |= static_cast<uint64_t>(std::clamp(event.Fingers[i], 0.f, 1.f) * 255.f + 0.5f) << (8 * i);
 
@@ -1283,6 +1286,76 @@ void DroppedItemService::RunGrabReports() noexcept
 
         m_transport.Send(report);
     }
+}
+
+// Kept per player and hand, for placing the thing in the copy's hand and for the hand as a second grip (both still to be built on it).
+void DroppedItemService::OnNotifyGrab(const NotifyGrab& acMessage) noexcept
+{
+    const uint64_t cKey = (static_cast<uint64_t>(acMessage.PlayerId) << 1) | (acMessage.Hand & 1);
+    const char* cpHand = (acMessage.Hand & 1) ? "right" : "left";
+
+    // What the thing is in this game.
+    uint32_t formId = 0;
+    if (acMessage.Kind == RequestGrabReport::kActor)
+    {
+        for (const auto cEntity : m_world.view<FormIdComponent>())
+        {
+            const auto* pRemote = m_world.try_get<RemoteComponent>(cEntity);
+            const auto* pLocal = m_world.try_get<LocalComponent>(cEntity);
+            if ((pRemote && pRemote->Id == acMessage.ServerId) || (pLocal && pLocal->Id == acMessage.ServerId))
+            {
+                formId = m_world.get<FormIdComponent>(cEntity).Id;
+                break;
+            }
+        }
+    }
+    else if (acMessage.Kind == RequestGrabReport::kDroppedItem)
+    {
+        if (const auto cRef = m_refById.find(acMessage.ServerId); cRef != m_refById.end())
+            formId = cRef->second;
+    }
+    else if (acMessage.Kind == RequestGrabReport::kWorldObject)
+        formId = m_world.GetModSystem().GetGameId(acMessage.ObjectId);
+
+    const char* cpKind = acMessage.Kind == RequestGrabReport::kActor ? "character" : acMessage.Kind == RequestGrabReport::kDroppedItem ? "dropped item" : "placed object";
+
+    if (acMessage.Event == RequestGrabReport::kPulled)
+    {
+        spdlog::info("RemoteGrab: player {}'s {} hand pulled {} {:X} toward itself (here {:X})", acMessage.PlayerId, cpHand, cpKind, acMessage.ServerId, formId);
+        return;
+    }
+
+    if (acMessage.Event == RequestGrabReport::kLetGo)
+    {
+        const auto cGrab = m_remoteGrabs.find(cKey);
+        if (cGrab == m_remoteGrabs.end())
+        {
+            spdlog::info("RemoteGrab: player {}'s {} hand let go of {} {:X} (here {:X}); no grab of it was known here", acMessage.PlayerId, cpHand, cpKind, acMessage.ServerId, formId);
+            return;
+        }
+        spdlog::info("RemoteGrab: player {}'s {} hand let go of {} {:X} (here {:X}) after {:.1f} s", acMessage.PlayerId, cpHand, cpKind, acMessage.ServerId, formId,
+                     std::chrono::duration<float>(std::chrono::steady_clock::now() - cGrab->second.Since).count());
+        m_remoteGrabs.erase(cGrab);
+        return;
+    }
+
+    RemoteGrab grab{};
+    grab.Kind = acMessage.Kind;
+    grab.ServerId = acMessage.ServerId;
+    grab.ObjectId = acMessage.ObjectId;
+    grab.FormId = formId;
+    grab.NodeName = acMessage.NodeName.c_str();
+    grab.Position[0] = acMessage.GrabX;
+    grab.Position[1] = acMessage.GrabY;
+    grab.Position[2] = acMessage.GrabZ;
+    std::copy(std::begin(acMessage.GrabRotation), std::end(acMessage.GrabRotation), grab.Rotation);
+    for (int i = 0; i < 5; ++i)
+        grab.Fingers[i] = static_cast<float>((acMessage.Fingers >> (8 * i)) & 0xFF) / 255.f;
+    grab.Since = std::chrono::steady_clock::now();
+
+    spdlog::info("RemoteGrab: player {}'s {} hand grabbed {} {:X} (here {:X}{}) at node '{}', node in hand space at ({:.1f}, {:.1f}, {:.1f})", acMessage.PlayerId, cpHand, cpKind,
+                 acMessage.ServerId, formId, formId ? "" : ", not loaded here", grab.NodeName, grab.Position[0], grab.Position[1], grab.Position[2]);
+    m_remoteGrabs[cKey] = std::move(grab);
 }
 
 void DroppedItemService::OnNotifyPull(const NotifyPull& acMessage) noexcept

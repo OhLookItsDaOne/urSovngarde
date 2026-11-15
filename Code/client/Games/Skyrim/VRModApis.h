@@ -137,6 +137,8 @@ struct HandEvent
     std::string NodeName{};
     float Grab[3]{};
     float Fingers[5]{};
+    //! The rotation part of the same hand-to-node transform, as the game keeps it: three rows of three.
+    float GrabRotation[9]{};
     //! Set by Poll once the grabbed node's name has been read and the event is in the log; only then is it handed out.
     bool Ready{};
     std::chrono::steady_clock::time_point At{};

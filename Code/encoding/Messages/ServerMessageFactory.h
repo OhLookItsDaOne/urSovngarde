@@ -63,6 +63,7 @@
 #include <Messages/NotifyDroppedItemMove.h>
 #include <Messages/NotifyWorldObjectMove.h>
 #include <Messages/NotifyPull.h>
+#include <Messages/NotifyGrab.h>
 #include <Messages/NotifyClash.h>
 #include <Messages/NotifyVoiceData.h>
 #include <Messages/NotifyPlayerWhereabouts.h>
@@ -88,7 +89,7 @@ struct ServerMessageFactory
             NotifyActorValueChanges, NotifyPartyJoined, NotifyPartyLeft, NotifyActorMaxValueChanges, NotifyHealthChangeBroadcast, NotifyActivate, NotifyLockChange, AssignObjectsResponse, NotifyDeathStateChange, NotifyOwnershipTransfer, NotifyObjectInventoryChanges, NotifySpellCast,
             NotifyProjectileLaunch, NotifyInterruptCast, NotifyAddTarget, NotifyScriptAnimation, NotifyDrawWeapon, NotifyMount, NotifyNewPackage, NotifyRespawn, NotifySyncExperience, NotifyEquipmentChanges, NotifyChatMessageBroadcast, TeleportCommandResponse, NotifyPlayerRespawn, NotifyDialogue,
             NotifySubtitle, NotifyPlayerDialogue, NotifyActorTeleport, NotifyPlayerLeft, NotifyPlayerJoined, NotifyDialogue, NotifySubtitle, NotifyPlayerDialogue, NotifyPlayerLevel, NotifyPlayerCellChanged, NotifyTeleport, NotifyPlayerHealthUpdate, NotifySettingsChange,
-            NotifyWeatherChange, NotifySetWaypoint, NotifyRemoveWaypoint, NotifySetTimeResult, NotifyRemoveSpell, NotifyDroppedItem, NotifyDroppedItemRemoved, NotifyDroppedItemMove, NotifyWorldObjectMove, NotifyClash, NotifyVoiceData, NotifyPlayerWhereabouts, NotifyArrowNocked, NotifyDownedState, NotifyActionEvents, NotifySleep, NotifyReferenceEnable, NotifyWarState, NotifyPartyPlugin, NotifyPartyValue, NotifyPull>;
+            NotifyWeatherChange, NotifySetWaypoint, NotifyRemoveWaypoint, NotifySetTimeResult, NotifyRemoveSpell, NotifyDroppedItem, NotifyDroppedItemRemoved, NotifyDroppedItemMove, NotifyWorldObjectMove, NotifyClash, NotifyVoiceData, NotifyPlayerWhereabouts, NotifyArrowNocked, NotifyDownedState, NotifyActionEvents, NotifySleep, NotifyReferenceEnable, NotifyWarState, NotifyPartyPlugin, NotifyPartyValue, NotifyPull, NotifyGrab>;
 
         return s_visitor(std::forward<T>(func));
     }
