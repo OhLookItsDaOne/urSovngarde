@@ -1459,7 +1459,10 @@ bool DroppedItemService::SharedMove(const uint8_t aKind, const uint32_t aServerI
     // EXPERIMENTAL: only where it is, not how it is turned; each hand turns its own copy.
     // The key names this thing, not a hand: two things held by both are pulled separately.
     const uint64_t cKey = 0xC000000000000000ull | (static_cast<uint64_t>(apRef->formID) << 1);
-    const bool cPulled = VRBodySync::PullBody(cKey, apRef, acPosition);
+    // Further apart than two arms reach, the two are not holding one thing: the other game's report of a hand on it is stale, or
+    // that player walked off with their copy (seen 2026-11-15: up to 4000 units). Then it is not pulled; this hand keeps it.
+    const float cApart = glm::distance(acPosition, WorldPositionOf(apRef));
+    const bool cPulled = cApart < 200.f && VRBodySync::PullBody(cKey, apRef, acPosition);
     // Carried, not put down, while the other player moves it under this hand.
     aMotion.LastLocalMove = aNow;
     if (aNow - aMotion.SharedLogAt > std::chrono::seconds(2))

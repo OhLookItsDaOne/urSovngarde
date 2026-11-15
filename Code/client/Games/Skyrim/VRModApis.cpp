@@ -31,6 +31,10 @@ bool s_done = false;
 std::mutex s_eventLock;
 std::vector<VRModApis::HandEvent> s_events;
 
+// What each hand (0 right, 1 left) is taken to hold after HIGGS's reports, and since when HIGGS says it does not. Main thread only.
+uint32_t s_taken[2]{};
+std::chrono::steady_clock::time_point s_goneSince[2]{};
+
 void Queue(VRModApis::HandEvent&& aEvent) noexcept
 {
     std::scoped_lock _{s_eventLock};
@@ -84,6 +88,15 @@ void FinishEvents() noexcept
         event.Ready = true;
         event.At = std::chrono::steady_clock::now();
 
+        // What each hand is taken to hold, for the check below.
+        if (event.Event == VRModApis::HandEvent::kGrabbed)
+        {
+            s_taken[event.IsLeft] = event.FormId;
+            s_goneSince[event.IsLeft] = {};
+        }
+        else if (event.Event == VRModApis::HandEvent::kLetGo && s_taken[event.IsLeft] == event.FormId)
+            s_taken[event.IsLeft] = 0;
+
         if (event.Event == VRModApis::HandEvent::kLetGo)
             spdlog::info("Higgs: {} hand let go of {:X}", Side(event.IsLeft), event.FormId);
         else if (event.Event == VRModApis::HandEvent::kPulled)
@@ -100,6 +113,40 @@ void FinishEvents() noexcept
             spdlog::info("Higgs: {} hand grabbed {:X} at its node '{}'{}; node in hand space at ({:.1f}, {:.1f}, {:.1f}); fingers {:.2f} {:.2f} {:.2f} {:.2f} {:.2f}", Side(event.IsLeft),
                          event.FormId, event.NodeName, cStillHeld ? "" : " (let go again before the name could be read)", event.Grab[0], event.Grab[1], event.Grab[2], event.Fingers[0],
                          event.Fingers[1], event.Fingers[2], event.Fingers[3], event.Fingers[4]);
+        }
+    }
+
+    // HIGGS does not say every end of a hold: of 152 grabs in a session of 2026-11-15 only 89 were followed by its dropped
+    // callback (a thing passed to the other hand, taken by another player, stashed or used up ends without one). The server
+    // and the other games then took the hand to hold on, and treated the thing as held by two. So the hand is asked: a
+    // hand that has not held its thing for 0.3 s has let go, and that is said like HIGGS's own report.
+    const auto cNow = std::chrono::steady_clock::now();
+    for (const bool cIsLeft : {false, true})
+    {
+        if (!s_taken[cIsLeft])
+            continue;
+        const TESObjectREFR* pHeld = s_pHiggs->GetGrabbedObject(cIsLeft);
+        if (pHeld && pHeld->formID == s_taken[cIsLeft])
+        {
+            s_goneSince[cIsLeft] = {};
+            continue;
+        }
+        if (s_goneSince[cIsLeft] == std::chrono::steady_clock::time_point{})
+            s_goneSince[cIsLeft] = cNow;
+        else if (cNow - s_goneSince[cIsLeft] > std::chrono::milliseconds(300))
+        {
+            spdlog::info("Higgs: {} hand no longer holds {:X}, and HIGGS did not say it let go; taken as let go", Side(cIsLeft), s_taken[cIsLeft]);
+            VRModApis::HandEvent event;
+            event.Event = VRModApis::HandEvent::kLetGo;
+            event.IsLeft = cIsLeft;
+            event.FormId = s_taken[cIsLeft];
+            event.Ready = true;
+            event.At = cNow;
+            if (s_events.size() >= 64)
+                s_events.erase(s_events.begin());
+            s_events.push_back(std::move(event));
+            s_taken[cIsLeft] = 0;
+            s_goneSince[cIsLeft] = {};
         }
     }
 }

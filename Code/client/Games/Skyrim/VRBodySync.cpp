@@ -2483,15 +2483,19 @@ void DrivePullsBeforeStep(void* apHkpWorld, const float aSeconds) noexcept
         const float* pAt = reinterpret_cast<const float*>(pHavok + kBodyTranslationOffset);
         const glm::vec3 toHand = glm::vec3{pulls[i].Target[0], pulls[i].Target[1], pulls[i].Target[2]} - glm::vec3{pAt[0], pAt[1], pAt[2]};
         // The speed that would bring it to the hand in 150 ms, at most 4 m/s: a hand that is far away tugs, it does not fling.
-        constexpr float cReachSeconds = 0.15f;
-        constexpr float cMaxSpeed = 4.f;
+        // A thing held by two (DroppedItemService::SharedMove, key 0xC...) is pulled toward the other game's copy of it, not toward
+        // a hand, while this player's own hand holds it. Two players, 2026-11-15: at the hand's strength a sword held by both shook
+        // for both, the pull against HIGGS's hold every step. So that pull is a nudge: half the speed, twice the time, a fifth of the say.
+        const bool cShared = (pulls[i].Key >> 62) == 3;
+        const float cReachSeconds = cShared ? 0.3f : 0.15f;
+        const float cMaxSpeed = cShared ? 2.f : 4.f;
         glm::vec3 wanted = toHand / cReachSeconds;
         if (const float speed = glm::length(wanted); speed > cMaxSpeed)
             wanted *= cMaxSpeed / speed;
         // Blended with the speed it has: what else holds it (this player's hand, another pull, the rest of its ragdoll) keeps its say.
         float* pLinear = reinterpret_cast<float*>(pHavok + kAngularVelocityOffset - 0x10);
         const glm::vec3 current{pLinear[0], pLinear[1], pLinear[2]};
-        const glm::vec3 speed = current + (wanted - current) * 0.6f;
+        const glm::vec3 speed = current + (wanted - current) * (cShared ? 0.2f : 0.6f);
         pLinear[0] = speed.x, pLinear[1] = speed.y, pLinear[2] = speed.z;
     }
 }
