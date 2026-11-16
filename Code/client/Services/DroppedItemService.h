@@ -190,6 +190,8 @@ private:
         std::chrono::steady_clock::time_point Since{};
         std::chrono::steady_clock::time_point LastSent{};
         std::chrono::steady_clock::time_point MissingSince{};
+        //! The projectile followed now is the one flying back to the hand.
+        bool Returning{};
     };
     OwnThrow m_ownThrows[2];
 

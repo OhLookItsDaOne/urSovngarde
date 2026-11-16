@@ -145,6 +145,9 @@ struct Thrown
 };
 //! True, and the throw, once for each throw.
 bool TakeThrown(Thrown& aThrown) noexcept;
+//! A launch from a helper that no throw report claimed: the flight of a thrown weapon back to the hand, which Weapon Throw VR
+//! fires as a second projectile after deleting the first. Only asked for while a thrown weapon's projectile has just gone.
+bool TakeReturnLaunch(uint32_t& aProjectileHandle) noexcept;
 //! True once for each time the mod said a thrown weapon came back to a hand.
 bool TakeReturned(bool& aIsLeft) noexcept;
 //! Called by the projectile launch hook for a launch from a reference that is no character, with a weapon and no spell:

@@ -1857,9 +1857,11 @@ void DroppedItemService::RunThrownWeapons(const std::chrono::steady_clock::time_
             continue;
         const uint8_t cHand = thrown.IsLeft ? 0 : 1;
         GameId baseId{};
-        if (!modSystem.GetServerModId(thrown.WeaponFormId, baseId))
+        // A form the game made while running (FF......) has no id another game knows. A weapon tempered or enchanted by a player
+        // is not one of these: it is its ordinary base form with the change kept beside it, and is shown.
+        if (thrown.WeaponFormId >= 0xFF000000 || !modSystem.GetServerModId(thrown.WeaponFormId, baseId))
         {
-            spdlog::info("Thrown: this player threw {:X}, which only this game has (made or enchanted here); not shown to the other players", thrown.WeaponFormId);
+            spdlog::info("Thrown: this player threw {:X}, a form only this game has; not shown to the other players", thrown.WeaponFormId);
             continue;
         }
         EndOwnThrow(cHand, "that hand threw again");
@@ -1888,6 +1890,15 @@ void DroppedItemService::RunThrownWeapons(const std::chrono::steady_clock::time_
         const NiNode* pNode = pRef && !pRef->IsDeleted() && !pRef->IsDisabled() ? pRef->GetNiNode() : nullptr;
         if (!pNode)
         {
+            // Called back: the mod deletes the projectile and fires another from where it was, which flies to the hand.
+            if (uint32_t returning = 0; !own.Returning && aNow - own.Since > std::chrono::seconds(1) && VRModApis::TakeReturnLaunch(returning))
+            {
+                own.Handle = returning;
+                own.Returning = true;
+                own.MissingSince = {};
+                spdlog::info("Thrown: this player's {} hand's thrown weapon is called back; its flight back is sent too", hand ? "right" : "left");
+                continue;
+            }
             // Its 3D comes a moment after the launch; half a second without one and the projectile is gone.
             if (own.MissingSince == std::chrono::steady_clock::time_point{})
                 own.MissingSince = aNow;
@@ -1896,12 +1907,6 @@ void DroppedItemService::RunThrownWeapons(const std::chrono::steady_clock::time_
             continue;
         }
         own.MissingSince = {};
-        if (aNow - own.Since > std::chrono::minutes(2))
-        {
-            EndOwnThrow(hand, "two minutes have passed");
-            continue;
-        }
-
         const glm::vec3 cPosition = WorldPositionOf(pRef);
         // Every frame while it moves, four times a second while it lies: the others drop a copy they hear nothing of for three seconds.
         if (glm::distance(cPosition, own.LastPosition) < 0.5f && aNow - own.LastSent < std::chrono::milliseconds(250))

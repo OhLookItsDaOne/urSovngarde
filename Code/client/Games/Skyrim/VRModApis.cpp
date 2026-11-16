@@ -8,6 +8,7 @@
 
 #include <chrono>
 #include <mutex>
+#include <vector>
 
 namespace
 {
@@ -35,11 +36,16 @@ struct
     bool IsLeft = false;
     std::chrono::steady_clock::time_point At{};
 } s_saidThrown;
-struct
+// Launches by a reference that is no character. The mod's throw comes within moments of its report; one left unpaired is
+// taken for the flight back to the hand, which the mod fires the same way (TakeReturnLaunch), or was a trap's.
+struct HelperLaunch
 {
     uint32_t Handle = 0;
     std::chrono::steady_clock::time_point At{};
-} s_helperLaunch;
+};
+std::vector<HelperLaunch> s_helperLaunches;
+constexpr auto kPairWithin = std::chrono::milliseconds(500);
+constexpr auto kLaunchKept = std::chrono::seconds(3);
 bool s_returned[2]{};
 
 void OnWeaponThrown(TESForm* apWeapon, bool aIsLeft, void*)
@@ -282,17 +288,47 @@ bool TakeThrown(Thrown& aThrown) noexcept
     // The mod queues the shot and then reports the throw, so either can come first; two seconds apart at most.
     if (s_saidThrown.WeaponFormId && cNow - s_saidThrown.At > std::chrono::seconds(2))
         s_saidThrown.WeaponFormId = 0;
-    if (s_helperLaunch.Handle && cNow - s_helperLaunch.At > std::chrono::seconds(2))
-        s_helperLaunch.Handle = 0;
-    if (!s_saidThrown.WeaponFormId || !s_helperLaunch.Handle)
+    std::erase_if(s_helperLaunches, [cNow](const HelperLaunch& acLaunch) { return cNow - acLaunch.At > kLaunchKept; });
+    if (!s_saidThrown.WeaponFormId)
+        return false;
+
+    // The launch nearest in time to the report, half a second apart at most: a flight back fired earlier is not the throw.
+    auto best = s_helperLaunches.end();
+    auto bestGap = std::chrono::steady_clock::duration::max();
+    for (auto it = s_helperLaunches.begin(); it != s_helperLaunches.end(); ++it)
+    {
+        const auto cGap = it->At > s_saidThrown.At ? it->At - s_saidThrown.At : s_saidThrown.At - it->At;
+        if (cGap <= kPairWithin && cGap < bestGap)
+        {
+            best = it;
+            bestGap = cGap;
+        }
+    }
+    if (best == s_helperLaunches.end())
         return false;
 
     aThrown.WeaponFormId = s_saidThrown.WeaponFormId;
     aThrown.IsLeft = s_saidThrown.IsLeft;
-    aThrown.ProjectileHandle = s_helperLaunch.Handle;
+    aThrown.ProjectileHandle = best->Handle;
     s_saidThrown.WeaponFormId = 0;
-    s_helperLaunch.Handle = 0;
+    s_helperLaunches.erase(best);
     return true;
+}
+
+bool TakeReturnLaunch(uint32_t& aProjectileHandle) noexcept
+{
+    const auto cNow = std::chrono::steady_clock::now();
+    std::scoped_lock _{s_throwLock};
+    for (auto it = s_helperLaunches.begin(); it != s_helperLaunches.end(); ++it)
+    {
+        // Still within reach of a throw report that may yet come, unless none is waiting... a report pairs first.
+        if (cNow - it->At > kLaunchKept || (s_saidThrown.WeaponFormId && cNow - it->At <= kPairWithin))
+            continue;
+        aProjectileHandle = it->Handle;
+        s_helperLaunches.erase(it);
+        return true;
+    }
+    return false;
 }
 
 bool TakeReturned(bool& aIsLeft) noexcept
@@ -313,8 +349,9 @@ bool TakeReturned(bool& aIsLeft) noexcept
 void NoteHelperLaunch(const uint32_t aProjectileHandle) noexcept
 {
     std::scoped_lock _{s_throwLock};
-    s_helperLaunch.Handle = aProjectileHandle;
-    s_helperLaunch.At = std::chrono::steady_clock::now();
+    if (s_helperLaunches.size() >= 16)
+        s_helperLaunches.erase(s_helperLaunches.begin());
+    s_helperLaunches.push_back({aProjectileHandle, std::chrono::steady_clock::now()});
 }
 
 uint32_t HeldByHand(const uint8_t aSide) noexcept
