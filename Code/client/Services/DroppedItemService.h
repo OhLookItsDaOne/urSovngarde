@@ -137,6 +137,8 @@ private:
     //! A place another game sent for a thing it moves: gone to over the time until its next place is due, not in one jump.
     void FollowMove(TESObjectREFR* apRef, Motion& aMotion, const glm::vec3& acPosition, const glm::vec3& acRotation, std::chrono::steady_clock::time_point aNow) noexcept;
     //! One frame's part of that way.
+    //! Where a thing another player holds belongs by that player's copy's hand here. False where the sent places are to be followed.
+    bool HandPlace(TESObjectREFR* apRef, const Motion& acMotion, std::chrono::steady_clock::time_point aNow, glm::vec3& aOut) noexcept;
     void StepFollow(TESObjectREFR* apRef, Motion& aMotion, std::chrono::steady_clock::time_point aNow) noexcept;
     std::unordered_map<uint32_t, Motion> m_motion;
 
@@ -177,6 +179,11 @@ private:
         std::chrono::steady_clock::time_point Since{};
         //! When the "SharedBody:" line was last written for it.
         std::chrono::steady_clock::time_point SharedLogAt{};
+        //! How far the place worked out from the copy's hand is from where the holder's game sends the thing, smoothed; below zero
+        //! until measured. While small the thing is placed by the hand (InHand), see HandPlace.
+        float HandError{-1.f};
+        bool InHand{};
+        std::chrono::steady_clock::time_point HandLogAt{};
     };
     std::unordered_map<uint64_t, RemoteGrab> m_remoteGrabs;
 

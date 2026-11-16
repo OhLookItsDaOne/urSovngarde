@@ -639,12 +639,81 @@ void DroppedItemService::FollowMove(TESObjectREFR* apRef, Motion& aMotion, const
     aMotion.FollowDue = aNow + cSince;
 }
 
+// A thing another player holds is seen next to that player's copy, whose hand is placed and smoothed by the pose sync. The thing's
+// own places come by another road and at other moments, so against the hand it trembled. HIGGS says where the grabbed node sits in
+// the hand's space (sent once per grab): with it the thing is placed from the copy's hand here, every frame, and no sent place is
+// needed for where it is. Its turn still comes from the places sent.
+// What is not known without the game: whether HIGGS's hand space is the hand bone's of the copy. So it is measured: the place worked
+// out is compared with the places the holder's game sends, and used only while the two agree.
+bool DroppedItemService::HandPlace(TESObjectREFR* apRef, const Motion& acMotion, const std::chrono::steady_clock::time_point aNow, glm::vec3& aOut) noexcept
+{
+    if (!acMotion.Held || !VRModApis::KnowsGrabs() || VRModApis::HeldByHand(0) == apRef->formID || VRModApis::HeldByHand(1) == apRef->formID)
+        return false;
+
+    for (auto& [key, grab] : m_remoteGrabs)
+    {
+        if (grab.Kind == RequestGrabReport::kActor)
+            continue;
+        // Not loaded here when it was grabbed: found now.
+        if (!grab.FormId)
+        {
+            if (grab.Kind == RequestGrabReport::kDroppedItem)
+            {
+                if (const auto cRef = m_refById.find(grab.ServerId); cRef != m_refById.end())
+                    grab.FormId = cRef->second;
+            }
+            else
+                grab.FormId = m_world.GetModSystem().GetGameId(grab.ObjectId);
+        }
+        if (grab.FormId != apRef->formID)
+            continue;
+
+        Actor* pCopy = nullptr;
+        auto view = m_world.view<FormIdComponent, PlayerComponent>();
+        for (const auto cEntity : view)
+            if (view.get<PlayerComponent>(cEntity).Id == static_cast<uint32_t>(key >> 1))
+                pCopy = Cast<Actor>(TESForm::GetById(view.get<FormIdComponent>(cEntity).Id));
+        glm::vec3 node{};
+        if (!pCopy || pCopy->formID == 0x14 || !VRBodySync::CopyHandPoint(pCopy, static_cast<uint8_t>(key & 1), glm::vec3(grab.Position[0], grab.Position[1], grab.Position[2]), node))
+            return false;
+        // The grabbed node is there; the thing's origin is as far from it as it is now.
+        aOut = node - VRBodySync::NodeFromOrigin(apRef, grab.NodeName.c_str());
+
+        // Measured against a place that came just now, half a second after the grab at the earliest (HIGGS first brings the thing to the hand).
+        if (aNow - grab.Since > std::chrono::milliseconds(500) && aNow - acMotion.FollowArrivedAt < std::chrono::milliseconds(100))
+        {
+            const float cError = glm::distance(aOut, acMotion.FollowPosition);
+            grab.HandError = grab.HandError < 0.f ? cError : grab.HandError + (cError - grab.HandError) * 0.1f;
+            const bool cWas = grab.InHand;
+            if (!grab.InHand && grab.HandError < 12.f && aNow - grab.Since > std::chrono::seconds(1))
+                grab.InHand = true;
+            else if (grab.InHand && grab.HandError > 40.f)
+                grab.InHand = false;
+            if (cWas != grab.InHand || aNow - grab.HandLogAt > std::chrono::seconds(5))
+            {
+                grab.HandLogAt = aNow;
+                spdlog::info("Hand: {:X} in player {}'s {} hand: by the copy's hand here it belongs {:.1f} units from where its holder's game has it; {}", apRef->formID, key >> 1,
+                             (key & 1) ? "right" : "left", grab.HandError, grab.InHand ? "placed by the hand" : "following the places sent");
+            }
+        }
+        return grab.InHand;
+    }
+    return false;
+}
+
 void DroppedItemService::StepFollow(TESObjectREFR* apRef, Motion& aMotion, const std::chrono::steady_clock::time_point aNow) noexcept
 {
+    glm::vec3 inHand{};
+    const bool cInHand = HandPlace(apRef, aMotion, aNow, inHand);
     if (!aMotion.Following)
     {
+        if (cInHand)
+        {
+            VRBodySync::PinBody(apRef, &inHand);
+            PlaceMovedObject(apRef, inHand, RotationOf(apRef));
+        }
         // With HIGGS the thing is a body physics may move: kept where it was put.
-        if (VRModApis::KnowsGrabs())
+        else if (VRModApis::KnowsGrabs())
             VRBodySync::PinBody(apRef, nullptr);
         return;
     }
@@ -657,7 +726,7 @@ void DroppedItemService::StepFollow(TESObjectREFR* apRef, Motion& aMotion, const
     const float cPart = cLeft > 0.f ? std::min(1.f, cStep / (cLeft + cStep)) : 1.f;
 
     const glm::vec3 cAt(apRef->position.x, apRef->position.y, apRef->position.z);
-    const glm::vec3 cPosition = cAt + (aMotion.FollowPosition - cAt) * cPart;
+    const glm::vec3 cPosition = cInHand ? inHand : cAt + (aMotion.FollowPosition - cAt) * cPart;
     // Each angle the short way round.
     glm::vec3 rotation(apRef->rotation.x, apRef->rotation.y, apRef->rotation.z);
     for (int i = 0; i < 3; ++i)

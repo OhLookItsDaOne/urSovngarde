@@ -121,6 +121,10 @@ float NearestNodeTo(TESObjectREFR* apRef, const glm::vec3& acPoint) noexcept;
 bool IsBodyMovedByOwner(uint32_t aFormId) noexcept;
 //! Where a hand of another player's copy is in the world, left (0) or right (1): the copy's hand bone.
 bool CopyHandPosition(Actor* apCopy, uint8_t aSide, glm::vec3& aOut) noexcept;
+//! Where a point given in the space of another player's copy's hand bone is in the world (the hand's turn, scale and place applied).
+bool CopyHandPoint(Actor* apCopy, uint8_t aSide, const glm::vec3& acInHand, glm::vec3& aOut) noexcept;
+//! The way in the world from a reference's 3D origin to its node of that name; zero for the origin itself, no name, or no such node.
+glm::vec3 NodeFromOrigin(TESObjectREFR* apRef, const char* acpName) noexcept;
 //! What other players' hands hold of the characters here, as their HIGGS said it. aHand: player id * 2 + hand; aFormId 0: that hand let go.
 void SetBodyInAnotherHand(uint64_t aHand, uint32_t aFormId) noexcept;
 void ClearBodiesInOtherHands() noexcept;

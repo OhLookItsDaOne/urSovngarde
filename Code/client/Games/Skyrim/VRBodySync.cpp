@@ -4654,6 +4654,32 @@ bool CopyHandPosition(Actor* apCopy, const uint8_t aSide, glm::vec3& aOut) noexc
     return true;
 }
 
+bool CopyHandPoint(Actor* apCopy, const uint8_t aSide, const glm::vec3& acInHand, glm::vec3& aOut) noexcept
+{
+    void* pRoot = apCopy && aSide <= 1 ? static_cast<void*>(apCopy->GetNiNode()) : nullptr;
+    void* pHand = FindShallowest(pRoot, kHandNames[aSide <= 1 ? aSide : 0]);
+    if (!pHand)
+        return false;
+    // As the game does it: world = place + scale * (rotation * local), the rotation's rows times the vector.
+    const auto& cHand = At<NiTransform>(pHand, kWorldOffset);
+    const glm::vec3 cPlace = ToGlm(cHand.translate);
+    for (int row = 0; row < 3; ++row)
+        aOut[row] = cPlace[row] +
+                    cHand.scale * (cHand.rotate.data[row][0] * acInHand.x + cHand.rotate.data[row][1] * acInHand.y + cHand.rotate.data[row][2] * acInHand.z);
+    return true;
+}
+
+glm::vec3 NodeFromOrigin(TESObjectREFR* apRef, const char* acpName) noexcept
+{
+    void* pRoot = apRef ? static_cast<void*>(apRef->GetNiNode()) : nullptr;
+    if (!pRoot || !acpName || !*acpName)
+        return {};
+    void* pNode = FindShallowest(pRoot, acpName);
+    if (!pNode || pNode == pRoot)
+        return {};
+    return ToGlm(At<NiTransform>(pNode, kWorldOffset).translate) - ToGlm(At<NiTransform>(pRoot, kWorldOffset).translate);
+}
+
 namespace
 {
 std::mutex s_otherHandsLock;
