@@ -15,9 +15,9 @@ struct ItemPickedUpEvent
 {
     uint32_t RefFormId{};
 
-    //! A placed book, named here because the reference is gone by the time the event runs.
-    //! Nothing else reports a taken book: activation sync leaves books out, and HIGGS picks them up directly (SkipActivateBooks).
-    bool PlacedBook{};
+    //! A placed thing (a plugin's reference, no quest object), named here because the reference is gone by the time the event runs.
+    //! Activation sync tells only the players who are there at that moment, and leaves books out; this is what the server remembers.
+    bool Placed{};
     GameId ObjectId{};
     GameId CellId{};
     GameId WorldSpaceId{};

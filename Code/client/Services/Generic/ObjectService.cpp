@@ -415,6 +415,13 @@ void ObjectService::OnActivateNotify(const NotifyActivate& acMessage) noexcept
         return;
     }
 
+    // Already taken off the floor here: a taken placed thing is also sent as taken (DroppedItemService), and that may come first.
+    if (pObject->IsDisabled() || pObject->IsDeleted())
+    {
+        spdlog::info("Activation of {:X}, activated by server id {:X}: it is disabled here already; not done", pObject->formID, acMessage.ActivatorId);
+        return;
+    }
+
     // A door that does not lead elsewhere is set to the state it was left in over there, not used again here.
     // It needs no actor, so a door opened by an NPC this game has no copy of opens too.
     // Setting it is not an activation here, so nothing is sent back and two games cannot pass it to and fro.

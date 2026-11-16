@@ -318,13 +318,15 @@ char TP_MAKE_THISCALL(HookPickUpObject, PlayerCharacter, TESObjectREFR* apObject
     // Sent before the pick-up runs, because afterwards the reference is gone.
     // DroppedItemService decides whether the server remembers the item, and if so tells everyone to remove their copy.
     // Placed references count too: one may stand in for another player's drop of the same item.
-    // A placed book also carries its cell and position, so other players remove their copy from the table.
+    // A placed thing also carries its cell and position: the server remembers it as taken, for the players in range and for those who
+    // come later. Without that a player who enters the place afterwards still has it lying there, and can carry what nobody else sees.
+    // Not a quest object: each player's game needs its own (see above).
     if (apObject->IsTemporary() || !ScopedActivateOverride::IsOverriden())
     {
         ItemPickedUpEvent event{apObject->formID};
-        if (!apObject->IsTemporary() && apObject->baseForm->formType == FormType::Book && modSystem.GetServerModId(apObject->formID, event.ObjectId))
+        if (!apObject->IsTemporary() && !item.IsQuestItem && modSystem.GetServerModId(apObject->formID, event.ObjectId))
         {
-            event.PlacedBook = true;
+            event.Placed = true;
             if (TESObjectCELL* pCell = apObject->GetParentCellEx())
                 modSystem.GetServerModId(pCell->formID, event.CellId);
             if (TESWorldSpace* pWorldSpace = apObject->GetWorldSpace())

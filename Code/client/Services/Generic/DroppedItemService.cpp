@@ -343,9 +343,8 @@ void DroppedItemService::OnItemPickedUp(const ItemPickedUpEvent& acEvent) noexce
     const auto it = m_idByRef.find(acEvent.RefFormId);
     if (it == m_idByRef.end())
     {
-        // A placed book taken: sent as a world object taken, so every other game disables its own copy.
-        // Activation sync leaves books out (TESObjectREFR.cpp, HookActivate).
-        if (acEvent.PlacedBook && m_transport.IsConnected())
+        // A placed thing taken: sent as a world object taken, so every other game disables its own copy, also one that comes near later.
+        if (acEvent.Placed && m_transport.IsConnected())
         {
             RequestWorldObjectMove request{};
             request.ObjectId = acEvent.ObjectId;
@@ -355,7 +354,7 @@ void DroppedItemService::OnItemPickedUp(const ItemPickedUpEvent& acEvent) noexce
             request.Taken = true;
             m_transport.Send(request);
             m_objectMotion.erase(acEvent.RefFormId);
-            spdlog::info("WorldObject: book {:X} taken here; asking everyone to take it off the floor", acEvent.RefFormId);
+            spdlog::info("WorldObject: {:X} taken here; the server keeps it as taken for everyone, now and later", acEvent.RefFormId);
         }
         return; // not an item the server was keeping
     }
@@ -1033,7 +1032,7 @@ void DroppedItemService::OnNotifyWorldObjectMove(const NotifyWorldObjectMove& ac
     const uint32_t cFormId = m_world.GetModSystem().GetGameId(acMessage.ObjectId);
     TESObjectREFR* pRef = cFormId ? Cast<TESObjectREFR>(TESForm::GetById(cFormId)) : nullptr;
 
-    // Taken into another player's inventory (a book, see OnItemPickedUp): gone from this world too.
+    // Taken into another player's inventory (see OnItemPickedUp): gone from this world too.
     // Disabled, not deleted: it is a plugin's placed reference, and disabled is how this save keeps it.
     if (acMessage.Taken)
     {
