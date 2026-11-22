@@ -5,6 +5,7 @@
 
 #include "loader/ExeLoader.h"
 #include "loader/PathRerouting.h"
+#include "loader/OpenVRLoader.h"
 
 #include "Utils/Error.h"
 #include "Utils/FileVersion.inl"
@@ -79,6 +80,8 @@ int StartUp(int argc, char** argv)
 
 #if (!IS_MASTER)
     TiltedPhoques::Debug::CreateConsole();
+    // The library names the console after itself; players see the mod's name instead.
+    SetConsoleTitleW(L"urSovngarde Console");
 #endif
 
     SetMaxstdio();
@@ -107,6 +110,8 @@ int StartUp(int argc, char** argv)
 
     // Bind path environment.
     loader::InstallPathRouting(LC->gamePath);
+    // Before Steam's folder joins the lookups: the game's own VR file, OpenComposite when a player installed it.
+    loader::LoadGameOpenVR(LC->gamePath);
     steam::Load(LC->gamePath);
 
     if (!LoadProgram(*LC))

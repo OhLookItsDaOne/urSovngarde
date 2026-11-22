@@ -1,4 +1,5 @@
 #include <TiltedOnlinePCH.h>
+#include <BuildVersion.h>
 
 #include <TiltedOnlineApp.h>
 
@@ -7,6 +8,7 @@
 #include <WindowsHook.hpp>
 
 #include <PluginCalls.h>
+#include <Games/Skyrim/BSInput/GameInputHold.h>
 #include <World.h>
 #include <ScriptExtender.h>
 
@@ -22,6 +24,8 @@
 
 #include <NvidiaUtil.h>
 
+#include <tlhelp32.h>
+
 using TiltedPhoques::Debug;
 
 namespace
@@ -30,9 +34,13 @@ namespace
 std::shared_ptr<spdlog::sinks::rotating_file_sink_mt> CreateClientLogSink(const std::filesystem::path& acLogPath)
 {
     std::string filename = "tp_client.log";
+    // A slot belongs to one log folder: a game started from another folder (a flat game beside a VR one) keeps its tp_client.log.
+    std::wstring folder = std::filesystem::absolute(acLogPath).wstring();
+    std::transform(folder.begin(), folder.end(), folder.begin(), towlower);
+    const size_t cFolderHash = std::hash<std::wstring>{}(folder);
     for (uint32_t instance = 1;; ++instance)
     {
-        const auto mutexName = fmt::format("SkyrimTogether.ClientLog.Instance_{}", instance);
+        const auto mutexName = fmt::format("SkyrimTogether.ClientLog.{:016X}.Instance_{}", cFolderHash, instance);
         HANDLE pMutex = CreateMutexA(nullptr, FALSE, mutexName.c_str());
         const DWORD error = GetLastError();
 
@@ -83,9 +91,119 @@ static void LogEngineFixes7() noexcept
     }
 }
 
+// A plugin's version as Crash Logger shows it: the file's ProductVersion text, else the version it gives SKSE.
+// The file's numeric version comes last, because some are placeholders (DynDOLOD's is 666.666.666.666).
+static std::string PluginVersionOf(const MODULEENTRY32W& acEntry) noexcept
+{
+    std::string data;
+    DWORD handle = 0;
+    if (const DWORD cSize = GetFileVersionInfoSizeW(acEntry.szExePath, &handle))
+    {
+        data.resize(cSize);
+        if (!GetFileVersionInfoW(acEntry.szExePath, 0, cSize, data.data()))
+            data.clear();
+    }
+
+    if (!data.empty())
+    {
+        struct Translation
+        {
+            WORD Language;
+            WORD CodePage;
+        };
+        Translation* pTranslations = nullptr;
+        UINT size = 0;
+        std::vector<Translation> translations;
+        if (VerQueryValueW(data.data(), L"\\VarFileInfo\\Translation", reinterpret_cast<LPVOID*>(&pTranslations), &size) && pTranslations)
+            translations.assign(pTranslations, pTranslations + size / sizeof(Translation));
+        translations.push_back({0x0409, 0x04B0});
+        translations.push_back({0x0409, 0x04E4});
+
+        for (const auto& cTranslation : translations)
+        {
+            wchar_t key[64];
+            swprintf_s(key, L"\\StringFileInfo\\%04x%04x\\ProductVersion", cTranslation.Language, cTranslation.CodePage);
+            wchar_t* pText = nullptr;
+            UINT length = 0;
+            if (VerQueryValueW(data.data(), key, reinterpret_cast<LPVOID*>(&pText), &length) && pText && length > 1 && *pText)
+            {
+                char text[256]{};
+                if (!WideCharToMultiByte(CP_UTF8, 0, pText, -1, text, sizeof(text) - 1, nullptr, nullptr))
+                    continue;
+                // The log line separates plugins with commas, and old version texts are written "1, 0, 0, 1".
+                std::string version;
+                for (const char* p = text; *p; ++p)
+                {
+                    if (*p == ',')
+                        version += '.';
+                    else if (*p != ' ' || (p > text && p[-1] != ','))
+                        version += *p;
+                }
+                return version;
+            }
+        }
+    }
+
+    struct SksePluginVersion
+    {
+        uint32_t DataVersion;
+        uint32_t PluginVersion;
+    };
+    if (const auto* pVersion = reinterpret_cast<const SksePluginVersion*>(GetProcAddress(acEntry.hModule, "SKSEPlugin_Version")))
+    {
+        const uint32_t cPacked = pVersion->PluginVersion;
+        std::string version = fmt::format("{}.{}.{}", cPacked >> 24, (cPacked >> 16) & 0xFF, (cPacked >> 4) & 0xFFF);
+        if (cPacked & 0xF)
+            version += fmt::format(".{}", cPacked & 0xF);
+        return version;
+    }
+
+    VS_FIXEDFILEINFO* pInfo = nullptr;
+    UINT infoSize = 0;
+    if (!data.empty() && VerQueryValueW(data.data(), L"\\", reinterpret_cast<LPVOID*>(&pInfo), &infoSize) && pInfo &&
+        infoSize >= sizeof(VS_FIXEDFILEINFO))
+        return fmt::format("{}.{}.{}.{}", pInfo->dwFileVersionMS >> 16, pInfo->dwFileVersionMS & 0xFFFF, pInfo->dwFileVersionLS >> 16, pInfo->dwFileVersionLS & 0xFFFF);
+
+    return "no version";
+}
+
+// Logs every loaded SKSE plugin with its version, so a crash report shows which build of each plugin was there.
+// Called at the first update, once SKSE has loaded its plugins.
+// Only file names are logged: a mod manager's path holds the player's folders.
+static void LogPluginVersions() noexcept
+{
+    const HANDLE cSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (cSnapshot == INVALID_HANDLE_VALUE)
+        return;
+
+    std::string list;
+    uint32_t count = 0;
+    MODULEENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    for (BOOL more = Module32FirstW(cSnapshot, &entry); more; more = Module32NextW(cSnapshot, &entry))
+    {
+        std::wstring path = entry.szExePath;
+        std::transform(path.begin(), path.end(), path.begin(), towlower);
+        if (path.find(L"\\skse\\plugins\\") == std::wstring::npos)
+            continue;
+
+        char name[MAX_MODULE_NAME32 * 3 + 1]{};
+        WideCharToMultiByte(CP_UTF8, 0, entry.szModule, -1, name, sizeof(name) - 1, nullptr, nullptr);
+        list += fmt::format("{}{} {}", count ? ", " : "", name, PluginVersionOf(entry));
+        ++count;
+    }
+    CloseHandle(cSnapshot);
+
+    spdlog::info("SKSE plugins ({}): {}", count, count ? list : "none");
+}
+
 #ifdef SKYRIMVR
 // RenderPassWatch.cpp: hooks the list draw the first time the map is open, after every SKSE plugin has loaded.
 void InstallDrawListCheck() noexcept;
+#endif
+#ifndef SKYRIMVR
+// BSInputDeviceManager.cpp: hooks the device poll at the first update, after every SKSE plugin has loaded.
+void InstallInputFocusCheck() noexcept;
 #endif
 
 TiltedOnlineApp::TiltedOnlineApp()
@@ -110,13 +228,20 @@ TiltedOnlineApp::TiltedOnlineApp()
     logger->flush_on(spdlog::level::warn);
     set_default_logger(logger);
 
-    spdlog::info("Skyrim Together client, build " BUILD_BRANCH "@" BUILD_COMMIT);
+    spdlog::info("Skyrim Together client, build {}", BuildVersion::Tag());
 
 #ifdef SKYRIMVR
     // Logged here because the address database loads before the logger exists.
     // Each is an id the installed VR Address Library defines differently; ours is used.
     for (const auto& conflict : VersionDb::Get().GetOverrideConflicts())
         spdlog::warn("Address id {} differs: the VR Address Library says {:X}, this client uses its own {:X}", conflict.Id, conflict.Library, conflict.Ours);
+
+    // Other plugins still read the player's library, and an older one lacks ids they need.
+    const auto& cDb = VersionDb::Get();
+    if (cDb.GetLibraryIdCount() == 0)
+        spdlog::warn("VR Address Library: its file holds no ids");
+    else
+        spdlog::info("VR Address Library {}: {} ids", cDb.GetLibraryVersion().empty() ? "of unknown version" : cDb.GetLibraryVersion(), cDb.GetLibraryIdCount());
 #endif
 }
 
@@ -179,10 +304,14 @@ void TiltedOnlineApp::Update()
     {
         s_engineFixesLogged = true;
         LogEngineFixes7();
+        LogPluginVersions();
     }
 #ifdef SKYRIMVR
     InstallDrawListCheck();
+#else
+    InstallInputFocusCheck();
 #endif
+    GameInputHold::Install();
 
     World::Get().Update();
     RunPluginCalls();

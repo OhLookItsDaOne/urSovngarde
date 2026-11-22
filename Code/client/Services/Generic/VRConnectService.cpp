@@ -1,7 +1,5 @@
 #include <TiltedOnlinePCH.h>
 
-#ifdef SKYRIMVR
-
 #include <Services/VRConnectService.h>
 #include <Services/ConnectFile.h>
 #include <Services/TransportService.h>
@@ -15,6 +13,7 @@
 #include <Interface/UI.h>
 #include <Forms/TESNPC.h>
 #include <PlayerCharacter.h>
+#include <Copies/PlayerLook.h>
 #include <ScriptExtender.h>
 #include <Utils.h>
 #include <World.h>
@@ -24,6 +23,14 @@ namespace
 constexpr auto kAutoConnectDelay = 5s;    // after a save is loaded, so the cell has settled, before the install checks and the connection or the F6 hint
 constexpr auto kAttemptTimeout = 30s;     // an attempt that never reports back is abandoned
 constexpr std::array<std::chrono::seconds, 5> kRetryDelays{5s, 10s, 20s, 30s, 60s};
+#ifdef SKYRIMVR
+constexpr const char* kScriptExtender = "SKSE VR";
+constexpr const char* kNoServerHint = "no server set, join from the urSovngarde launcher";
+#else
+constexpr const char* kScriptExtender = "SKSE";
+// A flat player also picks a server in the menu.
+constexpr const char* kNoServerHint = "no server set, pick one in the menu (F2) or join from the urSovngarde launcher";
+#endif
 
 // The name the server knows this player by: TransportService sends it when connecting.
 TiltedPhoques::String PlayerName() noexcept
@@ -36,12 +43,9 @@ TiltedPhoques::String PlayerName() noexcept
 
 bool VRConnectService::LoadConfig(Config& aConfig) noexcept
 {
-    char localAppData[MAX_PATH] = "";
-    GetEnvironmentVariableA("LOCALAPPDATA", localAppData, sizeof(localAppData));
-
     // The working directory is the game's, so under Mod Organizer this path shows the mods.
     ConnectFile::Contents contents;
-    if (!ConnectFile::Load(std::string(localAppData) + "\\SkyrimTogetherVR\\connect.txt", "Data\\SKSE\\Plugins\\urSovngarde\\connect.txt", contents))
+    if (!ConnectFile::Load(ConnectFile::PlayerFolder() / "connect.txt", "Data\\SKSE\\Plugins\\urSovngarde\\connect.txt", contents))
         return false;
 
     aConfig.Address = contents.Address.c_str();
@@ -53,28 +57,103 @@ bool VRConnectService::LoadConfig(Config& aConfig) noexcept
 }
 
 VRConnectService::VRConnectService(World& aWorld, entt::dispatcher& aDispatcher, TransportService& aTransport) noexcept
-    : m_transport(aTransport)
+    : m_world(aWorld)
+    , m_transport(aTransport)
 {
     m_updateConnection = aDispatcher.sink<UpdateEvent>().connect<&VRConnectService::OnUpdate>(this);
     m_connectedConnection = aDispatcher.sink<ConnectedEvent>().connect<&VRConnectService::OnConnected>(this);
     m_disconnectedConnection = aDispatcher.sink<DisconnectedEvent>().connect<&VRConnectService::OnDisconnected>(this);
     m_connectionErrorConnection = aDispatcher.sink<ConnectionErrorEvent>().connect<&VRConnectService::OnConnectionError>(this);
+    EventDispatcherManager::Get()->loadGameEvent.RegisterSink(this);
+}
+
+BSTEventResult VRConnectService::OnEvent(const TESLoadGameEvent*, const EventDispatcher<TESLoadGameEvent>*)
+{
+    ++m_saveLoads;
+    return BSTEventResult::kOk;
 }
 
 void VRConnectService::Toggle() noexcept
 {
     if (m_state == State::kOnline || m_state == State::kConnecting)
     {
-        spdlog::info("VRConnectService: disconnecting, asked for here (F6 or the menu)");
-        // Set before closing: Close() reports the disconnection synchronously, and it must not schedule a retry.
-        m_state = State::kIdle;
-        m_transport.Close();
-        Utils::ShowHudMessage("urSovngarde: disconnected (F6 to connect again)");
+        Stop();
         return;
     }
 
     m_failedAttempts = 0;
     StartAttempt();
+}
+
+void VRConnectService::Stop() noexcept
+{
+    // A friend's server never reached is given up; one left on purpose stays F6's.
+    if (m_state != State::kOnline)
+    {
+        m_chosen.reset();
+        m_chosenNext.clear();
+    }
+
+    const bool cWasTrying = m_state != State::kIdle;
+    // Set before closing: Close() reports the disconnection synchronously, and it must not schedule a retry.
+    m_state = State::kIdle;
+    m_transport.Close();
+    if (!cWasTrying)
+        return;
+
+    spdlog::info("VRConnectService: disconnecting, asked for here (F6 or the menu)");
+    Utils::ShowModHudMessage("disconnected (F6 to connect again)");
+}
+
+void VRConnectService::ConnectNow() noexcept
+{
+    spdlog::info("VRConnectService: joining the server the launcher just set, asked for in the menu");
+    m_chosen.reset();
+    m_chosenNext.clear();
+    ReconnectNow();
+}
+
+void VRConnectService::ConnectTo(const std::vector<std::string>& acAddresses, const std::string& acPassword) noexcept
+{
+    if (acAddresses.empty())
+        return;
+
+    spdlog::info("VRConnectService: joining a Steam friend's server, asked for in the menu");
+    m_chosen = Config{acAddresses.front().c_str(), acPassword.c_str(), false};
+    m_chosenNext.assign(acAddresses.begin() + 1, acAddresses.end());
+    m_chosenIsFriend = true;
+    ReconnectNow();
+}
+
+void VRConnectService::ConnectToServer(const std::string& acAddress, const std::string& acPassword) noexcept
+{
+    spdlog::info("VRConnectService: joining the server chosen in the menu");
+    m_chosen = Config{acAddress.c_str(), acPassword.c_str(), false};
+    m_chosenNext.clear();
+    m_chosenIsFriend = false;
+    ReconnectNow();
+}
+
+/**
+ * Check if the server this game connects to, or is on, came from a Steam friend's share.
+ * Such an address is the friend's to give, so it is not passed on to this player's own Steam friends.
+ *
+ * @return True while the menu's pick of a Steam friend's server is in use; false for connect.txt, the launcher and the menu's own server list.
+ */
+bool VRConnectService::IsServerFromFriendsShare() const noexcept
+{
+    // The friend flag counts only while the pick is in use: leaving it, or connecting elsewhere, clears the pick.
+    return m_chosen.has_value() && m_chosenIsFriend;
+}
+
+void VRConnectService::ReconnectNow() noexcept
+{
+    // Waiting before closing: the disconnection then schedules nothing, and the next update connects.
+    // Before a save is loaded, that update comes once the game is in.
+    m_state = State::kWaiting;
+    m_failedAttempts = 0;
+    m_nextAttempt = std::chrono::steady_clock::now();
+    m_transport.Close();
 }
 
 bool VRConnectService::CheckInstall() noexcept
@@ -84,15 +163,15 @@ bool VRConnectService::CheckInstall() noexcept
 
     if (!IsScriptExtenderLoaded())
     {
-        spdlog::error("VRConnectService: SKSE VR is not loaded");
-        Utils::ShowHudMessage("urSovngarde: SKSE VR is not loaded, check the SKSE VR install");
+        spdlog::error("VRConnectService: {} is not loaded", kScriptExtender);
+        Utils::ShowModHudMessage(fmt::format("{0} is not loaded, check the {0} install", kScriptExtender).c_str());
     }
 
     auto* pGrids = INISettingCollection::Get()->GetSetting("uGridsToLoad:General");
     if (pGrids && pGrids->data != 5)
     {
         spdlog::error("VRConnectService: uGridsToLoad is {}, the server requires 5", pGrids->data);
-        Utils::ShowHudMessage("urSovngarde: set uGridsToLoad=5 in SkyrimPrefs.ini, the server refuses other values");
+        Utils::ShowModHudMessage("set uGridsToLoad=5 in SkyrimPrefs.ini, the server refuses other values");
         ok = false;
     }
 
@@ -110,22 +189,34 @@ void VRConnectService::StartAttempt() noexcept
 {
     if (!IsInGame())
     {
-        Utils::ShowHudMessage("urSovngarde: load a save before connecting");
+        Utils::ShowModHudMessage("load a save before connecting");
         m_state = State::kIdle;
         return;
     }
 
     Config config;
-    if (!LoadConfig(config))
+    if (m_chosen)
+        config = *m_chosen;
+    else if (!LoadConfig(config))
     {
-        spdlog::warn("VRConnectService: no server in %LOCALAPPDATA%\\SkyrimTogetherVR\\connect.txt or Data\\SKSE\\Plugins\\urSovngarde\\connect.txt");
-        Utils::ShowHudMessage("urSovngarde: no server set, join from the urSovngarde launcher");
+        // The folder by name only: its full path holds the Windows user name, and logs end up in crash reports.
+        spdlog::warn("VRConnectService: no server in %LOCALAPPDATA%\\{}\\connect.txt or Data\\SKSE\\Plugins\\urSovngarde\\connect.txt", ConnectFile::kFolderName);
+        Utils::ShowModHudMessage(kNoServerHint);
         m_state = State::kIdle;
         return;
     }
 
-    spdlog::info("VRConnectService: connecting to {} (attempt {})", config.Address.c_str(), m_failedAttempts + 1);
-    Utils::ShowHudMessage(TiltedPhoques::String("urSovngarde: connecting to ") + config.Address);
+    // A server picked in the menu stays off the HUD and out of the log: it can be a friend's home, and both can end up on a stream or in a crash report.
+    if (m_chosen)
+    {
+        spdlog::info("VRConnectService: connecting to {} (attempt {})", m_chosenIsFriend ? "a Steam friend's server" : "the server chosen in the menu", m_failedAttempts + 1);
+        Utils::ShowModHudMessage(m_chosenIsFriend ? "connecting to your friend's server" : "connecting to the server you chose");
+    }
+    else
+    {
+        spdlog::info("VRConnectService: connecting to {} (attempt {})", config.Address.c_str(), m_failedAttempts + 1);
+        Utils::ShowModHudMessage(TiltedPhoques::String("connecting to ") + config.Address);
+    }
 
     // Any leftover connection (say a dashboard connect still trying) is closed while the state is still idle or waiting.
     // Its disconnection then schedules no retry; closed after the state change, it would read as this attempt failing.
@@ -152,6 +243,38 @@ void VRConnectService::OnUpdate(const UpdateEvent&) noexcept
         m_nameCheckDue = true;
     }
 
+    // A trip through the main menu counts as a save load: a New Game started there raises no load event, and is another character all the same.
+    static const BSFixedString s_mainMenu("Main Menu");
+    const UI* pUI = UI::Get();
+    const bool cAtMainMenu = pUI && pUI->GetMenuOpen(s_mainMenu);
+    if (cAtMainMenu && !m_atMainMenu)
+        ++m_saveLoads;
+    m_atMainMenu = cAtMainMenu;
+
+    // Character creation, or a race menu later, changes the look and often the name with no loading screen: both go at once.
+    static const BSFixedString s_raceMenu("RaceSex Menu");
+    const bool cInRaceMenu = pUI && pUI->GetMenuOpen(s_raceMenu);
+    if (m_inRaceMenu && !cInRaceMenu && m_state == State::kOnline)
+    {
+        // After a save load the name check has not seen, that check decides: a New Game's race menu belongs to another character.
+        if (m_saveLoads != m_saveLoadsChecked)
+            m_nameCheckDue = true;
+        else
+        {
+            spdlog::info("VRConnectService: the race menu closed; the character's look and name '{}' sent, still connected", PlayerName().c_str());
+            m_lookPending = true;
+        }
+    }
+    m_inRaceMenu = cInRaceMenu;
+
+    // Tried again each update until it goes: right after connecting the player has no server character yet.
+    if (m_lookPending && m_state == State::kOnline && PlayerLook::SendRenamed(m_world, m_transport))
+    {
+        m_lookPending = false;
+        if (const auto cName = PlayerName(); !cName.empty())
+            m_connectedName = cName;
+    }
+
     if (!IsInGame())
     {
         m_inGameSince = {};
@@ -176,13 +299,15 @@ void VRConnectService::OnUpdate(const UpdateEvent&) noexcept
             Config config;
             if (!LoadConfig(config))
             {
-                Utils::ShowHudMessage("urSovngarde: no server set, join from the urSovngarde launcher or run setup-connect.bat in the mod's folder");
+#ifdef SKYRIMVR
+                Utils::ShowModHudMessage("no server set, join from the urSovngarde launcher or run setup-connect.bat in the mod's folder");
+#endif
                 return;
             }
             if (!config.AutoConnect)
             {
                 spdlog::info("VRConnectService: ready to connect to {}; waiting for F6", config.Address.c_str());
-                Utils::ShowHudMessage(TiltedPhoques::String("urSovngarde: press F6 to connect to ") + config.Address);
+                Utils::ShowModHudMessage(TiltedPhoques::String("press F6 to connect to ") + config.Address);
                 return;
             }
         }
@@ -205,19 +330,28 @@ void VRConnectService::OnUpdate(const UpdateEvent&) noexcept
         break;
 
     case State::kOnline:
-        // Another character loaded while connected: reconnect, or the others keep seeing the old one.
-        // The server keeps the name and body it was given when connecting.
+        // Checked once after each loading screen, when the cell has settled.
+        // A new name after a save load is another character: reconnect, as the server keeps the name and body it was given when connecting.
+        // A new name with no save loaded is the same character renamed in play (character creation, a quest, a mod): its look and name are sent instead.
+        // A reconnect hands away every NPC this game runs, mid-scene if need be, and sends every actor again.
         // The name is compared rather than the race, which changes in a werewolf's fight.
-        // Only once after each loading screen, when the cell has settled: a quest or a mod may rename the player in play.
-        // A name that changes in play is not another character, and each reconnect sends every actor again.
         if (m_nameCheckDue && now - m_inGameSince >= kAutoConnectDelay)
         {
             m_nameCheckDue = false;
             const auto name = PlayerName();
-            if (!name.empty() && !m_connectedName.empty() && name != m_connectedName)
+            const bool cSaveLoaded = m_saveLoads != m_saveLoadsChecked;
+            m_saveLoadsChecked = m_saveLoads;
+            if (!name.empty() && !m_connectedName.empty() && name != m_connectedName && !cSaveLoaded)
+            {
+                // Renamed in play (character creation, a quest, a mod): the same character, who keeps their id, party and NPCs.
+                spdlog::info("VRConnectService: the character was renamed '{}' in play, was '{}'; its name and look sent, still connected", name.c_str(),
+                             m_connectedName.c_str());
+                m_lookPending = true;
+            }
+            else if (!name.empty() && !m_connectedName.empty() && name != m_connectedName)
             {
                 spdlog::info("VRConnectService: the character is now '{}', was '{}' when connecting; connecting again", name.c_str(), m_connectedName.c_str());
-                Utils::ShowHudMessage("urSovngarde: another character was loaded, connecting again");
+                Utils::ShowModHudMessage("another character was loaded, connecting again");
                 // Waiting before closing: the disconnection then schedules nothing, and the next update connects.
                 m_state = State::kWaiting;
                 m_failedAttempts = 0;
@@ -231,12 +365,17 @@ void VRConnectService::OnUpdate(const UpdateEvent&) noexcept
 
 void VRConnectService::OnConnected(const ConnectedEvent&) noexcept
 {
+    // Connected somewhere else from the menu: a drop from there must not come back to the friend's server.
+    if (m_chosen && m_transport.GetServerEndpoint() != m_chosen->Address.c_str())
+        m_chosen.reset();
     m_state = State::kOnline;
     m_failedAttempts = 0;
     m_autoConnectDone = true;
     m_connectedName = PlayerName();
     m_nameCheckDue = false;
     m_loadingScreensSeen = UI::LoadingScreensQueued();
+    m_saveLoadsChecked = m_saveLoads;
+    m_lookPending = false;
 }
 
 void VRConnectService::OnDisconnected(const DisconnectedEvent&) noexcept
@@ -246,6 +385,18 @@ void VRConnectService::OnDisconnected(const DisconnectedEvent&) noexcept
         return;
 
     const bool wasOnline = m_state == State::kOnline;
+
+    // A friend's server that did not answer at one address is tried at the next one at once.
+    if (!wasOnline && m_chosen && !m_chosenNext.empty())
+    {
+        m_chosen->Address = m_chosenNext.front().c_str();
+        m_chosenNext.erase(m_chosenNext.begin());
+        m_state = State::kWaiting;
+        m_nextAttempt = std::chrono::steady_clock::now();
+        spdlog::info("VRConnectService: no answer from the friend's server there; trying its next address");
+        return;
+    }
+
     const auto delay = kRetryDelays[std::min<size_t>(m_failedAttempts, kRetryDelays.size() - 1)];
     ++m_failedAttempts;
 
@@ -267,6 +418,6 @@ void VRConnectService::OnConnectionError(const ConnectionErrorEvent&) noexcept
 
     spdlog::info("VRConnectService: connection refused by the server, not retrying");
     m_state = State::kIdle;
+    m_chosen.reset();
+    m_chosenNext.clear();
 }
-
-#endif

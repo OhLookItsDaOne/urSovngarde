@@ -15,7 +15,8 @@
 #include <Games/Memory.h>
 #include <Combat/CombatController.h>
 #include <CrashHandler.h>
-#include <RecentModelChanges.h>
+#include <Copies/RecentModelChanges.h>
+#include <Copies/SceneLines.h>
 
 #include <Events/HealthChangeEvent.h>
 #include <Events/InventoryChangeEvent.h>
@@ -23,10 +24,10 @@
 #include <Events/DialogueEvent.h>
 #include <Games/Misc/MenuTopicManager.h>
 #include <Events/HitEvent.h>
-#ifdef SKYRIMVR
-#include <Games/Skyrim/VRBodySync.h>
 #include <Services/ActorValueService.h>
-#include <Services/CalendarService.h>
+#include <Games/Skyrim/VR/PoseKeepDiag.h>
+#ifdef SKYRIMVR
+#include <Games/Skyrim/VR/VRBodySync.h>
 #endif
 #include <Events/RemoveSpellEvent.h>
 #include <Events/DroppedItemEvents.h>
@@ -45,7 +46,7 @@
 #include <Games/Skyrim/Misc/InventoryEntry.h>
 #include <Games/Skyrim/ExtraData/ExtraCount.h>
 #include <Games/Misc/ActorKnowledge.h>
-#include <InventoryCompare.h>
+#include <Copies/InventoryCompare.h>
 
 #include <ExtraData/ExtraDataList.h>
 #include <ExtraData/ExtraCharge.h>
@@ -71,8 +72,11 @@
 #include <Forms/TESObjectARMO.h>
 
 #include <ModCompat/BehaviorVar.h>
-#include <PerfScope.h>
+#include <Helpers/PerfScope.h>
 #include <Services/PvpProjectiles.h>
+#include <Services/PvpRules.h>
+#include <Helpers/FiniteVector.h>
+#include <Helpers/ModuleImage.h>
 
 namespace
 {
@@ -268,12 +272,7 @@ void LogSetPositionOwner() noexcept
         spdlog::info("ForcePosition: Character::SetPosition is the game's own; copies are moved with it");
         return;
     }
-    char path[MAX_PATH] = "?";
-    HMODULE hModule = nullptr;
-    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCSTR>(pCurrent), &hModule) && hModule)
-        GetModuleFileNameA(hModule, path, MAX_PATH);
-    const char* pFile = std::strrchr(path, '\\');
-    spdlog::info("ForcePosition: Character::SetPosition is replaced by {}; copies are moved with the game's own instead", pFile ? pFile + 1 : path);
+    spdlog::info("ForcePosition: Character::SetPosition is replaced by {}; copies are moved with the game's own instead", ModuleImage::NameOf(pCurrent));
 }
 
 // Moves a Character with the game's own SetPosition, which a plugin watching for teleports does not see.
@@ -307,6 +306,10 @@ void Actor::ForcePosition(const NiPoint3& acPosition) noexcept
             updateController = pController->UpdateStepTiming();
         }
     }
+
+    // TEMPORARY (PoseKeepDiag): how often another player's copy has its 3D moved at once.
+    if (pExtension && pExtension->IsRemotePlayer())
+        PoseKeepDiag::NotePlaced(formID, !updateController);
 
     // With no usable step yet, update the reference and 3D now.
     // Interpolation catches the controller up once physics timing becomes available.
@@ -524,6 +527,12 @@ void Actor::StopCombat() noexcept
     s_pStopCombat(this);
 }
 
+bool Actor::IsHostileToActor(Actor* apActor) noexcept
+{
+    PAPYRUS_FUNCTION(bool, Actor, IsHostileToActor, Actor*);
+    return apActor && s_pIsHostileToActor(this, apActor);
+}
+
 bool Actor::RemoveSpell(MagicItem* apSpell) noexcept
 {
     if (!apSpell)
@@ -737,6 +746,21 @@ void Actor::SetCommandingActor(BSPointerHandle<TESObjectREFR> aCommandingActor) 
         currentProcess->middleProcess->commandingActor = aCommandingActor;
         flags2 |= ActorFlags::IS_COMMANDED_ACTOR;
     }
+}
+
+/**
+ * Whether a spell is raising this body: dead, and already commanded by the one who raised it.
+ * The game counts a raised body dead for its first moments.
+ * A raise starts only in the game that runs the body (MagicTarget::IsRaiseOnCopy), so a copy is being raised only when this game ran it as the raise began.
+ * A copy of another player's summon is commanded by this game's own mark (ActorExtension::CommandedAsSummonCopy), which says nothing of a raise.
+ *
+ * @return True while the body is dead and commanded by a spell.
+ */
+bool Actor::IsBeingRaised() const noexcept
+{
+    const ActorExtension* pExtension = const_cast<Actor*>(this)->GetExtension();
+    const bool cCommandedBySpell = IsCommandedActor() && !(pExtension && pExtension->CommandedAsSummonCopy);
+    return cCommandedBySpell && IsDead();
 }
 
 bool Actor::IsPlayerSummon() const noexcept
@@ -1192,37 +1216,41 @@ void Actor::Kill(Actor* apKiller) noexcept
     */
 }
 
-void Actor::Reset() noexcept
-{
-    using ObjectReference = TESObjectREFR;
-
-    PAPYRUS_FUNCTION(void, ObjectReference, Reset, int, TESObjectREFR*);
-
-    s_pReset(this, 0, nullptr);
-}
-
 bool Actor::PlayIdle(TESIdleForm* apIdle) noexcept
 {
     PAPYRUS_FUNCTION(bool, Actor, PlayIdle, TESIdleForm*);
     return s_pPlayIdle(this, apIdle);
 }
 
+/**
+ * Bring a dead actor back to life where it lies, with its inventory and its 3D kept.
+ * The game's own Resurrect is called with its 3D attached, on flat and VR alike.
+ * No Reset follows: it unloads the actor, and a copy unloaded that way is removed, announced again and comes back dead, over and over.
+ * A body a spell is raising (IsBeingRaised) is left to its spell: the game's Resurrect ends every spell on the body, and a raise that ends turns it to ash.
+ * Such a body only gets the health a revival would give, if it has none: a copy's health follows its owner's only as that changes.
+ * A copy resurrected here is then watched until its revival lasts (ActorValueService::WatchCopyRevival).
+ */
 void Actor::Respawn() noexcept
 {
+    if (IsBeingRaised())
+    {
+        if (GetActorValue(ActorValueInfo::kHealth) <= 0.f)
+            ForceActorValue(ActorValueOwner::ForceMode::DAMAGE, ActorValueInfo::kHealth, GetActorPermanentValue(ActorValueInfo::kHealth));
+        spdlog::info("Revive: {:X} is raised by a spell; not resurrected, as that would end the spell and turn it to ash (health now {:.0f})", formID,
+                     GetActorValue(ActorValueInfo::kHealth));
+        return;
+    }
+
     RecentModelChanges::Note(this, RecentModelChanges::Kind::Revived);
-    LetHandsGoOfStrayExtraData("its item does not hold, before its revival");
-#ifdef SKYRIMVR
-    // Resurrect(resetInventory, attach3D) = SE 36331, by address like KillImpl above.
-    // No Reset here: it unloads the actor, and a copy announced again that way comes back dead.
+    EmptyHandsOfStrayExtraData("its item does not hold, before its revival");
+    // Resurrect(resetInventory, attach3D): Anniversary Edition 37321 on flat, SE 36331 for VR (VRAddressOverrides.h).
     TP_THIS_FUNCTION(TResurrect, void, Actor, bool aResetInventory, bool aAttach3D);
-    POINTER_SKYRIMSE(TResurrect, s_resurrect, 0, 36331);
-    TiltedPhoques::ThisCall(s_resurrect, this, false, true);
+    POINTER_SKYRIMSE(TResurrect, s_resurrect, 37321, 36331);
+    constexpr bool cResetInventory = false;
+    constexpr bool cAttach3D = true;
+    TiltedPhoques::ThisCall(s_resurrect, this, cResetInventory, cAttach3D);
     if (const ActorExtension* pExtension = GetExtension(); pExtension && pExtension->IsRemote())
         ActorValueService::WatchCopyRevival(formID);
-    return;
-#endif
-    Resurrect(false);
-    Reset();
 }
 
 bool Actor::IsVampireLord() const noexcept
@@ -1336,11 +1364,6 @@ static THitTarget* RealHitTarget = nullptr;
 // Our own clash keeps its block sound, sparks and buzz; a hit on his body goes through as before.
 void TP_MAKE_THISCALL(HookHitTarget, Actor, Actor* apTarget, void* apProjectile, bool aIsOffhand)
 {
-    // Physical hand tracking stays live while waiting for party sleep, including PLANCK weapon bodies.
-    // Those contacts must not turn a freely moving hand into an attack while controls are locked.
-    if (!apProjectile && CalendarService::AreSleepControlsLocked() && apThis == PlayerCharacter::Get())
-        return;
-
     if (apThis == PlayerCharacter::Get() && !apProjectile && apTarget)
     {
         const ActorExtension* pTarget = apTarget->GetExtension();
@@ -1390,10 +1413,10 @@ bool TP_MAKE_THISCALL(HookDamageActor, Actor, float aDamage, Actor* apHitter, bo
 
     if (pExHittee->IsLocalPlayer())
     {
-        if (!World::Get().GetServerSettings().PvpEnabled)
+        // Another player's hit here, a replayed arrow included, counts only between players who may fight.
         {
             const ActorExtension* pHitterExtension = apHitter ? apHitter->GetExtension() : nullptr;
-            if (pHitterExtension && pHitterExtension->IsRemotePlayer())
+            if (pHitterExtension && pHitterExtension->IsRemotePlayer() && !PvpRules::IsAllowedWithCopy(apHitter))
                 return false;
         }
 
@@ -1440,7 +1463,7 @@ bool TP_MAKE_THISCALL(HookDamageActor, Actor, float aDamage, Actor* apHitter, bo
         // With PvP on, the hit is sent as a health change, which the other side applies to its own player (floored at zero).
         // Only this player's own hits are sent: the other game already handles what its own NPCs do, so forwarding those doubles them.
         const ActorExtension* pPvpHitterExtension = apHitter ? apHitter->GetExtension() : nullptr;
-        if (World::Get().GetServerSettings().PvpEnabled && realDamage > 0.f && pPvpHitterExtension && pPvpHitterExtension->IsLocalPlayer())
+        if (PvpRules::IsAllowedWithCopy(apThis) && realDamage > 0.f && pPvpHitterExtension && pPvpHitterExtension->IsLocalPlayer())
         {
 #ifdef SKYRIMVR
             // The other player's sword is a body in this world (VRBodySync), and PLANCK counts a swing into any such body as a hit.
@@ -1767,9 +1790,9 @@ bool TP_MAKE_THISCALL(HookInitiateMountPackage, Actor, Actor* apMount)
         World::Get().GetRunner().Trigger(MountEvent(apThis->formID, apMount->formID));
 
     // TEMPORARY: a horse killed in play could still be ridden (its prompt said "Steal"); what the game had of it when a ride began.
-    if (apMount && pExtension && pExtension->IsLocal() && (((apMount->actorState.flags1 >> 21) & 0xF) != 0 || apMount->GetActorValue(ActorValueInfo::kHealth) <= 0.f))
+    if (apMount && pExtension && pExtension->IsLocal() && (apMount->actorState.LifeState() != LifeStates::kAlive || apMount->GetActorValue(ActorValueInfo::kHealth) <= 0.f))
         spdlog::info("Mount: {:X} starts to ride {:X}, whose life state here is {} (dead {}), health {:.0f}", apThis->formID, apMount->formID,
-                     (apMount->actorState.flags1 >> 21) & 0xF, apMount->IsDead(), apMount->GetActorValue(ActorValueInfo::kHealth));
+                     apMount->actorState.LifeState(), apMount->IsDead(), apMount->GetActorValue(ActorValueInfo::kHealth));
 
     return TiltedPhoques::ThisCall(RealInitiateMountPackage, apThis, apMount);
 }
@@ -1809,6 +1832,9 @@ float TP_MAKE_THISCALL(HookSpeakSoundFunction, Actor, const char* apName, uint32
 
     if (cShouldSync)
         World::Get().GetRunner().Trigger(DialogueEvent(apThis->formID, apName, sceneId, scenePhase));
+    // A copy speaking in a scene shows the scene runs here too, so lines of it from the speakers' owners are left to it.
+    else if (sceneId && pSpeakerExtension && pSpeakerExtension->IsRemote())
+        SceneLines::NoteCopyLine(sceneId);
 
     return TiltedPhoques::ThisCall(RealSpeakSoundFunction, apThis, apName, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
 }
@@ -1963,9 +1989,8 @@ static TMovementDirection* RealMovementDirection = nullptr;
 
 static void HookMovementDirection(const MovementTarget* apTarget, const NiPoint3* apPosition, const NiPoint3* apAngles, float aHeight, NiPoint3* apDirection)
 {
-    const auto cFinite = [](const NiPoint3& acPoint) { return std::isfinite(acPoint.x) && std::isfinite(acPoint.y) && std::isfinite(acPoint.z); };
     const bool cPlace = apTarget->Kind == 2 || apTarget->Kind == 3;
-    if (!cPlace || (cFinite(apTarget->Position) && cFinite(*apPosition)))
+    if (!cPlace || (IsFiniteVector(apTarget->Position) && IsFiniteVector(*apPosition)))
     {
         RealMovementDirection(apTarget, apPosition, apAngles, aHeight, apDirection);
         return;
@@ -1978,8 +2003,7 @@ static void HookMovementDirection(const MovementTarget* apTarget, const NiPoint3
 
     static std::atomic<uint64_t> s_next{0};
     if (SecondPassed(s_next))
-        spdlog::warn("NonFinite: a movement target at ({}, {}, {}) for the actor at ({}, {}, {}), facing ({:.2f}, {:.2f}), not followed", apTarget->Position.x,
-                     apTarget->Position.y, apTarget->Position.z, apPosition->x, apPosition->y, apPosition->z, apAngles->x, apAngles->z);
+        spdlog::warn("NonFinite: a movement target at ({}) for the actor at ({}), facing ({:.2f}, {:.2f}), not followed", apTarget->Position, *apPosition, apAngles->x, apAngles->z);
 }
 
 static void HookNonFiniteGuards() noexcept

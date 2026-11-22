@@ -14,6 +14,7 @@
 #include <Events/HitEvent.h>
 
 #include <Games/ActorExtension.h>
+#include <Services/PvpRules.h>
 #include <Games/Overrides.h>
 #include <Games/References.h>
 #include <PlayerCharacter.h>
@@ -47,6 +48,9 @@ static thread_local bool s_measurePerks = false;
 static thread_local float s_perkFactor = 1.f;
 // A damaging spell on another player's copy is made only to measure its perks: the effect is left with no magnitude.
 static thread_local bool s_measureOnly = false;
+// While only the game's own check of an effect runs (WouldTakeEffect): no effect is made, and whether the check passed is kept.
+static thread_local bool s_checkOnly = false;
+static thread_local bool s_checkPassed = false;
 
 // The effect lowers health: a harmful value modifier whose first value is health.
 // Fire is a single value modifier; frost and shock are dual ones that also take stamina or magicka.
@@ -65,6 +69,23 @@ static bool DamagesHealth(EffectItem* apEffect) noexcept
     return cModifiesValue && pSetting->primaryActorValue == ActorValueInfo::kHealth && (pSetting->flags & cDetrimental) != 0;
 }
 
+/**
+ * Run only the game's own check of an effect on a target, as it is run when the effect is added, without making the effect.
+ * That check refuses a target the effect cannot take: for a raise, a body too strong for it, or one not dead.
+ *
+ * @param apTarget The target.
+ * @param arData The effect, as it would be added.
+ * @return True when the game would add the effect.
+ */
+static bool WouldTakeEffect(MagicTarget* apTarget, MagicTarget::AddTargetData& arData) noexcept
+{
+    s_checkOnly = true;
+    s_checkPassed = false;
+    TiltedPhoques::ThisCall(RealAddTarget, apTarget, arData);
+    s_checkOnly = false;
+    return s_checkPassed;
+}
+
 bool MagicTarget::IsCast(MagicItem* apSpell) noexcept
 {
     if (const SpellItem* pSpell = Cast<SpellItem>(apSpell))
@@ -72,6 +93,21 @@ bool MagicTarget::IsCast(MagicItem* apSpell) noexcept
 
     const EnchantmentItem* pEnchantment = Cast<EnchantmentItem>(apSpell);
     return pEnchantment && (pEnchantment->eDelivery == MagicSystem::AIMED || pEnchantment->eDelivery == MagicSystem::TARGET_LOCATION);
+}
+
+/**
+ * Whether an effect is a raise landing on another player's game's actor here, which this game does not run.
+ * The owner's game raises the body and says it lives, and the copy here gets up with a plain resurrection (Actor::Respawn).
+ * A raise run on the copy too would be ended by that resurrection, which turns the body to ash, or would leave it lying dead and commanded.
+ *
+ * @param apTarget The actor the effect lands on.
+ * @param apEffect The effect.
+ * @return True for a reanimate effect on a copy.
+ */
+bool MagicTarget::IsRaiseOnCopy(Actor* apTarget, const EffectItem* apEffect) noexcept
+{
+    const ActorExtension* pExtension = apTarget ? apTarget->GetExtension() : nullptr;
+    return pExtension && pExtension->IsRemote() && apEffect && apEffect->IsReanimateEffect();
 }
 
 void MagicTarget::DispelAllSpells(bool aNow) noexcept
@@ -177,13 +213,13 @@ bool TP_MAKE_THISCALL(HookAddTarget, MagicTarget, MagicTarget::AddTargetData& ar
         {
             // A spell's damage runs on the copy as it does on an NPC, with the caster's perks and its burn.
             // Each of its hits goes to the other game as a health change (Actor::HookDamageActor), and the copy's health stays as it is.
-            if (World::Get().GetServerSettings().PvpEnabled && MagicTarget::IsCast(arData.pSpell) && DamagesHealth(arData.pEffectItem))
+            if (PvpRules::IsAllowedWithCopy(pTargetActor) && MagicTarget::IsCast(arData.pSpell) && DamagesHealth(arData.pEffectItem))
                 return TiltedPhoques::ThisCall(RealAddTarget, apThis, arData);
 
             // A damaging spell on the other player is sent as a health change, like a sword hit (Actor::HookDamageActor).
             // Only the caster's game reliably knows it landed. It is not applied locally: the other side owns that body.
             // Only an instant effect that damages health, not the spell's other effects: damage-over-time and concentration effects tick on their own.
-            if (World::Get().GetServerSettings().PvpEnabled && DamagesHealth(arData.pEffectItem) && arData.pEffectItem->data.iDuration == 0 && arData.fMagnitude > 0.f)
+            if (PvpRules::IsAllowedWithCopy(pTargetActor) && DamagesHealth(arData.pEffectItem) && arData.pEffectItem->data.iDuration == 0 && arData.fMagnitude > 0.f)
             {
                 // The caster's perks (Augmented Flames and the like) adjust an effect only as it is made (AdjustForPerks), as on an NPC.
                 // So the effect is made on the copy to take their factor, and left with no magnitude there (live-pvp-spell-perks).
@@ -236,7 +272,7 @@ bool TP_MAKE_THISCALL(HookAddTarget, MagicTarget, MagicTarget::AddTargetData& ar
             ActorExtension* pCasterExtension = arData.pCaster->GetExtension();
             if (pCasterExtension->IsRemotePlayer())
             {
-                if (!World::Get().GetServerSettings().PvpEnabled)
+                if (!PvpRules::IsAllowedWithCopy(arData.pCaster))
                     return false;
 
                 // Heal and buff spells are already synced by the caster.
@@ -261,6 +297,19 @@ bool TP_MAKE_THISCALL(HookAddTarget, MagicTarget, MagicTarget::AddTargetData& ar
         ActorExtension* pCasterExtension = arData.pCaster->GetExtension();
         if (pCasterExtension->IsLocalPlayer())
         {
+            // A raise on a copy is sent on once the game here finds the body one the spell can raise, and is not run here.
+            // Only the owner's game runs it (the other games leave it, MagicService::OnNotifyAddTarget); the copy gets up when that game says it lives.
+            if (MagicTarget::IsRaiseOnCopy(pTargetActor, arData.pEffectItem))
+            {
+                if (!WouldTakeEffect(apThis, arData))
+                {
+                    spdlog::info("Magic: this player's raise on copy {:X} is refused by the game here (the spell cannot raise that body); not sent", pTargetActor->formID);
+                    return false;
+                }
+                spdlog::info("Magic: this player's raise on copy {:X} is sent to its owner's game, not run here; the copy gets up when that game raises it", pTargetActor->formID);
+                World::Get().GetRunner().Trigger(addTargetEvent);
+                return false;
+            }
             bool result = TiltedPhoques::ThisCall(RealAddTarget, apThis, arData);
             if (result && arData.ShouldSync())
                 World::Get().GetRunner().Trigger(addTargetEvent);
@@ -291,6 +340,13 @@ bool TP_MAKE_THISCALL(HookCheckAddEffectTargetData, MagicTarget::AddTargetData, 
 {
     if (s_autoSucceedEffectCheck)
         return true;
+
+    // Only the check is wanted: a refusal here makes no effect.
+    if (s_checkOnly)
+    {
+        s_checkPassed = TiltedPhoques::ThisCall(RealCheckAddEffectTargetData, apThis, arArgs, afResistance);
+        return false;
+    }
 
     return TiltedPhoques::ThisCall(RealCheckAddEffectTargetData, apThis, arArgs, afResistance);
 }

@@ -1,5 +1,7 @@
-#include <RecentDeletes.h>
-#include <RecentModelChanges.h>
+#include <Copies/RecentDeletes.h>
+#include <Copies/RecentModelChanges.h>
+#include <Games/Skyrim/Watches/BoneHold.h>
+#include <Games/Skyrim/Watches/EyeBoneWatch.h>
 #include <BranchInfo.h>
 #include "CrashHandler.h"
 #include <DbgHelp.h>
@@ -20,7 +22,7 @@
 #include <sstream>
 #include <strsafe.h>
 #include <Games/Memory.h>
-#include <SmallDump.h>
+#include <Helpers/SmallDump.h>
 
 using time_point = std::chrono::system_clock::time_point;
 
@@ -515,6 +517,10 @@ LONG WINAPI VectoredExceptionHandler(PEXCEPTION_POINTERS pExceptionInfo)
             constexpr size_t cMaxStackWords = 4096;
             const size_t cStackWords = pStack >= pStackLimit && pStack < pStackTop ? std::min<size_t>(static_cast<size_t>(pStackTop - pStack), cMaxStackWords) : 0;
             RecentModelChanges::Report(regs, std::size(regs), pStack, cStackWords);
+#ifdef SKYRIMVR
+            BoneHold::Report(regs, std::size(regs));
+            EyeBoneWatch::Report(regs, std::size(regs));
+#endif
         }
 
         // The small dump first, in every build: it is the one a player can send with a report.

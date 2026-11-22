@@ -17,6 +17,7 @@
 #include <Messages/AssignCharacterResponse.h>
 #include <Messages/CharacterSpawnRequest.h>
 #include <Structs/GameId.h>
+#include <Structs/GridCellCoords.h>
 #include <Structs/ReferenceUpdate.h>
 #include <Structs/Inventory.h>
 #include <Structs/Tints.h>
@@ -46,6 +47,8 @@ struct BotOptions
     std::optional<glm::vec2> Start; // where to look for the host first; else read from HostLog
     std::string HostLog;            // the host's tp_client.log, for the position guess
     float Spacing = 200.f;          // spawn this far from the host (game units)
+    //! Tell the server this bot plays flat Skyrim, so games apply the rules between a flat and a VR player to it.
+    bool Flat = false;
     //! The worldspace to look in, as the game's form id (Solstheim is 0x02000800 in a load order where
     //! Dragonborn.esm is index 2). Empty means Tamriel, which is where this used to be nailed down: the bot
     //! could not see a host anywhere else, and 2026-09-24 was spent discovering that rather than testing.
@@ -181,6 +184,7 @@ private:
     //! Takes a replayed pose as the one `holdpose` sends, keeping the fields that come only now and then.
     void KeepReplayedPose(const VRPose& acPose) noexcept;
     void SendHealth(float aHealth) noexcept;
+    void SendPresence() noexcept;
     void SendDeath(bool aDead) noexcept;
     //! An NPC this bot owns dies or comes back to life, as its owner's game reports it (death state and health).
     void SendNpcLife(KnownActor& aNpc, bool aDead, float aHealth) noexcept;
@@ -247,18 +251,25 @@ private:
     bool m_gridReported{false};
     //! True when the cell id is one this bot invented for its grid square rather than a real one from a host.
     bool m_standaloneCell{false};
-    //! Whether announcing a cell also sends the grid shift. Off makes the bot behave like a real client whose
-    //! *current* grid changed while its *centre* grid did not -- walking from one outdoor cell into the next,
-    //! which sends the exterior-enter alone. The bot always sent both, so the server's handling of that message
-    //! on its own could not be tested: whatever the exterior-enter failed to do, the grid shift did a moment
-    //! later. See the cellwalk pair.
+    //! Whether announcing a cell also sends the grid shift.
+    //! Off sends the exterior-enter alone, which no game does for long: the server keeps the range where the last shift put it.
+    //! A walk like the game's is "gridshift lag" (see the cellwalk pair).
     bool m_sendGridShift{true};
+    //! "gridshift lag": cell changes go as the game sends them while walking.
+    //! Its loaded cells' centre trails the cell the player stands in; here it moves by one cell once the player is two cells from it.
+    bool m_gridShiftLags{false};
+    //! The centre last sent in lag mode; unset after a door or a change of mode.
+    std::optional<GridCellCoords> m_lagCentre;
     //! Whether this bot keeps an actor the server hands it, instead of handing it straight back.
     //!
     //! Off by default, because a bot has no game behind it and owning an actor means being asked to drive
     //! something it cannot drive -- every existing test relies on that. The ownership-churn pair turns it on,
     //! because handing an actor back and forth on purpose is the thing it measures.
     bool m_acceptOwnership{false};
+    // "npc fights": whom this bot's NPCs fight (a server id, 0 for nobody), told to the server in presence reports as a game does.
+    // Unset, the bot sends no presence reports at all.
+    std::optional<uint32_t> m_npcFightTarget;
+    Clock::time_point m_lastPresence{};
     bool m_followHostCell{true}; // false after `stay`
     //! The NPCs this bot asked the server to register and has no answer for yet: cookie to reference. Kept apart from
     //! m_cookie so the response for its own character and the response for an NPC can be told apart. One per request:

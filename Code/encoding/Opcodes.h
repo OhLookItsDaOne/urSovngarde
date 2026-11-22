@@ -66,13 +66,16 @@ enum ClientOpcode : unsigned char
     kReviveRequest,
     kSafePointRequest,
     kRequestActionEvents,
-    kRequestSleep,
+    kRequestHourMove,
     kRequestReferenceEnable,
     kRequestWarState,
     kRequestFollowerState,
     kRequestPartyPlugin,
     kRequestPartyValue,
     kRequestActorPresence,
+    kRequestNpcPlugins,
+    kRequestTimeSkip,
+    kRequestCombatState,
     kClientOpcodeMax
 };
 
@@ -142,10 +145,13 @@ enum ServerOpcode : unsigned char
     kNotifyArrowNocked,
     kNotifyDownedState,
     kNotifyActionEvents,
-    kNotifySleep,
+    kNotifyHourMove,
     kNotifyReferenceEnable,
     kNotifyWarState,
     kNotifyPartyPlugin,
     kNotifyPartyValue,
+    kNotifyNpcPluginsDiffer,
+    kNotifyPlayerName,
+    kNotifyTimeSkip,
     kServerOpcodeMax
 };

@@ -11,6 +11,8 @@ struct OverlayApp;
 struct RenderSystemD3D11;
 struct D3D11RenderProvider;
 struct VRDashboard;
+struct VRPage;
+struct VRPanel;
 struct FormIdComponent;
 struct World;
 struct Actor;
@@ -22,6 +24,7 @@ struct NotifyChatMessageBroadcast;
 struct NotifyPlayerList;
 struct NotifyPlayerJoined;
 struct NotifyPlayerLeft;
+struct NotifyPlayerName;
 struct NotifyPlayerDialogue;
 struct ConnectionErrorEvent;
 struct NotifyPlayerLevel;
@@ -57,6 +60,8 @@ struct OverlayService
 
     void SetActive(bool aActive) noexcept;
     [[nodiscard]] bool GetActive() const noexcept;
+    // Where the page is shown (MenuService), held and sent to the page like the active state.
+    void SetSurface(const char* acpSurface) noexcept;
 
     void SetInGame(bool aInGame) noexcept;
     [[nodiscard]] bool GetInGame() const noexcept;
@@ -79,9 +84,15 @@ protected:
     void OnChatMessageReceived(const NotifyChatMessageBroadcast&) noexcept;
     void OnPlayerDialogue(const NotifyPlayerDialogue&) noexcept;
     void OnPlayerJoined(const NotifyPlayerJoined&) noexcept;
+    void OnPlayerName(const NotifyPlayerName&) noexcept;
     void OnPlayerLeft(const NotifyPlayerLeft&) noexcept;
     void OnPlayerLevel(const NotifyPlayerLevel&) noexcept;
     void OnPlayerCellChanged(const NotifyPlayerCellChanged& acMessage) const noexcept;
+    /**
+     * Move the player to the player picked with the menu's teleport button, where the server says they are.
+     *
+     * @param acMessage The server's answer: the cell, the world space and the position.
+     */
     void OnNotifyTeleport(const NotifyTeleport& acMessage) noexcept;
     void OnNotifyPlayerHealthUpdate(const NotifyPlayerHealthUpdate& acMessage) noexcept;
     void OnPartyJoinedEvent(const PartyJoinedEvent& acEvent) noexcept;
@@ -96,7 +107,9 @@ private:
     CefRefPtr<OverlayApp> m_pOverlay{nullptr};
     TiltedPhoques::UniquePtr<D3D11RenderProvider> m_pProvider;
 #ifdef SKYRIMVR
+    TiltedPhoques::UniquePtr<VRPage> m_pVRPage;
     TiltedPhoques::UniquePtr<VRDashboard> m_pVRDashboard;
+    TiltedPhoques::UniquePtr<VRPanel> m_pVRPanel;
     bool m_vrOverlayAttempted = false;
 #endif
 
@@ -108,10 +121,12 @@ private:
     TiltedPhoques::Map<uint32_t, float> m_playerHealth;
 
     bool m_active = false;
+    std::string m_surface;
     bool m_inGame = false;
     // What the page has actually been told. The page loads asynchronously and drops calls made before then; see PushUiState.
     bool m_sentActive = false;
     bool m_sentInGame = false;
+    std::string m_sentSurface;
 
     entt::scoped_connection m_updateConnection;
     entt::scoped_connection m_connectedConnection;
@@ -122,6 +137,7 @@ private:
     entt::scoped_connection m_playerDialogueConnection;
     entt::scoped_connection m_playerJoinedConnection;
     entt::scoped_connection m_playerLeftConnection;
+    entt::scoped_connection m_playerNameConnection;
     entt::scoped_connection m_playerAddedConnection;
     entt::scoped_connection m_playerRemovedConnection;
     entt::scoped_connection m_playerLevelConnection;

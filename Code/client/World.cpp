@@ -2,10 +2,11 @@
 
 #include "World.h"
 #include <CrashHandler.h>
-#include <PerfScope.h>
+#include <Helpers/PerfScope.h>
 
 #include <Services/DiscoveryService.h>
 #include <Services/InputService.h>
+#include <Services/MenuService.h>
 #include <Services/TransportService.h>
 #include <Services/RunnerService.h>
 #include <Services/ImguiService.h>
@@ -23,14 +24,18 @@
 #include <Services/PlayerService.h>
 #include <Services/CombatService.h>
 #include <Services/CharacterService.h>
+#include <Services/PresenceService.h>
 #include <Games/Skyrim/Interface/IMenu.h>
 #include <Games/Skyrim/Interface/UI.h>
 #include <Services/WeatherService.h>
 #include <Services/MapService.h>
 #include <Services/VRConnectService.h>
+#include <Services/LauncherLinkService.h>
+#include <Services/SteamFriendsService.h>
 #include <Services/VoiceService.h>
 #include <Services/PlayerMarkerService.h>
 #include <Services/ReviveService.h>
+#include <Services/SleepVoteService.h>
 
 #include <Events/PreUpdateEvent.h>
 #include <Events/UpdateEvent.h>
@@ -47,6 +52,7 @@ World::World()
     ctx().emplace<DiscoveryService>(*this, m_dispatcher);
     ctx().emplace<OverlayService>(*this, m_transport, m_dispatcher);
     ctx().emplace<InputService>(ctx().at<OverlayService>());
+    ctx().emplace<MenuService>(*this, m_dispatcher);
     ctx().emplace<CharacterService>(*this, m_dispatcher, m_transport);
     ctx().emplace<DebugService>(m_dispatcher, *this, m_transport, ctx().at<ImguiService>());
     ctx().emplace<PapyrusService>(m_dispatcher);
@@ -63,14 +69,16 @@ World::World()
     ctx().emplace<PlayerService>(*this, m_dispatcher, m_transport);
     ctx().emplace<StringCacheService>(m_dispatcher);
     ctx().emplace<CombatService>(*this, m_transport, m_dispatcher);
+    ctx().emplace<PresenceService>(*this, m_dispatcher, m_transport);
     ctx().emplace<WeatherService>(*this, m_transport, m_dispatcher);
     ctx().emplace<MapService>(*this, m_dispatcher, m_transport);
     ctx().emplace<VoiceService>(*this, m_dispatcher);
     ctx().emplace<PlayerMarkerService>(*this, m_dispatcher);
     ctx().emplace<ReviveService>(*this, m_dispatcher, m_transport);
-#ifdef SKYRIMVR
+    ctx().emplace<SleepVoteService>(m_dispatcher, m_transport, ctx().at<CalendarService>());
     ctx().emplace<VRConnectService>(*this, m_dispatcher, m_transport);
-#endif
+    ctx().emplace<LauncherLinkService>(*this, m_dispatcher);
+    ctx().emplace<SteamFriendsService>(*this, m_dispatcher, m_transport);
 
     BehaviorVar::Get()->Init();
 }

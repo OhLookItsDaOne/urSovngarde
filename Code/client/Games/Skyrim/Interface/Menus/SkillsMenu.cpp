@@ -3,7 +3,7 @@
 
 #ifdef SKYRIMVR
 #include <Games/Skyrim/Interface/UI.h>
-#include <PatchCheck.h>
+#include <Helpers/PatchCheck.h>
 
 // VR draws the skill tree as a 3D model in the world scene (StatsMenu+0xC0, a BSFadeNode that fades out between 500
 // and 1000 units). Tree view moves it about 3000 units away. Paused, the fade update never runs; unpaused the model
@@ -166,8 +166,8 @@ static uint32_t HookStatsProcessMessage(IMenu* apThis, UIMessage& aMessage)
 
 // The unpaused menu needs three of the game's checks skipped: the main-thread check, the update check and the
 // controls guard. They are skipped only while the server unpauses the menu (Gameplay:bUnpausedMenus); elsewhere the
-// menu runs exactly as in the game. Skipped for good, a paused menu's messages ran off the main thread too, as the
-// Sleep/Wait menu's did (7a4b2002). Each site's first two bytes are swapped in one aligned write, so a thread running
+// menu runs exactly as in the game. Skipped for good, a paused menu's messages would run off the main thread too.
+// Each site's first two bytes are swapped in one aligned write, so a thread running
 // it sees either form whole: a jne (0F 85 rel32) becomes a short jump over its other four bytes, a je short two nops.
 struct SwitchedCheck
 {

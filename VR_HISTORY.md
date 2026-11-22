@@ -4,6 +4,26 @@ Everything VR_TODO.md held up to 2026-10-07, word for word: session reports, inv
 queues with their evidence, and the done items. VR_TODO.md now keeps only what is current and points here; the
 sections below are not maintained any more. Newest first, as it was. Since 2026-10-31 finished work moves here from VR_TODO.md, word for word.
 
+## Moved from the TODO, 2026-11-18
+
+Finished work, word for word, as it stood in `VR_TODO.md`. Seen working in play: the other player's icon shows on the world map (owner, 2026-11-18).
+
+- [x] **Other players on the world map** (the owner's request, 2026-10-23). The markers follow the players and go on the map's list
+      (`Player markers: X put on the world map's list`, in play), and nobody has seen an icon. The map gathers markers only when its camera
+      height crosses 10000 upward, so opening it alone never gathers. To see: "Map icons". If zooming shows the icon, make the client force
+      the regather. Not yet checked: the icon type VR's map shows for type 11, whether the list goes into saves, fast travel between
+      worldspaces. A marker for a far player loads that exterior cell from disk; left as it is.
+- From the next-session checklist: **Map icons:** open the map, zoom in close and back out, and look for the other player's icon.
+
+## Moved from the TODO, 2026-11-14
+
+Finished work, word for word, as it stood in `VR_TODO.md`.
+
+- [x] **The two-game rig's second game closed itself at start** (11-05 09:09, 11-06 18:53): the `two-games.on` marker was missing, so the game's own check found the first game's window (`FindWindowA` in its start, VR 0x5B5969) and quit.
+      Not a fault: the marker had been removed after the last run, as the guide says. The `setup` step now creates it when missing.
+      With it, the second game starts, but its first load can stall: at 11-06 20:27 for over 15 min with no CPU (taken down), at 21:08 for 3 min before it went on; at 21:27 not at all.
+      Both games write the same SKSE log files, so the first game's plugin logs are cut when the second starts.
+
 ## Moved from the TODO, 2026-10-31
 
 Finished work and the stories of open items, word for word, in the order they stood in `VR_TODO.md`. What is still open from them has a short

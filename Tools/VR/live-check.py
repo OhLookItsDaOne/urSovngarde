@@ -21,6 +21,9 @@ Checks:
     copy exists | copy 3d | copy alive | copy dead | copy health <n>      the game's copy of the bot's character
     npc exists  | npc alive | npc dead | npc health <n|full>             its copy of an NPC the bot owns
     npc gone | copy gone                                                  that copy is no longer in this game (deleted or disabled)
+    copy|npc|placed fights player|copy|none                               in combat with the local player, with the bot's character, or not in combat
+    told health placed [<units>]                                          the bot was given the placed actor's health here when it went to the bot
+    server logged|absent <regular expression>                             the rig server wrote such a line since the script began or the last DO logmark, or none
                                                                           (exists: in this game and enabled; a DevBench timeout makes either INVALID)
     player cell <hex>                                                     the cell the player stands in, by form id
     player mark | player dropped <n>|<low>..<high>                        the local player's health, before and after
@@ -35,6 +38,7 @@ Checks:
                                                                           to that place, or to the player
     scene <hex> playing                                                   a scene of the game's own plays
     ref <hex> world <hex>                                                 a reference is in that world space
+    papyrus <Script> <Function> <self> [argument ...] is <value>          what a native function answers, e.g. Quest IsObjectiveCompleted 29940 n:101 is true
     ref <hex> cell same | ref <hex> cell other                            a reference of the game's own is in the
                                                                           player's cell, or in another one
     ref <hex> open | ref <hex> closed                                     a door of the game's own is open (or
@@ -73,8 +77,10 @@ The bot's script does not stop while the driver is busy with that, so its own `w
 `log DO pickup own` has the player pick up the newest item this game dropped itself.
 `log DO papyrus <Script> <Function> <self>|global [form ...]` calls a native function on a reference, or a global one (ids in hex; a number as n:<value>,
 a float as f:<value>, a bool as b:true or b:false, a string as s:<text>).
+`log CHECK papyrus <Script> <Function> <self> [argument ...] is <value>` passes when that native function answers that value
+(a bool as true or false, a number within 0.001), such as `Quest IsObjectiveCompleted 29940 n:101 is true`.
 
-`log CHECK copy|npc mounted|unmounted` asks whether the copy rides (IsOnMount). `log CHECK copy|npc equipped|unequipped <hex>` asks the game whether its copy has that item equipped (not for the left hand: the
+`log CHECK copy|npc mounted|unmounted` asks whether the copy rides (IsOnMount). `log CHECK copy|npc weapon drawn|sheathed` asks whether its weapon is out (IsWeaponDrawn). `log CHECK copy|npc equipped|unequipped <hex>` asks the game whether its copy has that item equipped (not for the left hand: the
 game's IsEquipped does not count it); `lefthand|righthand <hex>` asks which weapon is in that hand; `has <hex>` whether it owns one.
 `log CHECK ref <hex> count <item hex> <n>` asks whether a reference of the game's own holds exactly that many of the item.
 `log CHECK distinct <most> <regular expression with one group>` passes when the client has logged at least one and
@@ -206,6 +212,18 @@ def papyrus(script, function, form, args=None):
         return NOT_FOUND if re.search(r"self form '[^']*' not found", text) else 'ERR HTTPError %d' % e.code
     except Exception as e:
         return 'ERR ' + type(e).__name__
+
+
+def papyrus_answer_matches(returned, wanted):
+    """Whether what a native function returned is the value a check wants: a bool as true or false, a number within 0.001, anything else as text."""
+    if isinstance(returned, bool):
+        return wanted.lower() == ('true' if returned else 'false')
+    if isinstance(returned, (int, float)):
+        try:
+            return abs(float(returned) - float(wanted)) < 0.001
+        except ValueError:
+            return False
+    return str(returned) == wanted
 
 
 def papyrus_global(script, function, args=None):
@@ -416,6 +434,27 @@ def log_time(line):
     """When the client wrote a line, in seconds since the epoch, or None."""
     m = re.match(r'\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\.(\d{3})\]', line)
     return time.mktime(time.strptime(m.group(1), '%Y-%m-%d %H:%M:%S')) + int(m.group(2)) / 1000.0 if m else None
+
+
+SERVER_LOG = os.path.join(RELEASE, 'logs', 'STServerOut.log')
+
+
+def server_log_size():
+    try:
+        return os.path.getsize(SERVER_LOG)
+    except OSError:
+        return 0
+
+
+def server_lines_from(offset):
+    """The rig server's log lines written since that byte offset; all of them when the log started again."""
+    try:
+        with open(SERVER_LOG, 'rb') as f:
+            if os.path.getsize(SERVER_LOG) >= offset:
+                f.seek(offset)
+            return f.read().decode('utf-8', errors='replace').splitlines()
+    except OSError:
+        return []
 
 
 def session_lines():
@@ -801,6 +840,32 @@ class Run:
         if not form:
             return None, 'the game logged no spawn for server id %s' % sid
         return form, None
+
+    def papyrus_argument(self, word):
+        """One argument of a "papyrus" line: a form by its hex id, n:<number>, f:<float>, b:true, b:false, s:<text>, or copy, npc or placed."""
+        if word.startswith('n:'):
+            return int(word[2:])
+        if word.startswith('f:'):
+            return float(word[2:])
+        if word in ('b:true', 'b:false'):
+            return word == 'b:true'
+        if word.startswith('s:'):
+            return word[2:]
+        if word in ('copy', 'npc'):
+            form, _ = self.subject(word)
+            return {'form': '0x' + (form or '0')}
+        if word == 'placed':
+            return {'form': '0x' + (getattr(self, 'placed', None) or '0')}
+        return {'form': '0x' + word}
+
+    def papyrus_target(self, word):
+        """The reference a "papyrus" line calls on: a hex id, or copy, npc or placed; None when the script has no such form."""
+        if word in ('copy', 'npc'):
+            form, _ = self.subject(word)
+            return form
+        if word == 'placed':
+            return getattr(self, 'placed', None)
+        return word
 
     def report(self):
         """The bot's last "report": actors (server id -> (Skyrim.esm reference or None, dead, "ours" or "theirs", position or None)),
@@ -1193,6 +1258,24 @@ class Run:
                             wrong.append('reference %s is %s here, %s for the other player' % (ref, 'locked' if here_locked else 'unlocked', 'locked' if locked else 'unlocked'))
                     ok = not wrong
                     detail = ('%d things compared, %d differ: ' % (compared, len(wrong)) + '; '.join(wrong)) if wrong else '%d things compared, all the same' % compared
+            elif who == 'told' and what == 'health':
+                # "told health placed [<units>]": when the actor last placed went to the bot, the bot was given the health it has here, within that much (default 5).
+                # The server's word on its health, which the next owner's game takes on.
+                form = getattr(self, 'placed', None)
+                sid = None
+                for l in session_lines():
+                    m = re.search(r'Entity: local actor ([0-9A-Fa-f]+) has server id ([0-9A-Fa-f]+)', l)
+                    if m and form and m.group(1).upper() == form.upper():
+                        sid = m.group(2).upper()
+                told = None
+                for line in self.bot_lines:
+                    m = re.search(r'Actor ([0-9A-Fa-f]+) goes to player \d+ with health (-?[\d.]+) of', line)
+                    if m and sid and m.group(1).upper() == sid:
+                        told = float(m.group(2))
+                here = papyrus('Actor', 'GetActorValue', form, ['Health']) if form else None
+                tolerance = float(words[3]) if len(words) > 3 else 5.0
+                ok = told is not None and isinstance(here, (int, float)) and abs(told - here) <= tolerance
+                detail = 'actor %s (server id %s): health %s here, the bot was told %s' % (form, sid, here, 'nothing' if told is None else '%.0f' % told)
             elif who == 'told':
                 # "told door <hex> open|closed", "told lock <hex> locked|unlocked": the bot's last "report" has that reference so.
                 # What this game did to it reached the other player.
@@ -1207,6 +1290,12 @@ class Run:
                     known = locks.get(words[2].upper())
                     ok = known is not None and known == (words[3] == 'locked')
                     detail = 'lock %s: %s for the other player' % (words[2], 'never told' if known is None else 'locked' if known else 'unlocked')
+            elif who == 'server' and what in ('logged', 'absent'):
+                # "server logged|absent <regular expression>": the rig server wrote such a line since the script began, or since "DO logmark"; or none.
+                rx = re.compile(' '.join(words[2:]))
+                hits = [l for l in server_lines_from(self.server_from) if rx.search(l)]
+                ok = bool(hits) if what == 'logged' else not hits
+                detail = ('%d lines, e.g. %s' % (len(hits), hits[0][35:160].strip())) if hits else 'none'
             elif who == 'absent':
                 # "absent <regular expression>": the client has written no such line since the script began.
                 rx = re.compile(' '.join(words[1:]))
@@ -1220,6 +1309,18 @@ class Run:
                 hits = [l for l in session_lines()[self.log_from:] if rx.search(l)]
                 ok = len(hits) >= wanted
                 detail = '%d lines (wanted %d)%s' % (len(hits), wanted, ', the last ' + hits[-1][35:140].strip() if hits else '')
+            elif who == 'papyrus' and 'is' in words[4:]:
+                # "papyrus <Script> <Function> <self> [argument ...] is <value>": what a native function answers, such as whether a quest objective is completed.
+                # Arguments as in "DO papyrus"; self is a reference (hex, copy, npc or placed), not "global"; a number compares within 0.001.
+                at = len(words) - 1 - words[::-1].index('is')
+                target = self.papyrus_target(words[3])
+                wanted = ' '.join(words[at + 1:])
+                returned = papyrus(words[1], words[2], target, [self.papyrus_argument(w) for w in words[4:at]]) if target else 'ERR no %s' % words[3]
+                if returned == TIMED_OUT:
+                    detail = UNASKED
+                else:
+                    ok = papyrus_answer_matches(returned, wanted)
+                    detail = '%s.%s on %s answered %s (wanted %s)' % (words[1], words[2], words[3], returned, wanted)
             elif who == 'logged':
                 # "logged <regular expression>": the client wrote such a line since this script began. For a test
                 # whose point is that a certain path was taken, not only that the game survived it.
@@ -1388,7 +1489,8 @@ class Run:
                         ok = abs(dropped - float(low)) <= PLAYER_TOLERANCE
                     detail = 'health %.0f -> %.0f, dropped %.0f (wanted %s)' % (self.mark, health, dropped, words[2])
             else:
-                form, why = self.subject(who)
+                # "placed" also takes these checks, for the actor the last "DO console player.placeatme" made.
+                form, why = (getattr(self, 'placed', None), 'nothing placed') if who == 'placed' else self.subject(who)
                 if not form:
                     ok, detail = False, why
                 elif what in ('exists', 'gone'):
@@ -1468,11 +1570,29 @@ class Run:
                     inside = papyrus('Actor', 'IsInFaction', form, [{'form': '0x' + words[2]}])
                     ok = isinstance(inside, bool) and inside is (what == 'infaction')
                     detail = 'actor %s, IsInFaction(%s) %s' % (form, words[2], inside)
+                elif what == 'fights':
+                    # "npc fights player|copy|none": the actor is in combat with the local player, with the bot's character, or not in combat at all.
+                    fighting = papyrus('Actor', 'IsInCombat', form, [])
+                    target = papyrus('Actor', 'GetCombatTarget', form, [])
+                    got = target.get('formId', '') if isinstance(target, dict) else ''
+                    if words[2] == 'none':
+                        ok = fighting is False
+                    else:
+                        wanted, why = ('14', None) if words[2] == 'player' else self.subject('copy')
+                        ok = fighting is True and bool(got) and bool(wanted) and int(got, 16) & 0xFFFFFFFF == int(wanted, 16) & 0xFFFFFFFF
+                        if why:
+                            got += ' (%s)' % why
+                    detail = 'actor %s, IsInCombat %s, combat target %s' % (form, fighting, got or target)
                 elif what in ('mounted', 'unmounted'):
                     # "copy mounted": the game's copy is riding (Actor.IsOnMount), for a rider's MountRequest (2026-10-10).
                     riding = papyrus('Actor', 'IsOnMount', form, [])
                     ok = isinstance(riding, bool) and riding is (what == 'mounted')
                     detail = 'actor %s, IsOnMount %s' % (form, riding)
+                elif what == 'weapon' and len(words) > 2 and words[2] in ('drawn', 'sheathed'):
+                    # "copy weapon drawn|sheathed": the copy's weapon is out or put away (Actor.IsWeaponDrawn).
+                    out = papyrus('Actor', 'IsWeaponDrawn', form, [])
+                    ok = isinstance(out, bool) and out is (words[2] == 'drawn')
+                    detail = 'actor %s, IsWeaponDrawn %s' % (form, out)
                 elif what == 'has':
                     # "copy has <hex>": the copy's inventory holds at least one.
                     n = papyrus('ObjectReference', 'GetItemCount', form, [{'form': '0x' + words[2]}])
@@ -1621,6 +1741,7 @@ class Run:
         print('== %s' % self.script, flush=True)
         self.log_start = len(session_lines())
         self.log_from = self.log_start
+        self.server_from = server_log_size()
         proc = subprocess.Popen(cmd, cwd=RELEASE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace')
         log = io.open(os.path.join(RELEASE, 'logs', self.script + '-bot.log'), 'w', encoding='utf-8')
         # Read on a thread of its own: a DO line holds the loop below for up to half a minute ("DO watch"), and a bot that fills
@@ -1818,28 +1939,8 @@ class Run:
                     # "DO papyrus <Script> <Function> <self> [form ...]": a native function called on a reference,
                     # with forms as its arguments (hex ids).
                     words = text.split()
-                    # Arguments: a form by its hex id, or a plain number written "n:<value>".
-                    def arg(w):
-                        if w.startswith('n:'):
-                            return int(w[2:])
-                        if w.startswith('f:'):
-                            return float(w[2:])
-                        if w in ('b:true', 'b:false'):
-                            return w == 'b:true'
-                        if w.startswith('s:'):
-                            return w[2:]
-                        if w in ('copy', 'npc'):
-                            f, _ = self.subject(w)
-                            return {'form': '0x' + (f or '0')}
-                        if w == 'placed':
-                            return {'form': '0x' + (getattr(self, 'placed', None) or '0')}
-                        return {'form': '0x' + w}
-                    args = [arg(w) for w in words[5:]]
-                    target = words[4]
-                    if target in ('copy', 'npc'):
-                        target, _ = self.subject(target)
-                    elif target == 'placed':
-                        target = getattr(self, 'placed', None)
+                    args = [self.papyrus_argument(w) for w in words[5:]]
+                    target = self.papyrus_target(words[4])
                     # "global" in place of the reference: a global function, such as Debug.SendAnimationEvent copy s:<event>.
                     if words[4] == 'global':
                         result = papyrus_global(words[2], words[3], args)
@@ -1896,6 +1997,7 @@ class Run:
                 elif text.strip() == 'DO logmark':
                     # From here on, logged, absent, atleast, fewer and distinct count only the client lines written after this one.
                     self.log_from = len(session_lines())
+                    self.server_from = server_log_size()
                     print('   (log mark: the checks count client lines from line %d of this session)' % self.log_from, flush=True)
                 elif text.strip() == 'DO pickup own':
                     # The newest item this game dropped itself, picked up by the player through the game's own Activate.

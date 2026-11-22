@@ -3,7 +3,7 @@
 #include <Events/ConnectedEvent.h>
 #include <Events/DisconnectedEvent.h>
 #include <Events/UpdateEvent.h>
-#include <PerfScope.h>
+#include <Helpers/PerfScope.h>
 #include <Services/OverlayService.h>
 #include <Services/PartyService.h>
 #include <Services/TransportService.h>
@@ -11,7 +11,7 @@
 #include <PlayerCharacter.h>
 #include <Forms/TESForm.h>
 #ifdef SKYRIMVR
-#include <Games/Skyrim/VRBodySync.h>
+#include <Games/Skyrim/VR/VRBodySync.h>
 #endif
 
 #include <Messages/NotifyVoiceData.h>
@@ -74,6 +74,28 @@ struct SteamVoice
     TGetVoice GetVoice = nullptr;
     TDecompressVoice Decompress = nullptr;
     TOptimalSampleRate OptimalSampleRate = nullptr;
+
+    /**
+     * Decompress one voice packet into a buffer, growing the buffer and trying once more when Steam says it is too small.
+     *
+     * @param apPacket The compressed packet.
+     * @param aPacketSize Its size in bytes.
+     * @param aBuffer Filled with the sound, 16-bit samples; grown when it is too small.
+     * @param aRate The sample rate to decompress at, in samples a second.
+     * @param aWritten Set to how many bytes of the buffer hold the sound.
+     * @return Steam's result: kVoiceOK when the sound is in the buffer.
+     */
+    int DecompressInto(const void* apPacket, const uint32_t aPacketSize, std::vector<uint8_t>& aBuffer, const uint32_t aRate, uint32_t& aWritten) const noexcept
+    {
+        aWritten = 0;
+        int result = Decompress(User, apPacket, aPacketSize, aBuffer.data(), static_cast<uint32_t>(aBuffer.size()), &aWritten, aRate);
+        if (result == kVoiceBufferTooSmall && aWritten > aBuffer.size())
+        {
+            aBuffer.resize(aWritten);
+            result = Decompress(User, apPacket, aPacketSize, aBuffer.data(), static_cast<uint32_t>(aBuffer.size()), &aWritten, aRate);
+        }
+        return result;
+    }
 
     // Empty when it fails; the reason is logged once.
     static SteamVoice& Get() noexcept
@@ -141,11 +163,15 @@ private:
     }
 };
 
-// Shows a message in the menu's chat box and on the HUD, which is hidden while the menu is open.
+/**
+ * Show a message in the menu's chat box, and on the HUD with the mod's name in front, as the HUD is hidden while the menu is open.
+ *
+ * @param acMessage The message.
+ */
 void TellPlayer(const std::string& acMessage) noexcept
 {
     World::Get().GetOverlayService().SendSystemMessage(acMessage);
-    Utils::ShowHudMessage(TiltedPhoques::String("urSovngarde: ") + acMessage.c_str());
+    Utils::ShowModHudMessage(acMessage.c_str());
 }
 
 constexpr auto kTestLength = std::chrono::seconds(5);
@@ -381,13 +407,8 @@ void VoiceService::FinishRecording() noexcept
     for (const auto& packet : m_packets)
     {
         uint32_t written = 0;
-        int result = steam.Decompress(steam.User, packet.Bytes.data(), static_cast<uint32_t>(packet.Bytes.size()), decoded.data(), static_cast<uint32_t>(decoded.size()), &written, cRate);
-        if (result == kVoiceBufferTooSmall && written > decoded.size())
-        {
-            decoded.resize(written);
-            result = steam.Decompress(steam.User, packet.Bytes.data(), static_cast<uint32_t>(packet.Bytes.size()), decoded.data(), static_cast<uint32_t>(decoded.size()), &written, cRate);
-        }
-        if (result != kVoiceOK)
+        const int cResult = steam.DecompressInto(packet.Bytes.data(), static_cast<uint32_t>(packet.Bytes.size()), decoded, cRate, written);
+        if (cResult != kVoiceOK)
         {
             ++failures;
             continue;
@@ -548,6 +569,15 @@ void VoiceService::SetVolume(float aVolume) noexcept
     m_volume = std::clamp(aVolume, 0.f, 2.f);
 }
 
+void VoiceService::SetPartyNearbyOnly(bool aNearbyOnly) noexcept
+{
+    if (aNearbyOnly == m_partyNearbyOnly)
+        return;
+
+    m_partyNearbyOnly = aNearbyOnly;
+    spdlog::info("Voice: the party is heard {}", aNearbyOnly ? "only nearby" : "at any distance");
+}
+
 void VoiceService::SetPlayerMuted(uint32_t aPlayerId, bool aMuted) noexcept
 {
     if (aMuted)
@@ -664,13 +694,8 @@ void VoiceService::OnVoiceData(const NotifyVoiceData& acMessage) noexcept
     if (m_decodeBuffer.size() < 32 * 1024)
         m_decodeBuffer.resize(32 * 1024);
     uint32_t written = 0;
-    int result = steam.Decompress(steam.User, acMessage.Data.data(), static_cast<uint32_t>(acMessage.Data.size()), m_decodeBuffer.data(), static_cast<uint32_t>(m_decodeBuffer.size()), &written, m_sampleRate);
-    if (result == kVoiceBufferTooSmall && written > m_decodeBuffer.size())
-    {
-        m_decodeBuffer.resize(written);
-        result = steam.Decompress(steam.User, acMessage.Data.data(), static_cast<uint32_t>(acMessage.Data.size()), m_decodeBuffer.data(), static_cast<uint32_t>(m_decodeBuffer.size()), &written, m_sampleRate);
-    }
-    if (result != kVoiceOK || written < sizeof(int16_t))
+    const int cResult = steam.DecompressInto(acMessage.Data.data(), static_cast<uint32_t>(acMessage.Data.size()), m_decodeBuffer, m_sampleRate, written);
+    if (cResult != kVoiceOK || written < sizeof(int16_t))
         return;
 
     const auto* pSamples = reinterpret_cast<const int16_t*>(m_decodeBuffer.data());
@@ -790,8 +815,11 @@ void VoiceService::PlaceSpeaker(uint32_t aPlayerId, Speaker& aSpeaker) noexcept
 
     const auto& partyMembers = m_world.GetPartyService().GetPartyMembers();
     const bool cIsParty = std::find(partyMembers.begin(), partyMembers.end(), aPlayerId) != partyMembers.end();
+    const bool cRadio = cIsParty && !m_partyNearbyOnly;
 
-    float gain = cIsParty ? kRadioGain : kUnplacedGain;
+    // The server sends a party member's voice from any distance.
+    // So with the party heard only nearby, a party member whose body is not loaded here is not heard.
+    float gain = cRadio ? kRadioGain : cIsParty ? 0.f : kUnplacedGain;
     float pan = 0.f; // -1 left, 1 right
 
     glm::vec3 listener{}, forward{}, right{};
@@ -805,8 +833,8 @@ void VoiceService::PlaceSpeaker(uint32_t aPlayerId, Speaker& aSpeaker) noexcept
         if (cDistance > 1.f)
             pan = std::clamp(glm::dot(cToSpeaker / cDistance, right), -1.f, 1.f);
 
-        // A party member far away stays heard, centred, at the radio volume.
-        if (cIsParty && gain < kRadioGain)
+        // A party member far away stays heard, centred, at the radio volume, unless the party is heard only nearby.
+        if (cRadio && gain < kRadioGain)
         {
             pan *= gain / kRadioGain;
             gain = kRadioGain;

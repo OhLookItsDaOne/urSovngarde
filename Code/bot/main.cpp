@@ -1,6 +1,6 @@
 // STBot: a headless Skyrim Together player driven by a script. See Bot.h and VR_TODO.md section 6.1.
 //
-//   STBot <script> [--server host:port] [--password X] [--name X] [--x N --y N] [--hostlog path] [--spacing N]
+//   STBot <script> [--server host:port] [--password X] [--name X] [--x N --y N] [--hostlog path] [--spacing N] [--flat]
 //
 // The script is one command per line, '#' starts a comment:
 //   log <text>                      print
@@ -20,6 +20,7 @@
 //   start <x> <y>                   where to look for the host (same as --x --y)
 
 #include "Bot.h"
+#include "../common/BuildVersion.h"
 
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
@@ -147,7 +148,7 @@ int main(int argc, char** argv)
         // warning on every single run, which is the fastest way to teach somebody to ignore version-skew warnings.
         if (arg == "--version")
         {
-            std::printf("STBot %s protocol %s\n", BUILD_COMMIT, BUILD_PROTOCOL);
+            std::printf("STBot %s protocol %s\n", BuildVersion::Commit(), BUILD_PROTOCOL);
             return 0;
         }
 
@@ -167,6 +168,10 @@ int main(int argc, char** argv)
         else if (arg == "--standalone")
         {
             options.Standalone = true;
+        }
+        else if (arg == "--flat")
+        {
+            options.Flat = true;
         }
         else if (arg == "--max-runtime" && next(value))
         {
@@ -200,7 +205,7 @@ int main(int argc, char** argv)
 
     if (scriptPath.empty())
     {
-        spdlog::error("Usage: STBot <script> [--server host:port] [--password X] [--name X] [--x N --y N] [--hostlog path] [--spacing N] [--version]");
+        spdlog::error("Usage: STBot <script> [--server host:port] [--password X] [--name X] [--x N --y N] [--hostlog path] [--spacing N] [--flat] [--version]");
         return 2;
     }
 
@@ -208,7 +213,7 @@ int main(int argc, char** argv)
     if (!ReadScript(scriptPath, script, options))
         return 2;
 
-    spdlog::info("STBot {} : '{}' with {} commands, server {}, name '{}'", BUILD_COMMIT, scriptPath, script.size(), options.Server, options.Name);
+    spdlog::info("STBot {} : '{}' with {} commands, server {}, name '{}'", BuildVersion::Commit(), scriptPath, script.size(), options.Server, options.Name);
 
 #ifdef _WIN32
     // The run loop sleeps 10 ms between steps, and that sleep paces every send.

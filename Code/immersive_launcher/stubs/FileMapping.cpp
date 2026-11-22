@@ -163,18 +163,39 @@ NTSTATUS WINAPI TP_LdrGetDllFullName(HMODULE Module, PUNICODE_STRING DllName)
     return RealLdrGetDllFullName(Module, DllName);
 }
 
+// This launcher's own module answers with the game's path, as the game and its plugins expect.
+bool SpoofOwnModule(HMODULE aModule, LPWSTR alpFilename, DWORD aSize, DWORD& aResult)
+{
+    if (!IsMyModule(aModule) || !launcher::GetLaunchContext() || !launcher::GetLaunchContext()->GetLoaded())
+        return false;
+
+    // As the system's function does, a path that does not fit is cut, and the buffer's size comes back with ERROR_INSUFFICIENT_BUFFER.
+    if (aSize == 0)
+    {
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        aResult = 0;
+        return true;
+    }
+
+    if (StringCchCopyW(alpFilename, aSize, launcher::GetLaunchContext()->exePath.c_str()) == STRSAFE_E_INSUFFICIENT_BUFFER)
+    {
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        aResult = aSize;
+        return true;
+    }
+
+    aResult = static_cast<DWORD>(std::wcslen(alpFilename));
+    return true;
+}
+
 DWORD WINAPI TP_GetModuleFileNameW(HMODULE aModule, LPWSTR alpFilename, DWORD aSize)
 {
     // trampoline space for USVFS
     TP_EMPTY_HOOK_PLACEHOLDER;
 
-    if (IsMyModule(aModule) && launcher::GetLaunchContext() && launcher::GetLaunchContext()->GetLoaded())
-    {
-        auto& aExePath = launcher::GetLaunchContext()->exePath;
-        StringCchCopyW(alpFilename, aSize, aExePath.c_str());
-
-        return static_cast<DWORD>(std::wcslen(alpFilename));
-    }
+    DWORD result = 0;
+    if (SpoofOwnModule(aModule, alpFilename, aSize, result))
+        return result;
 
     return RealGetModuleFileNameW(aModule, alpFilename, aSize);
 }
@@ -192,8 +213,7 @@ struct ScopedOSHeapItem
     void* m_pBlock;
 };
 
-// NOTE(Vince): Introduce one layer of indirection by calling GetModuleFileNameW function directly, to trigger usvfs
-// indirection.
+// The ANSI call goes through the wide one, so that MO2's file system and the spoofing of our module apply to it too.
 DWORD WINAPI TP_GetModuleFileNameA(HMODULE aModule, char* alpFileName, DWORD aBufferSize)
 {
     TP_EMPTY_HOOK_PLACEHOLDER;
@@ -202,14 +222,19 @@ DWORD WINAPI TP_GetModuleFileNameA(HMODULE aModule, char* alpFileName, DWORD aBu
 
     wchar_t* pBuffer = static_cast<wchar_t*>(wideBuffer.m_pBlock);
 
-    // Under MO2, there's a bug caused when calling RealGetModuleFileNameW on XAudio2_7.dll,
-    // it crashes in usvfs. This only happens during the thread shutdown paths 
-    // of quitting, so just avoid the bug. 
+    // Under MO2, there's a bug caused when calling GetModuleFileNameW on XAudio2_7.dll,
+    // it crashes in usvfs. This only happens during the thread shutdown paths
+    // of quitting, so just avoid the bug.
     // TODO: Further analysis of what is under MO2 USVFS and what is needed.
     DWORD result = 0;
     HMODULE tMod = RealGetModuleHandleW(L"XAudio2_7.dll");
     if (tMod == nullptr || aModule != tMod)
-        result = TP_GetModuleFileNameW(aModule, pBuffer, aBufferSize * sizeof(wchar_t)); // To make sure spoofing happens if needed
+    {
+        // The system's function, never usvfs's handler directly: usvfs's own detour decides whether that handler runs.
+        // Its size is in characters, as the buffer holds aBufferSize of them.
+        if (!SpoofOwnModule(aModule, pBuffer, aBufferSize, result))
+            result = GetModuleFileNameW(aModule, pBuffer, aBufferSize);
+    }
 
     if (result == 0)
     {
@@ -220,7 +245,8 @@ DWORD WINAPI TP_GetModuleFileNameA(HMODULE aModule, char* alpFileName, DWORD aBu
     RtlInitUnicodeString(&source, pBuffer);
 
     // convert using the proper OS function
-    ANSI_STRING dest{.Length = static_cast<USHORT>(result), .MaximumLength = static_cast<USHORT>(aBufferSize), .Buffer = alpFileName};
+    // A string's length is 16 bits, so a larger buffer counts as the most it can hold.
+    ANSI_STRING dest{.Length = static_cast<USHORT>(result), .MaximumLength = static_cast<USHORT>(aBufferSize > 0xFFFF ? 0xFFFF : aBufferSize), .Buffer = alpFileName};
     if (RtlUnicodeStringToAnsiString(&dest, &source, FALSE) != 0)
         return 0;
 

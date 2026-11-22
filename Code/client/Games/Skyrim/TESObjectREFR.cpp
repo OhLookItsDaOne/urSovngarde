@@ -6,15 +6,12 @@
 #include <Games/Overrides.h>
 
 #include <World.h>
-#ifdef SKYRIMVR
-#include <Services/CalendarService.h>
-#endif
 #include <Services/PapyrusService.h>
 #include <Events/ActivateEvent.h>
 #include <Events/InventoryChangeEvent.h>
 #include <Events/DroppedItemEvents.h>
 #include <PlayerCharacter.h>
-#include <RecentModelChanges.h>
+#include <Copies/RecentModelChanges.h>
 #include <Events/ScriptAnimationEvent.h>
 #include <Events/LockChangeEvent.h>
 #include <Events/ReferenceEnableEvent.h>
@@ -354,8 +351,15 @@ void TESObjectREFR::LoadAnimationVariables(const AnimationVariables& aVariables)
             if (!pVariableSet)
                 return;
 
+            // A sender whose list is not as long as ours has another behaviour mod, or none: only the original graph's slots mean the same there.
+            // An empty or short list (a damaged message, a sender without a descriptor) leaves the slots it does not have as they are.
+            const auto cApplied = [](const size_t acSent, const size_t acOurs, const uint32_t acShared) { return acSent == acOurs ? acOurs : std::min({static_cast<size_t>(acShared), acOurs, acSent}); };
+            const size_t cBooleans = cApplied(aVariables.Booleans.size(), pDescriptor->BooleanLookUpTable.size(), pDescriptor->SharedBooleans);
+            const size_t cFloats = cApplied(aVariables.Floats.size(), pDescriptor->FloatLookupTable.size(), pDescriptor->SharedFloats);
+            const size_t cIntegers = cApplied(aVariables.Integers.size(), pDescriptor->IntegerLookupTable.size(), pDescriptor->SharedIntegers);
+
             // Never write into a variable whose word is an index: a wrong descriptor would make a synced value an index Havok follows later.
-            for (size_t i = 0; i < pDescriptor->BooleanLookUpTable.size(); ++i)
+            for (size_t i = 0; i < cBooleans; ++i)
             {
                 const auto idx = pDescriptor->BooleanLookUpTable[i];
 
@@ -365,7 +369,7 @@ void TESObjectREFR::LoadAnimationVariables(const AnimationVariables& aVariables)
                 }
             }
 
-            for (size_t i = 0; i < pDescriptor->FloatLookupTable.size(); ++i)
+            for (size_t i = 0; i < cFloats; ++i)
             {
                 const auto idx = pDescriptor->FloatLookupTable[i];
 
@@ -373,7 +377,7 @@ void TESObjectREFR::LoadAnimationVariables(const AnimationVariables& aVariables)
                     *reinterpret_cast<float*>(&pVariableSet->data[idx]) = aVariables.Floats.size() > i ? aVariables.Floats[i] : 0.f;
             }
 
-            for (size_t i = 0; i < pDescriptor->IntegerLookupTable.size(); ++i)
+            for (size_t i = 0; i < cIntegers; ++i)
             {
                 const auto idx = pDescriptor->IntegerLookupTable[i];
 
@@ -641,12 +645,23 @@ bool NamesStrayExtraData(const ExtraContainerChanges::Data* apChanges, const Inv
     return false;
 }
 
-void LetHandGo(TESObjectREFR* apRef, InventoryEntry* apEntry, const size_t aHand, const char* acpWhen) noexcept
+// Hands this client emptied, by actor form id, as (item, left hand).
+// Only a player copy's are taken, at its owner's next hand items (TakeEmptiedHands); an NPC's stay noted.
+TiltedPhoques::Map<uint32_t, Vector<std::pair<TESForm*, bool>>> s_emptiedHands;
+
+// The hand is emptied, as an unequip leaves it.
+// A hand left holding its item with no extra data list is not safe: the game reads that list with no null check, for a hand holding a light and in an equip.
+// The hand's entry is not freed, as that needs the game's own destructor; it is small.
+void EmptyHand(TESObjectREFR* apRef, InventoryEntry** appSlot, const size_t aHand, const char* acpWhen) noexcept
 {
+    const InventoryEntry* pEntry = *appSlot;
     const Actor* pActor = Cast<Actor>(apRef);
-    spdlog::info("HandWatch: {:X} (dead: {}) pointed its {} ({:X}) at extra data {}; it lets go of it", apRef->formID, pActor && pActor->IsDead(), kHandNames[aHand],
-                 apEntry->pObject ? apEntry->pObject->formID : 0, acpWhen);
-    apEntry->pExtraLists = nullptr;
+    spdlog::info("HandWatch: {:X} (dead: {}) pointed its {} ({:X}) at extra data {}; the hand is emptied", apRef->formID, pActor && pActor->IsDead(), kHandNames[aHand],
+                 pEntry->pObject ? pEntry->pObject->formID : 0, acpWhen);
+    // The ammunition is no hand item.
+    if (aHand < 2 && pEntry->pObject)
+        s_emptiedHands[apRef->formID].push_back({pEntry->pObject, aHand == 0});
+    *appSlot = nullptr;
 }
 
 // A removal is watched: what the hands point at is noted before it, and a hand the game left as it was is checked after.
@@ -666,7 +681,7 @@ public:
         }
     }
 
-    void LetGoOfRemoved() noexcept
+    void EmptyRemovedHands() noexcept
     {
         InventoryEntry** slots[3];
         if (!GetHandSlots(m_pRef, slots))
@@ -679,7 +694,7 @@ public:
             if (!hand.pLists || *slots[i] != hand.pEntry || hand.pEntry->pExtraLists != hand.pLists)
                 continue;
             if (NamesStrayExtraData(pChanges, hand.pEntry))
-                LetHandGo(m_pRef, hand.pEntry, i, "its item does not hold, after a removal");
+                EmptyHand(m_pRef, slots[i], i, "its item does not hold, after a removal");
         }
     }
 
@@ -698,7 +713,7 @@ private:
 // Other plugins read a living actor's hands on every equip (Enchantment Art Extender reads the right hand's extra data).
 // Items also leave an actor by the game's own hand (looting, the dead-body clean-up), which no watch here sees.
 // So before a revival and before each equip from its owner, a copy's hands are checked against its items once more.
-void TESObjectREFR::LetHandsGoOfStrayExtraData(const char* acpWhen) noexcept
+void TESObjectREFR::EmptyHandsOfStrayExtraData(const char* acpWhen) noexcept
 {
     InventoryEntry** slots[3];
     if (!GetHandSlots(this, slots))
@@ -709,8 +724,19 @@ void TESObjectREFR::LetHandsGoOfStrayExtraData(const char* acpWhen) noexcept
     {
         InventoryEntry* pEntry = *slots[i];
         if (pEntry && pEntry->pExtraLists && NamesStrayExtraData(pChanges, pEntry))
-            LetHandGo(this, pEntry, i, acpWhen);
+            EmptyHand(this, slots[i], i, acpWhen);
     }
+}
+
+Vector<std::pair<TESForm*, bool>> TESObjectREFR::TakeEmptiedHands(uint32_t aFormId) noexcept
+{
+    Vector<std::pair<TESForm*, bool>> emptied;
+    if (const auto it = s_emptiedHands.find(aFormId); it != s_emptiedHands.end())
+    {
+        emptied = std::move(it->second);
+        s_emptiedHands.erase(it);
+    }
+    return emptied;
 }
 
 // The game removes an item's extra data lists one at a time, and a removal does nothing once the item's count is used up.
@@ -865,7 +891,7 @@ void TESObjectREFR::RemoveAllItems() noexcept
 
         HandWatch hands(this);
         RemoveItem(pItem, count, ITEM_REMOVE_REASON::kRemove, pList, nullptr);
-        hands.LetGoOfRemoved();
+        hands.EmptyRemovedHands();
 
         // Progress: the list is gone, or the item's count went down.
         const ExtraContainerChanges::Entry* pAfter = FindEntry(GetContainerChanges(), pItem);
@@ -1348,7 +1374,7 @@ void TESObjectREFR::AddOrRemoveItem(const Inventory::Entry& arEntry, bool aIsSet
         spdlog::debug("Removing item {:X}, count {}", pObject->formID, -arEntry.Count);
         HandWatch hands(this);
         RemoveItem(pObject, -arEntry.Count, ITEM_REMOVE_REASON::kRemove, pExtraDataList, nullptr);
-        hands.LetGoOfRemoved();
+        hands.EmptyRemovedHands();
     }
 
     // TODO(cosideci): this is still flawed. Adding the refr to the quest leader is hard.
@@ -1422,7 +1448,7 @@ bool TP_MAKE_THISCALL(HookPlayAnimationAndWait, void, uint32_t auiStackID, TESOb
     spdlog::debug("Animation: {}, EventName: {}", apAnimation->AsAscii(), apEventName->AsAscii());
 
 #if OBJECT_ANIM_SYNC
-    if (!s_cancelAnimationWaitEvent && (apSelf->formID < 0xFF000000))
+    if (!s_cancelAnimationWaitEvent && !apSelf->IsTemporary())
         World::Get().GetRunner().Trigger(ScriptAnimationEvent(apSelf->formID, apAnimation->AsAscii(), apEventName->AsAscii()));
 #endif
 
@@ -1453,7 +1479,7 @@ bool TP_MAKE_THISCALL(HookPlayAnimation, void, uint32_t auiStackID, TESObjectREF
     spdlog::debug("EventName: {}", apEventName->AsAscii());
 
 #if OBJECT_ANIM_SYNC
-    if (!s_cancelAnimationEvent && (apSelf->formID < 0xFF000000))
+    if (!s_cancelAnimationEvent && !apSelf->IsTemporary())
         World::Get().GetRunner().Trigger(ScriptAnimationEvent(apSelf->formID, String{}, apEventName->AsAscii()));
 #endif
 
@@ -1462,11 +1488,6 @@ bool TP_MAKE_THISCALL(HookPlayAnimation, void, uint32_t auiStackID, TESObjectREF
 
 bool TP_MAKE_THISCALL(HookActivate, TESObjectREFR, TESObjectREFR* apActivator, uint8_t aUnk1, TESBoundObject* apObjectToGet, int32_t aCount, char aDefaultProcessing)
 {
-#ifdef SKYRIMVR
-    // Also guard activations issued directly by VR interactions, outside the native input handlers.
-    if (CalendarService::AreSleepControlsLocked() && apActivator == PlayerCharacter::Get() && !ScopedActivateOverride::IsOverriden())
-        return false;
-#endif
     Actor* pActivator = Cast<Actor>(apActivator);
 
     // A copy of another game's actor never goes through a load door on its own here: its owner's game reports where it went.
@@ -1670,7 +1691,7 @@ constexpr size_t kDisableSlot = 0x8A;
 // A switch that changed the disabled flag is reported; ObjectService decides whether the party gets it.
 void ReportEnableChange(const TESObjectREFR* apRef, bool aWasDisabled) noexcept
 {
-    if (apRef && aWasDisabled != apRef->IsDisabled() && apRef->formID < 0xFF000000 && !IsProcessExiting())
+    if (apRef && aWasDisabled != apRef->IsDisabled() && !apRef->IsTemporary() && !IsProcessExiting())
         World::Get().GetRunner().Trigger(ReferenceEnableEvent(apRef->formID, !apRef->IsDisabled()));
 }
 

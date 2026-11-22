@@ -11,9 +11,11 @@
 # checked against what a real build of this target looks like, and the version string has to be readable inside
 # the binary -- a truncated exe has neither.
 
+# -From takes the binaries from a saved build folder instead of build\windows\x64\release (a red run on an older build, or the main build put back).
 param(
     [string]$Destination = '',
-    [int]$MinimumBytes = 5000000
+    [int]$MinimumBytes = 5000000,
+    [string]$From = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -27,7 +29,7 @@ if (-not $Destination) {
     $Destination = Join-Path $fusRoot 'tools\Skyrim Together VR'
 }
 
-$release = (Resolve-Path (Join-Path $PSScriptRoot '..\..\build\windows\x64\release')).Path
+$release = if ($From) { (Resolve-Path $From).Path } else { (Resolve-Path (Join-Path $PSScriptRoot '..\..\build\windows\x64\release')).Path }
 # urSovngarde.exe since the rename of 2026-10-09; SkyrimTogetherVR.exe before (an older build output may still hold it).
 $exe = Join-Path $release 'urSovngarde.exe'
 $pdb = Join-Path $release 'urSovngarde.pdb'
@@ -91,6 +93,8 @@ Copy-Item $pdb (Join-Path $Destination 'urSovngarde.pdb') -Force
 # The menu's browser helper is a client binary too; it goes when it changed, with one fallback as above.
 $helper = Join-Path $release 'TPProcess.exe'
 $liveHelper = Join-Path $Destination 'TPProcess.exe'
+. (Join-Path $PSScriptRoot 'binary-check.ps1')
+if (Test-Path $helper) { Assert-CompleteBinary $helper }
 if ((Test-Path $helper) -and (-not (Test-Path $liveHelper) -or (Get-FileHash $helper).Hash -ne (Get-FileHash $liveHelper).Hash)) {
     # A fallback whose helper still runs (one a crashed game left behind) cannot be deleted: it stays, and the deploy goes on.
     Get-ChildItem -Path $Destination -Filter 'TPProcess.exe.old-*' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue

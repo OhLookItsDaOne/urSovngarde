@@ -1,5 +1,7 @@
 #include <TiltedOnlinePCH.h>
-#include <PerfScope.h>
+#include <BuildVersion.h>
+#include <Helpers/Throttle.h>
+#include <Helpers/PerfScope.h>
 
 #include <Services/OverlayService.h>
 
@@ -10,7 +12,9 @@
 
 #include <Systems/RenderSystemD3D11.h>
 #ifdef SKYRIMVR
-#include <Systems/VRDashboard.h>
+#include <UI/Menu/VRDashboard.h>
+#include <UI/Menu/VRPage.h>
+#include <UI/Menu/VRPanel.h>
 #endif
 
 #include <World.h>
@@ -23,14 +27,14 @@
 #include <Messages/NotifyPlayerList.h>
 #include <Messages/NotifyPlayerLeft.h>
 #include <Messages/NotifyPlayerJoined.h>
+#include <Messages/NotifyPlayerName.h>
 #include <Messages/NotifyPlayerDialogue.h>
 #include <Messages/NotifyPlayerLevel.h>
 #include <Messages/NotifyPlayerCellChanged.h>
 #include <Messages/NotifyTeleport.h>
+#include <Services/PlayerTeleport.h>
 #include <Messages/RequestPlayerHealthUpdate.h>
 #include <Messages/NotifyPlayerHealthUpdate.h>
-
-#include <Structs/GridCellCoords.h>
 
 #include <Events/ConnectedEvent.h>
 #include <Events/DisconnectedEvent.h>
@@ -123,6 +127,7 @@ OverlayService::OverlayService(World& aWorld, TransportService& transport, entt:
     m_chatMessageConnection = aDispatcher.sink<NotifyChatMessageBroadcast>().connect<&OverlayService::OnChatMessageReceived>(this);
     m_playerJoinedConnection = aDispatcher.sink<NotifyPlayerJoined>().connect<&OverlayService::OnPlayerJoined>(this);
     m_playerLeftConnection = aDispatcher.sink<NotifyPlayerLeft>().connect<&OverlayService::OnPlayerLeft>(this);
+    m_playerNameConnection = aDispatcher.sink<NotifyPlayerName>().connect<&OverlayService::OnPlayerName>(this);
     m_playerDialogueConnection = aDispatcher.sink<NotifyPlayerDialogue>().connect<&OverlayService::OnPlayerDialogue>(this);
     m_playerAddedConnection = m_world.on_destroy<WaitingFor3D>().connect<&OverlayService::OnWaitingFor3DRemoved>(this);
     m_playerRemovedConnection = m_world.on_destroy<PlayerComponent>().connect<&OverlayService::OnPlayerComponentRemoved>(this);
@@ -154,8 +159,11 @@ void OverlayService::CreateVR() noexcept
         return;
     m_vrOverlayAttempted = true;
 
+    // The page renders offscreen; the presenters (the SteamVR dashboard, the panel inside the game) show its pictures.
+    m_pVRPage = TiltedPhoques::MakeUnique<VRPage>();
     m_pVRDashboard = TiltedPhoques::MakeUnique<VRDashboard>();
-    CreateOverlay(m_pVRDashboard.get());
+    m_pVRPanel = TiltedPhoques::MakeUnique<VRPanel>();
+    CreateOverlay(m_pVRPage.get());
 }
 #endif
 
@@ -202,8 +210,13 @@ void OverlayService::Render() noexcept
     m_pOverlay->GetClient()->Render();
 
 #ifdef SKYRIMVR
-    if (m_pVRDashboard)
-        m_pVRDashboard->Update(*this);
+    // The presenters first, which say whether they show the page; then the page, told whether it is seen.
+    if (m_pVRPage && m_pVRDashboard)
+        m_pVRDashboard->Update(*this, *m_pVRPage);
+    if (m_pVRPage && m_pVRPanel)
+        m_pVRPanel->Update(*this, *m_pVRPage);
+    if (m_pVRPage)
+        m_pVRPage->Update(*this);
 #endif
 }
 
@@ -257,6 +270,12 @@ bool OverlayService::GetActive() const noexcept
     return m_active;
 }
 
+void OverlayService::SetSurface(const char* acpSurface) noexcept
+{
+    m_surface = acpSurface;
+    PushUiState();
+}
+
 void OverlayService::SetInGame(bool aInGame) noexcept
 {
     if (!m_pOverlay)
@@ -300,13 +319,22 @@ void OverlayService::PushUiState() noexcept
 
         if (m_inGame)
         {
-            SetVersion(BUILD_COMMIT);
+            SetVersion(BuildVersion::Commit());
             m_pOverlay->ExecuteAsync("enterGame");
         }
         else
         {
             m_pOverlay->ExecuteAsync("exitGame");
         }
+    }
+
+    // Before activate, so the page fits its controls to where it is shown as it opens.
+    if (m_sentSurface != m_surface)
+    {
+        m_sentSurface = m_surface;
+        auto pArguments = CefListValue::Create();
+        pArguments->SetString(0, m_surface);
+        m_pOverlay->ExecuteAsync("setSurface", pArguments);
     }
 
     if (m_sentActive != m_active)
@@ -360,9 +388,9 @@ void OverlayService::SetPlayerHealthPercentage(uint32_t aFormId) const noexcept
     float percentage = CalculateHealthPercentage(pActor);
 
     auto view = m_world.view<FormIdComponent, PlayerComponent>();
-    auto entityIt = std::find_if(view.begin(), view.end(), [view, aFormId](auto aEntity) { return view.get<FormIdComponent>(aEntity).Id == aFormId; });
+    const auto entityIt = Utils::FindById<FormIdComponent>(view, aFormId);
 
-    if (entityIt == view.end())
+    if (!entityIt)
     {
         spdlog::error("{}: cannot find player entity for form id {:X}", __FUNCTION__, aFormId);
         return;
@@ -396,9 +424,7 @@ void OverlayService::OnUpdate(const UpdateEvent&) noexcept
 
 void OverlayService::OnConnectedEvent(const ConnectedEvent& acEvent) noexcept
 {
-#ifdef SKYRIMVR
-    Utils::ShowHudMessage("urSovngarde: connected (build " BUILD_COMMIT ")");
-#endif
+    Utils::ShowModHudMessage(TiltedPhoques::String("connected (build ") + BuildVersion::Commit() + ")");
     if (!m_pOverlay)
         return;
 
@@ -413,7 +439,7 @@ void OverlayService::OnDisconnectedEvent(const DisconnectedEvent&) noexcept
 {
     m_playerHealth.clear();
 
-    // On VR the disconnection message comes from VRConnectService, which knows whether it will reconnect.
+    // The disconnection message comes from VRConnectService, which knows whether it will reconnect.
     if (!m_pOverlay)
         return;
 
@@ -489,7 +515,12 @@ void OverlayService::OnPlayerDialogue(const NotifyPlayerDialogue& acMessage) noe
 #ifdef SKYRIMVR
 namespace
 {
-// The error detail is JSON meant for the UI's error popup; the HUD needs a sentence.
+/**
+ * Turn a refused connection's error detail, JSON meant for the UI's error popup, into a sentence for the HUD.
+ *
+ * @param acDetail The error detail.
+ * @return The sentence, without the mod's name in front.
+ */
 TiltedPhoques::String DescribeConnectionError(const TiltedPhoques::String& acDetail)
 {
     const std::string detail = acDetail.c_str();
@@ -519,7 +550,7 @@ TiltedPhoques::String DescribeConnectionError(const TiltedPhoques::String& acDet
     else
         text = "refused by the server";
 
-    return TiltedPhoques::String("urSovngarde: connection failed, ") + text.c_str();
+    return TiltedPhoques::String("connection failed, ") + text.c_str();
 }
 } // namespace
 #endif
@@ -527,7 +558,7 @@ TiltedPhoques::String DescribeConnectionError(const TiltedPhoques::String& acDet
 void OverlayService::OnConnectionError(const ConnectionErrorEvent& acConnectedEvent) const noexcept
 {
 #ifdef SKYRIMVR
-    Utils::ShowHudMessage(DescribeConnectionError(acConnectedEvent.ErrorDetail));
+    Utils::ShowModHudMessage(DescribeConnectionError(acConnectedEvent.ErrorDetail));
 #endif
     if (!m_pOverlay)
         return;
@@ -542,7 +573,7 @@ void OverlayService::OnPlayerJoined(const NotifyPlayerJoined& acMessage) noexcep
     String cellName = GetCellName(acMessage.WorldSpaceId, acMessage.CellId);
 #ifdef SKYRIMVR
     // Sent both when someone joins and, on connecting, for everyone already there.
-    Utils::ShowHudMessage(String("urSovngarde: ") + acMessage.Username + " is online" + (cellName.empty() ? "" : String(" (") + cellName + ")"));
+    Utils::ShowModHudMessage(acMessage.Username + " is online" + (cellName.empty() ? "" : String(" (") + cellName + ")"));
 #endif
     if (!m_pOverlay)
         return;
@@ -557,11 +588,20 @@ void OverlayService::OnPlayerJoined(const NotifyPlayerJoined& acMessage) noexcep
     m_pOverlay->ExecuteAsync("playerConnected", pArguments);
 }
 
+// The menu's player list keeps the old name until the next connect: the page has no rename yet.
+void OverlayService::OnPlayerName(const NotifyPlayerName& acMessage) noexcept
+{
+    spdlog::info("Player {} is now called '{}', renamed in play", acMessage.PlayerId, acMessage.Username.c_str());
+#ifdef SKYRIMVR
+    Utils::ShowModHudMessage(String("a player is now called ") + acMessage.Username);
+#endif
+}
+
 void OverlayService::OnPlayerLeft(const NotifyPlayerLeft& acMessage) noexcept
 {
     m_playerHealth.erase(acMessage.PlayerId);
 #ifdef SKYRIMVR
-    Utils::ShowHudMessage(String("urSovngarde: ") + acMessage.Username + " left");
+    Utils::ShowModHudMessage(acMessage.Username + " left");
 #endif
     if (!m_pOverlay)
         return;
@@ -595,31 +635,14 @@ void OverlayService::OnPlayerCellChanged(const NotifyPlayerCellChanged& acMessag
     m_pOverlay->ExecuteAsync("setCell", pArguments);
 }
 
+/**
+ * Move the player to the player picked with the menu's teleport button, where the server says they are.
+ *
+ * @param acMessage The server's answer: the cell, the world space and the position.
+ */
 void OverlayService::OnNotifyTeleport(const NotifyTeleport& acMessage) noexcept
 {
-    auto& modSystem = m_world.GetModSystem();
-
-    const uint32_t cellId = modSystem.GetGameId(acMessage.CellId);
-    TESObjectCELL* pCell = Cast<TESObjectCELL>(TESForm::GetById(cellId));
-    if (!pCell)
-    {
-        const uint32_t worldSpaceId = modSystem.GetGameId(acMessage.WorldSpaceId);
-        TESWorldSpace* pWorldSpace = Cast<TESWorldSpace>(TESForm::GetById(worldSpaceId));
-        if (pWorldSpace)
-        {
-            GridCellCoords coordinates = GridCellCoords::CalculateGridCellCoords(acMessage.Position);
-            pCell = pWorldSpace->LoadCell(coordinates.X, coordinates.Y);
-        }
-
-        if (!pCell)
-        {
-            spdlog::error("Failed to fetch cell to teleport to.");
-            m_world.GetOverlayService().SendSystemMessage("Teleporting to player failed.");
-            return;
-        }
-    }
-
-    PlayerCharacter::Get()->MoveTo(pCell, acMessage.Position);
+    PlayerTeleport::MoveTo(m_world, acMessage.CellId, acMessage.WorldSpaceId, acMessage.Position);
 }
 
 void OverlayService::OnNotifyPlayerHealthUpdate(const NotifyPlayerHealthUpdate& acMessage) noexcept
@@ -651,7 +674,7 @@ void OverlayService::OnNotifyPlayerHealthUpdate(const NotifyPlayerHealthUpdate& 
 void OverlayService::OnPartyJoinedEvent(const PartyJoinedEvent& acEvent) noexcept
 {
 #ifdef SKYRIMVR
-    Utils::ShowHudMessage(acEvent.IsLeader ? "urSovngarde: party created" : "urSovngarde: joined party");
+    Utils::ShowModHudMessage(acEvent.IsLeader ? "party created" : "joined party");
 #endif
     if (!m_pOverlay)
         return;
@@ -663,7 +686,7 @@ void OverlayService::OnPartyJoinedEvent(const PartyJoinedEvent& acEvent) noexcep
 void OverlayService::OnPartyLeftEvent(const PartyLeftEvent& acEvent) noexcept
 {
 #ifdef SKYRIMVR
-    Utils::ShowHudMessage("urSovngarde: left party");
+    Utils::ShowModHudMessage("left party");
 #endif
     if (!m_pOverlay)
         return;
@@ -676,14 +699,9 @@ void OverlayService::RunDebugDataUpdates() noexcept
     if (!m_pOverlay)
         return;
 
-    static std::chrono::steady_clock::time_point lastSendTimePoint;
-    constexpr auto cDelayBetweenUpdates = 1000ms;
-
-    const auto now = std::chrono::steady_clock::now();
-    if (now - lastSendTimePoint < cDelayBetweenUpdates)
+    static Throttle s_sendThrottle(1000ms);
+    if (!s_sendThrottle.TakeTurn())
         return;
-
-    lastSendTimePoint = now;
 
     auto internalStats = m_transport.GetStatistics();
     auto steamStats = m_transport.GetConnectionStatus();
@@ -706,14 +724,9 @@ void OverlayService::RunPlayerHealthUpdates() noexcept
     if (!m_transport.IsConnected() || !m_world.GetPartyService().IsInParty())
         return;
 
-    static std::chrono::steady_clock::time_point lastSendTimePoint;
-    constexpr auto cDelayBetweenUpdates = 500ms;
-
-    const auto now = std::chrono::steady_clock::now();
-    if (now - lastSendTimePoint < cDelayBetweenUpdates)
+    static Throttle s_sendThrottle(500ms);
+    if (!s_sendThrottle.TakeTurn())
         return;
-
-    lastSendTimePoint = now;
 
     static float s_previousPercentage = -1.f;
 

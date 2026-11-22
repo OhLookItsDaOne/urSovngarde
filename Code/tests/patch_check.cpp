@@ -1,8 +1,8 @@
-// The checks a code patch makes before it writes over a game instruction (client/PatchCheck.h).
+// The checks a code patch makes before it writes over a game instruction (client/Helpers/PatchCheck.h).
 
 #include <catch2/catch.hpp>
 
-#include <PatchCheck.h>
+#include <Helpers/PatchCheck.h>
 
 #include <cstdint>
 #include <cstring>
@@ -96,4 +96,22 @@ TEST_CASE("A patch left off names the bytes it found", "[patchcheck]")
     uint8_t function[0x40]{};
     CHECK(PatchCheck::At(function, 0x15) == function + 0x15);
     CHECK(PatchCheck::At(nullptr, 0x15) == nullptr);
+}
+
+TEST_CASE("A function that starts with another plugin's jump is taken as hooked, and named in the log", "[patchcheck]")
+{
+    // A relative jump and an indirect one, as MinHook and other hook libraries write them.
+    const uint8_t cRelative[]{0xE9, 0x10, 0x20, 0x30, 0x40, 0x90};
+    const uint8_t cIndirect[]{0xFF, 0x25, 0x00, 0x00, 0x00, 0x00};
+    CHECK(PatchCheck::IsHookJump(cRelative));
+    CHECK(PatchCheck::IsHookJump(cIndirect));
+    CHECK(PatchCheck::OtherHookNote(cRelative) == " (on top of another plugin's hook: e9 10 20 30 40 90)");
+
+    // The game's own first instruction, an indirect call (FF 15) and no address at all are not hooks.
+    const uint8_t cGameCode[]{0x48, 0x89, 0x5C, 0x24, 0x10, 0x48};
+    const uint8_t cIndirectCall[]{0xFF, 0x15, 0x00, 0x00, 0x00, 0x00};
+    CHECK_FALSE(PatchCheck::IsHookJump(cGameCode));
+    CHECK_FALSE(PatchCheck::IsHookJump(cIndirectCall));
+    CHECK_FALSE(PatchCheck::IsHookJump(nullptr));
+    CHECK(PatchCheck::OtherHookNote(cGameCode).empty());
 }

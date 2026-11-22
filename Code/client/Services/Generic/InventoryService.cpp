@@ -1,7 +1,10 @@
 #include <Services/InventoryService.h>
-#include <EpochMiss.h>
-#include <PerfScope.h>
-#include <RecentModelChanges.h>
+#include <Helpers/Throttle.h>
+#include <Services/Generic/NpcEquipmentCheck.h>
+#include <Services/Generic/PlayerCopyWeapon.h>
+#include <Copies/EpochMiss.h>
+#include <Helpers/PerfScope.h>
+#include <Copies/RecentModelChanges.h>
 
 #include <Messages/RequestObjectInventoryChanges.h>
 #include <Messages/NotifyObjectInventoryChanges.h>
@@ -11,6 +14,7 @@
 #include <Messages/NotifyEquipmentChanges.h>
 #include <Messages/DrawWeaponRequest.h>
 #include <Messages/NotifyDrawWeapon.h>
+#include <Messages/CharacterSpawnRequest.h>
 
 #include <Events/UpdateEvent.h>
 #include <Events/InventoryChangeEvent.h>
@@ -32,6 +36,7 @@
 #include <DefaultObjectManager.h>
 #include <PlayerCharacter.h>
 #include <Forms/MagicItem.h>
+#include <Forms/TESObjectARMO.h>
 
 namespace
 {
@@ -49,6 +54,8 @@ InventoryService::InventoryService(World& aWorld, entt::dispatcher& aDispatcher,
     m_equipmentConnection = m_dispatcher.sink<EquipmentChangeEvent>().connect<&InventoryService::OnEquipmentChangeEvent>(this);
     m_inventoryChangeConnection = m_dispatcher.sink<NotifyInventoryChanges>().connect<&InventoryService::OnNotifyInventoryChanges>(this);
     m_equipmentChangeConnection = m_dispatcher.sink<NotifyEquipmentChanges>().connect<&InventoryService::OnNotifyEquipmentChanges>(this);
+    m_drawWeaponConnection = m_dispatcher.sink<NotifyDrawWeapon>().connect<&PlayerCopyWeapon::OnNotify>();
+    m_spawnConnection = m_dispatcher.sink<CharacterSpawnRequest>().connect<&PlayerCopyWeapon::OnSpawn>();
 }
 
 void InventoryService::OnUpdate(const UpdateEvent& acUpdateEvent) noexcept
@@ -58,6 +65,8 @@ void InventoryService::OnUpdate(const UpdateEvent& acUpdateEvent) noexcept
     RunWeaponStateUpdates();
     RunNakedNPCBugChecks();
     RunEquipmentSnapshotUpdates();
+    NpcEquipmentCheck::Run(m_world, m_transport);
+    PlayerCopyWeapon::Run(m_world, m_transport.IsConnected());
 }
 
 void InventoryService::OnInventoryChangeEvent(const InventoryChangeEvent& acEvent) noexcept
@@ -67,9 +76,9 @@ void InventoryService::OnInventoryChangeEvent(const InventoryChangeEvent& acEven
 
     auto view = m_world.view<FormIdComponent>();
 
-    const auto iter = std::find_if(std::begin(view), std::end(view), [view, formId = acEvent.FormId](auto entity) { return view.get<FormIdComponent>(entity).Id == formId; });
+    const auto iter = Utils::FindById<FormIdComponent>(view, acEvent.FormId);
 
-    if (iter == std::end(view))
+    if (!iter)
         return;
 
     uint32_t serverId = 0;
@@ -123,9 +132,9 @@ void InventoryService::OnEquipmentChangeEvent(const EquipmentChangeEvent& acEven
 
     auto view = m_world.view<FormIdComponent>();
 
-    const auto iter = std::find_if(std::begin(view), std::end(view), [view, formId = acEvent.ActorId](auto entity) { return view.get<FormIdComponent>(entity).Id == formId; });
+    const auto iter = Utils::FindById<FormIdComponent>(view, acEvent.ActorId);
 
-    if (iter == std::end(view))
+    if (!iter)
         return;
 
     const auto* pLocalComponent = m_world.try_get<LocalComponent>(*iter);
@@ -159,7 +168,14 @@ void InventoryService::OnEquipmentChangeEvent(const EquipmentChangeEvent& acEven
 
     m_transport.Send(request);
 
-    spdlog::info("Sending equipment request, item: {:X}, count: {}, target object: {:X}", acEvent.ItemId, acEvent.Count, acEvent.ActorId);
+    spdlog::info("Sending equipment request, item: {:X}, count: {}, target object: {:X}{}", acEvent.ItemId, acEvent.Count, acEvent.ActorId, acEvent.Unequip ? " (unequip)" : "");
+    // The hook queues the change before the game makes it, and the equipment above is read a frame later.
+    // An item taken off but worn by then, or put on but not worn, was undone through a path no hook sees: the first check sends what it wears.
+    if (pActor->formID != 0x14)
+    {
+        const bool cUndone = !acEvent.IsSpell && !acEvent.IsShout && NpcEquipmentCheck::IsWorn(request.CurrentInventory, request.ItemId) == acEvent.Unequip;
+        NpcEquipmentCheck::Note(pActor->formID, request.ServerId, request.OwnershipEpoch, request.CurrentInventory, cUndone);
+    }
 }
 
 namespace
@@ -212,9 +228,8 @@ void InventoryService::OnNotifyInventoryChanges(const NotifyInventoryChanges& ac
         // A character here under another epoch is a missed update, not an unknown character: report it.
         if (!pActor)
         {
-            const auto byIdIt = std::find_if(remoteView.begin(), remoteView.end(), [remoteView, &acMessage](const entt::entity aEntity)
-            { return remoteView.get<RemoteComponent>(aEntity).Id == acMessage.ServerId; });
-            if (byIdIt != remoteView.end())
+            const auto byIdIt = Utils::FindById<RemoteComponent>(remoteView, acMessage.ServerId);
+            if (byIdIt)
                 ReportEpochMiss("an equipment change", acMessage.ServerId, acMessage.OwnershipEpoch, remoteView.get<RemoteComponent>(*byIdIt).OwnershipEpoch);
         }
 
@@ -276,7 +291,10 @@ void InventoryService::OnNotifyEquipmentChanges(const NotifyEquipmentChanges& ac
     if (!acMessage.ItemId)
     {
         if (pActor->GetExtension()->IsRemote())
+        {
             ApplyHandEquipment(pActor, acMessage.CurrentInventory);
+            NpcEquipmentCheck::ApplyShield(pActor, acMessage.CurrentInventory);
+        }
         return;
     }
 
@@ -294,7 +312,7 @@ void InventoryService::OnNotifyEquipmentChanges(const NotifyEquipmentChanges& ac
     }
 
     // The equip makes other plugins read the copy's hands.
-    pActor->LetHandsGoOfStrayExtraData("its item does not hold, before an equip from its owner");
+    pActor->EmptyHandsOfStrayExtraData("its item does not hold, before an equip from its owner");
 
     uint32_t equipSlotId = modSystem.GetGameId(acMessage.EquipSlotId);
     TESForm* pEquipSlot = TESForm::GetById(equipSlotId);
@@ -361,10 +379,17 @@ void InventoryService::OnNotifyEquipmentChanges(const NotifyEquipmentChanges& ac
         pEquipManager->Equip(pActor, pItem, nullptr, acMessage.Count, pEquipSlot, false, true, false, false);
         NoteHandItem(pActor, pItem, pEquipSlot == DefaultObjectManager::Get().leftEquipSlot, true);
 
+        // The owner's game took off what the new armor replaces without a change of its own, so that piece stays off here.
+        // Put back on, it would take its slot back: a shield or helmet changed for another would show the old one.
+        // Only when the copy has the new piece: an equip of one it lacks does nothing, and the slot would stay empty.
+        const auto* pNewArmor = pActor->GetItemCountInInventory(pItem) > 0 ? Cast<TESObjectARMO>(pItem) : nullptr;
         for (const auto& armor : wornArmor.Entries)
         {
             uint32_t armorId = modSystem.GetGameId(armor.BaseId);
             TESForm* pArmor = TESForm::GetById(armorId);
+            const auto* pOldArmor = Cast<TESObjectARMO>(pArmor);
+            if (pNewArmor && pOldArmor && pOldArmor != pNewArmor && (pOldArmor->slotType & pNewArmor->slotType) != 0)
+                continue;
             if (pArmor)
                 pEquipManager->Equip(pActor, pArmor, nullptr, 1, pEquipSlot, false, true, false, false);
         }
@@ -376,14 +401,9 @@ void InventoryService::RunWeaponStateUpdates() noexcept
     if (!m_transport.IsConnected())
         return;
 
-    static std::chrono::steady_clock::time_point lastSendTimePoint;
-    constexpr auto cDelayBetweenUpdates = 500ms;
-
-    const auto now = std::chrono::steady_clock::now();
-    if (now - lastSendTimePoint < cDelayBetweenUpdates)
+    static Throttle s_sendThrottle(500ms);
+    if (!s_sendThrottle.TakeTurn())
         return;
-
-    lastSendTimePoint = now;
 
     auto view = m_world.view<FormIdComponent, LocalComponent>();
 
@@ -415,17 +435,12 @@ void InventoryService::RunNakedNPCBugChecks() noexcept
     if (!m_transport.IsConnected())
         return;
 
-    static std::chrono::steady_clock::time_point lastSendTimePoint;
-    constexpr auto cDelayBetweenUpdates = 1000ms;
-
     // How many times this has tried to dress each actor. See the give-up below.
     static TiltedPhoques::Map<uint32_t, uint32_t> s_resets;
 
-    const auto now = std::chrono::steady_clock::now();
-    if (now - lastSendTimePoint < cDelayBetweenUpdates)
+    static Throttle s_sendThrottle(1000ms);
+    if (!s_sendThrottle.TakeTurn())
         return;
-
-    lastSendTimePoint = now;
 
     auto view = m_world.view<FormIdComponent>();
 
@@ -487,22 +502,17 @@ void InventoryService::RunEquipmentSnapshotUpdates() noexcept
     if (!m_transport.IsConnected())
         return;
 
-    static std::chrono::steady_clock::time_point lastSendTimePoint;
-    constexpr auto cDelayBetweenUpdates = 1000ms;
-
-    const auto now = std::chrono::steady_clock::now();
-    if (now - lastSendTimePoint < cDelayBetweenUpdates)
+    static Throttle s_sendThrottle(1000ms);
+    if (!s_sendThrottle.TakeTurn())
         return;
-
-    lastSendTimePoint = now;
 
     PlayerCharacter* pPlayer = PlayerCharacter::Get();
     if (!pPlayer)
         return;
 
     auto view = m_world.view<FormIdComponent, LocalComponent>();
-    const auto it = std::find_if(view.begin(), view.end(), [view](auto entity) { return view.get<FormIdComponent>(entity).Id == 0x14; });
-    if (it == view.end())
+    const auto it = Utils::FindById<FormIdComponent>(view, 0x14);
+    if (!it)
         return;
 
     const uint32_t serverId = view.get<LocalComponent>(*it).Id;
@@ -516,23 +526,7 @@ void InventoryService::RunEquipmentSnapshotUpdates() noexcept
     }
 
     // Compare only what is worn where: charges and similar extra data change constantly in combat.
-    const auto isSameEquipment = [](const Inventory& acLhs, const Inventory& acRhs)
-    {
-        if (acLhs.Entries.size() != acRhs.Entries.size() || !(acLhs.CurrentMagicEquipment == acRhs.CurrentMagicEquipment))
-            return false;
-
-        for (size_t i = 0; i < acLhs.Entries.size(); ++i)
-        {
-            const auto& lhs = acLhs.Entries[i];
-            const auto& rhs = acRhs.Entries[i];
-            if (lhs.BaseId != rhs.BaseId || lhs.ExtraWorn != rhs.ExtraWorn || lhs.ExtraWornLeft != rhs.ExtraWornLeft)
-                return false;
-        }
-
-        return true;
-    };
-
-    if (serverId == m_lastSnapshotServerId && isSameEquipment(equipment, m_lastEquipmentSnapshot))
+    if (serverId == m_lastSnapshotServerId && NpcEquipmentCheck::HasSameWornItems(equipment, m_lastEquipmentSnapshot))
         return;
 
     RequestEquipmentChanges request;
@@ -580,7 +574,7 @@ void NoteHandItem(Actor* apActor, TESForm* apItem, bool aLeft, bool aEquipped) n
 void InventoryService::ApplyHandEquipment(Actor* apActor, const Inventory& acEquipment, bool aArrival) noexcept
 {
     // The equips below make other plugins read the actor's hands.
-    apActor->LetHandsGoOfStrayExtraData("its item does not hold, before its owner's hand items");
+    apActor->EmptyHandsOfStrayExtraData("its item does not hold, before its owner's hand items");
 
     constexpr uint8_t cLightFormType = 31;
 
@@ -615,6 +609,9 @@ void InventoryService::ApplyHandEquipment(Actor* apActor, const Inventory& acEqu
     Vector<HandItem>& heldItems = s_handsApplied[apActor->formID];
     if (aArrival)
         heldItems.clear(); // a fresh copy: SetInventory set the worn flags, the hands are empty
+    // A hand the hand check emptied no longer holds what we put there: it is put there again below while its owner still holds it.
+    for (const auto& [pForm, cLeft] : TESObjectREFR::TakeEmptiedHands(apActor->formID))
+        NoteHandItem(apActor, pForm, cLeft, false);
     const Vector<HandItem> flaggedItems = collectHandItems(apActor->GetEquipment());
     spdlog::info("Equipment sync: remote actor {:X} hands {}: {} hand items wanted ({} worn entries in all), {} put there by us, {} flagged worn, left spell {}, right spell {}", apActor->formID,
                  aArrival ? "on arrival" : "on snapshot", desiredItems.size(), acEquipment.Entries.size(), heldItems.size(), flaggedItems.size(),
@@ -639,6 +636,12 @@ void InventoryService::ApplyHandEquipment(Actor* apActor, const Inventory& acEqu
     {
         if (ContainsHandItem(heldItems, item.pForm, item.Left))
             continue;
+        // Already in that hand, put there since: equipping it again would empty the hand (`live-equip-twice`).
+        if (apActor->GetEquippedWeapon(item.Left ? 0 : 1) == item.pForm)
+        {
+            NoteHandItem(apActor, item.pForm, item.Left, true);
+            continue;
+        }
         auto* pObject = Cast<TESBoundObject>(item.pForm);
         if (!pObject)
             continue;

@@ -15,9 +15,9 @@
 #include <PlayerCharacter.h>
 #include <World.h>
 
-#ifdef SKYRIMVR
-#include <Games/Skyrim/VRBodySync.h>
-#endif
+#include <Games/Skyrim/VR/VRBodySync.h>
+#include <Games/Skyrim/VR/PosedCopyPlacement.h>
+#include <Services/DiscoveryService.h>
 
 namespace
 {
@@ -52,8 +52,12 @@ struct Down
     std::chrono::steady_clock::time_point QueuedSince;
     uint32_t GetUpsSent;
     bool SaidLong;
+    // Put on its feet where its owner stands, once its own get-ups were all refused.
+    bool Stood;
 };
 TiltedPhoques::Map<uint32_t, Down> s_down;
+// NPC copies put on their feet where their owner stands, and when: once in 30 s each, as their next fall starts a new entry above.
+TiltedPhoques::Map<uint32_t, std::chrono::steady_clock::time_point> s_stoodUp;
 
 // Copies dead here while their owner's game has not said they died, so that it is logged once per copy.
 std::unordered_set<uint32_t> s_saidDeadAlone;
@@ -220,6 +224,10 @@ uint64_t InterpolationSystem::GetPlaybackTick(const InterpolationComponent& acIn
 
 void InterpolationSystem::Update(Actor* apActor, InterpolationComponent& aInterpolationComponent, const double aNow, const bool aDeadAtOwner, const uint64_t aLastActionTick) noexcept
 {
+    // A place kept for the frame end by an earlier step goes: only one kept in this step is given (PosedCopyPlacement).
+    if (apActor)
+        PosedCopyPlacement::DropKeptPlace(apActor->formID);
+
     const double cDeltaTime = aInterpolationComponent.Clock.Advance(aNow);
 
     auto& movements = aInterpolationComponent.TimePoints;
@@ -564,9 +572,9 @@ void InterpolationSystem::Update(Actor* apActor, InterpolationComponent& aInterp
         }
     }
 
-#ifdef SKYRIMVR
+    // A VR player's arms, hands and weapons (VRBodySync::OnFrameEnd), in VR builds and on flat screens.
+    // On flat only another player's copy is posed; an NPC body's pose stays unused there.
     VRBodySync::SetRemotePose(apActor, vrPose);
-#endif
 
     if (!apActor)
         return;
@@ -618,7 +626,7 @@ void InterpolationSystem::Update(Actor* apActor, InterpolationComponent& aInterp
         const auto it = s_down.find(apActor->formID);
         if (cKnockedNpc && it == s_down.end())
         {
-            s_down[apActor->formID] = Down{cNow, {}, 0, false};
+            s_down[apActor->formID] = Down{cNow, {}, 0, false, false};
             spdlog::info("KnockDown: NPC copy {:X} lies in its own ragdoll (knock state {}); it stays where it fell until it gets up", apActor->formID, cKnockState);
         }
         else if (cKnockedNpc)
@@ -642,6 +650,27 @@ void InterpolationSystem::Update(Actor* apActor, InterpolationComponent& aInterp
                 spdlog::info("KnockDown: NPC copy {:X} waited {} ms with its get-up queued; sent it 'GetUpBegin' ({}, try {})", apActor->formID,
                              std::chrono::duration_cast<std::chrono::milliseconds>(cNow - down.QueuedSince).count(), cTaken ? "taken" : "not taken", down.GetUpsSent);
                 down.QueuedSince = {};
+            }
+            // Every get-up refused while its owner's NPC stands elsewhere: the copy would lie there for good while it fights on over there.
+            // The other player could neither find it nor hit it (a brawl, 2026-11-15).
+            // The game's own move puts it on its feet where its owner has it, and it follows from there.
+            constexpr float cOwnerAway = 100.f;
+            const float cApart = glm::distance(static_cast<glm::vec3>(apActor->position), static_cast<glm::vec3>(position));
+            const auto cStoodBefore = s_stoodUp.find(apActor->formID);
+            const bool cStoodLately = cStoodBefore != s_stoodUp.end() && cNow - cStoodBefore->second < 30s;
+            TESObjectCELL* pCell = apActor->GetParentCellEx();
+            if (down.GetUpsSent >= cMaxGetUps && !down.Stood && !cStoodLately && pCell && cKnockState == cKnockQueued && cNow - down.Since > 6s && cApart > cOwnerAway)
+            {
+                down.Stood = true;
+                if (s_stoodUp.size() > 256)
+                    s_stoodUp.clear();
+                s_stoodUp[apActor->formID] = cNow;
+                apActor->actorState.flags1 &= ~0xE000000u;
+                // The move drops its 3D for a moment; noted, discovery does not take that for a copy gone.
+                DiscoveryService::NoteMovedHere(apActor->formID);
+                apActor->MoveTo(pCell, position);
+                spdlog::info("KnockDown: NPC copy {:X} could not get up after {} tries while its owner stands {:.0f} units away; moved there on its feet", apActor->formID,
+                             down.GetUpsSent, cApart);
             }
             if (!down.SaidLong && cNow - down.Since > 15s)
             {
@@ -768,7 +797,13 @@ void InterpolationSystem::Update(Actor* apActor, InterpolationComponent& aInterp
         }
     }
 
-    apActor->ForcePosition(placed);
+    // A VR player's posed copy is placed and turned at the frame end, right before its pose is written (PosedCopyPlacement).
+    // This runs on the game's script threads at no fixed point in the frame, and a placement here could rebuild the skeleton after the pose.
+    // Not while the copy waits hidden for its first placement: that one shows it, so it lands now.
+    const bool cPosedPlayerCopy = vrPose.HasData && !vrPose.NoBones && pExtension && pExtension->IsRemotePlayer();
+    const bool cPlaceAtFrameEnd = cPosedPlayerCopy && !SpawnReveal::IsWaiting(apActor->formID) && PosedCopyPlacement::IsFrameEndRunning();
+    if (!cPlaceAtFrameEnd)
+        apActor->ForcePosition(placed);
     SpawnReveal::Placed(apActor);
     // A creature of another kind than the owner's (see MarkForeignGraph) keeps its own animation state.
     if (!aInterpolationComponent.ForeignGraph)
@@ -821,7 +856,10 @@ void InterpolationSystem::Update(Actor* apActor, InterpolationComponent& aInterp
     const auto finalY = TiltedPhoques::Mod(rotA.y + deltaY, float(TiltedPhoques::Pi * 2));
     const auto finalZ = TiltedPhoques::Mod(rotA.z + deltaZ, float(TiltedPhoques::Pi * 2));
 
-    apActor->SetRotation(finalX, finalY, finalZ);
+    if (cPlaceAtFrameEnd)
+        PosedCopyPlacement::KeepForFrameEnd(apActor->formID, placed, NiPoint3(glm::vec3(finalX, finalY, finalZ)));
+    else
+        apActor->SetRotation(finalX, finalY, finalZ);
 }
 
 void InterpolationSystem::AddPoint(InterpolationComponent& aInterpolationComponent, const InterpolationComponent::TimePoint& acPoint, const double aArrivalTime) noexcept
@@ -855,8 +893,8 @@ void InterpolationSystem::AddPoint(InterpolationComponent& aInterpolationCompone
             if (now >= s_nextLog)
             {
                 s_nextLog = now + std::chrono::seconds(10);
-                spdlog::info("JumpDiag: a buffered point was {:.0f} units from the one before it, at ({:.0f}, {:.0f}, {:.0f}); dropped the buffer so the actor arrives instead of flying. {} since the last line.",
-                             jump, acPoint.Position.x, acPoint.Position.y, acPoint.Position.z, s_since);
+                spdlog::info("JumpDiag: a buffered point was {:.0f} units from the one before it, at ({:.0f}); dropped the buffer so the actor arrives instead of flying. {} since the last line.",
+                             jump, acPoint.Position, s_since);
                 s_since = 0;
             }
         }

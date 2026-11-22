@@ -103,8 +103,7 @@ NiPoint3 PlayerCharacter::RespawnPlayer(TESObjectCELL* apSafePointCell, const Ni
     if (apSafePointCell)
     {
         const char* cpSafeEditorId = apSafePointCell->GetFormEditorID();
-        spdlog::info("RespawnPlayer: at the safe point in cell {:X} '{}', ({:.0f}, {:.0f}, {:.0f})", apSafePointCell->formID, cpSafeEditorId ? cpSafeEditorId : "", acSafePoint.x,
-                     acSafePoint.y, acSafePoint.z);
+        spdlog::info("RespawnPlayer: at the safe point in cell {:X} '{}', ({:.0f})", apSafePointCell->formID, cpSafeEditorId ? cpSafeEditorId : "", acSafePoint);
         MoveTo(apSafePointCell, acSafePoint);
         SetNoBleedoutRecovery(true);
         return acSafePoint;
@@ -217,6 +216,22 @@ void PlayerCharacter::SetWaypoint(NiPoint3* apPosition, TESWorldSpace* apWorldSp
 void PlayerCharacter::RemoveWaypoint() noexcept
 {
     return TiltedPhoques::ThisCall(RealRemoveWaypoint, this);
+}
+
+/**
+ * Tell whether the player is sleeping or waiting: the game's own countdown of the hours still to pass is running.
+ *
+ * @return True while the game's own sleep or wait runs; false otherwise, and when the game's check is not found.
+ */
+bool PlayerCharacter::IsSleepingOrWaiting() const noexcept
+{
+    // The game's check reads the seconds still to pass (+0x8F4 on flat, +0xFE0 on VR); its sleep and wait starts set them to the hours times 3600.
+    TP_THIS_FUNCTION(TIsSleepingOrWaiting, bool, const PlayerCharacter);
+    POINTER_SKYRIMSE(TIsSleepingOrWaiting, s_isSleepingOrWaiting, 40413, 9000016);
+    if (!s_isSleepingOrWaiting.Get())
+        return false;
+
+    return TiltedPhoques::ThisCall(s_isSleepingOrWaiting.Get(), this);
 }
 
 #ifdef SKYRIMVR

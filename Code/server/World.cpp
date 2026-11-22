@@ -2,6 +2,7 @@
 #include <Components.h>
 
 #include <Services/CharacterService.h>
+#include <Services/PresenceService.h>
 #include <Services/ObjectService.h>
 #include <Services/QuestService.h>
 #include <Services/ServerListService.h>
@@ -21,6 +22,8 @@
 #include <Services/VoiceService.h>
 #include <Services/WhereaboutsService.h>
 #include <Services/ReviveService.h>
+#include <Services/SleepVoteService.h>
+#include <Services/HourMoveService.h>
 
 #include <es_loader/ESLoader.h>
 
@@ -35,6 +38,7 @@ World::World()
     spdlog::default_logger()->sinks().push_back(std::static_pointer_cast<spdlog::sinks::sink>(m_spAdminService));
 
     ctx().emplace<CharacterService>(*this, m_dispatcher);
+    ctx().emplace<PresenceService>(*this, m_dispatcher);
     ctx().emplace<PlayerService>(*this, m_dispatcher);
     ctx().emplace<CalendarService>(*this, m_dispatcher);
     ctx().emplace<ObjectService>(*this, m_dispatcher);
@@ -56,6 +60,8 @@ World::World()
     ctx().emplace<VoiceService>(*this, m_dispatcher);
     ctx().emplace<WhereaboutsService>(*this, m_dispatcher);
     ctx().emplace<ReviveService>(*this, m_dispatcher);
+    ctx().emplace<SleepVoteService>(*this, m_dispatcher);
+    ctx().emplace<HourMoveService>(*this, m_dispatcher);
 
     ESLoader::ESLoader loader;
     // emplace loaded mods into modscomponent.

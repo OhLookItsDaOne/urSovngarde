@@ -6,9 +6,10 @@
 #include <Services/OverlayClient.h>
 #include <Services/TransportService.h>
 #include <Services/VoiceService.h>
-#ifdef SKYRIMVR
 #include <Services/VRConnectService.h>
-#endif
+#include <Services/MenuService.h>
+#include <Services/LauncherLinkService.h>
+#include <Services/SteamFriendsService.h>
 
 #include <Messages/SendChatMessageRequest.h>
 #include <Messages/TeleportRequest.h>
@@ -16,6 +17,7 @@
 #include <Events/SetTimeCommandEvent.h>
 
 #include <World.h>
+#include <Utils.h>
 
 OverlayClient::OverlayClient(TransportService& aTransport, TiltedPhoques::OverlayRenderHandler* apHandler)
     : TiltedPhoques::OverlayClient(apHandler)
@@ -36,10 +38,8 @@ bool OverlayClient::OnProcessMessageReceived(CefRefPtr<CefBrowser> browser, CefR
         auto eventName = pArguments->GetString(0).ToString();
         auto eventArgs = pArguments->GetList(1);
 
+        // Only the name: an event's arguments can hold a server password.
         spdlog::info(eventName);
-        spdlog::info(eventArgs->GetString(0).ToString());
-        spdlog::info(std::to_string(eventArgs->GetInt(1)));
-        spdlog::info(eventArgs->GetString(2).ToString());
 
 #ifndef PUBLIC_BUILD
         LOG(INFO) << "event=ui_event name=" << eventName;
@@ -97,11 +97,45 @@ bool OverlayClient::OnProcessMessageReceived(CefRefPtr<CefBrowser> browser, CefR
             const float cVolume = eventArgs->GetType(0) == VTYPE_INT ? static_cast<float>(eventArgs->GetInt(0)) : static_cast<float>(eventArgs->GetDouble(0));
             World::Get().GetRunner().Queue([cVolume]() { World::Get().ctx().at<VoiceService>().SetVolume(cVolume); });
         }
+        else if (eventName == "setVoicePartyNearbyOnly")
+        {
+            const bool cNearbyOnly = eventArgs->GetBool(0);
+            World::Get().GetRunner().Queue([cNearbyOnly]() { World::Get().ctx().at<VoiceService>().SetPartyNearbyOnly(cNearbyOnly); });
+        }
         else if (eventName == "setPlayerVoiceMuted")
         {
             const uint32_t cPlayerId = eventArgs->GetInt(0);
             const bool cMuted = eventArgs->GetBool(1);
             World::Get().GetRunner().Queue([cPlayerId, cMuted]() { World::Get().ctx().at<VoiceService>().SetPlayerMuted(cPlayerId, cMuted); });
+        }
+        else if (eventName == "launcherJoin")
+        {
+            const std::string cRequest = eventArgs->GetString(0);
+            const std::string cCode = eventArgs->GetString(1);
+            const std::string cName = eventArgs->GetString(2);
+            const std::string cPassword = eventArgs->GetString(3);
+            World::Get().GetRunner().Queue([cRequest, cCode, cName, cPassword]() { World::Get().ctx().at<LauncherLinkService>().RequestJoin(cRequest, cCode, cName, cPassword); });
+        }
+        else if (eventName == "connectFromLauncher")
+            World::Get().GetRunner().Queue([]() { World::Get().ctx().at<VRConnectService>().ConnectNow(); });
+        else if (eventName == "setShareWithSteamFriends")
+        {
+            const bool cSharing = eventArgs->GetBool(0);
+            World::Get().GetRunner().Queue([cSharing]() { World::Get().ctx().at<SteamFriendsService>().SetSharing(cSharing); });
+        }
+        else if (eventName == "joinSteamFriend")
+        {
+            const std::string cFriendId = eventArgs->GetString(0);
+            const std::string cPassword = eventArgs->GetString(1);
+            World::Get().GetRunner().Queue([cFriendId, cPassword]() { World::Get().ctx().at<SteamFriendsService>().JoinFriend(cFriendId, cPassword); });
+        }
+        else if (eventName == "launcherCancel")
+            World::Get().GetRunner().Queue([]() { World::Get().ctx().at<LauncherLinkService>().CancelRequest(); });
+        else if (eventName == "showHudMessage")
+        {
+            // From the menu, so a player who closed the dashboard still learns how a join ended.
+            const std::string cText = std::string(eventArgs->GetString(0)).substr(0, 200);
+            World::Get().GetRunner().Queue([cText]() { Utils::ShowModHudMessage(cText.c_str()); });
         }
 
         return true;
@@ -119,38 +153,25 @@ void OverlayClient::ProcessConnectMessage(CefRefPtr<CefListValue> aEventArgs)
     }
 
     uint16_t port = aEventArgs->GetInt(1) ? aEventArgs->GetInt(1) : 10578;
-    World::Get().GetTransport().SetServerPassword(aEventArgs->GetString(2));
+    const std::string cPassword = aEventArgs->GetString(2);
+    const std::string cEndpoint = baseIp + ":" + std::to_string(port);
 
-    std::string endpoint = baseIp + ":" + std::to_string(port);
-
-    World::Get().GetRunner().Queue([endpoint] { World::Get().GetTransport().Connect(endpoint); });
+    // Through the connect service, which then reconnects to this server after a drop or another character's save, not to connect.txt's.
+    World::Get().GetRunner().Queue([cEndpoint, cPassword] { World::Get().ctx().at<VRConnectService>().ConnectToServer(cEndpoint, cPassword); });
 }
 
 void OverlayClient::ProcessDisconnectMessage()
 {
-#ifdef SKYRIMVR
     // Closing the transport directly looks like a dropped line to the connect service, which then reconnects.
-    // Toggle() marks the disconnect as chosen, and only closes when online.
-    World::Get().GetRunner().Queue(
-        []()
-        {
-            auto& connect = World::Get().ctx().at<VRConnectService>();
-            if (World::Get().GetTransport().IsConnected())
-                connect.Toggle();
-            else
-                World::Get().GetTransport().Close();
-        });
-#else
-    World::Get().GetRunner().Queue([]() { World::Get().GetTransport().Close(); });
-#endif
+    // Stop() marks the disconnect as chosen, whether the game was online, connecting or waiting to retry.
+    World::Get().GetRunner().Queue([]() { World::Get().ctx().at<VRConnectService>().Stop(); });
 }
 
 void OverlayClient::ProcessRevealPlayersMessage()
 {
-#ifndef SKYRIMVR
-    SetUIVisible(false);
-#endif
-    // On VR the menu stays: it says the players glow once it is closed, when the game runs again.
+    // A flat screen's menu closes so the player sees the glow.
+    // In VR the menu stays: it says the players glow once it is closed.
+    World::Get().GetRunner().Queue([]() { World::Get().ctx().at<MenuService>().CloseOn(MenuSurface::kScreen); });
     // The effect goes on actors, so it starts on the game's thread, not CEF's.
     World::Get().GetRunner().Queue([]() { World::Get().GetMagicService().StartRevealingOtherPlayers(); });
 }
@@ -191,13 +212,3 @@ void OverlayClient::ProcessToggleDebugUI()
     World::Get().GetDebugService().m_showDebugStuff = !World::Get().GetDebugService().m_showDebugStuff;
 }
 
-void OverlayClient::SetUIVisible(bool aVisible) noexcept
-{
-    auto pRenderer = GetOverlayRenderHandler();
-    if (!pRenderer)
-        return;
-
-    TiltedPhoques::DInputHook::Get().SetEnabled(aVisible);
-    World::Get().GetOverlayService().SetActive(aVisible);
-    pRenderer->SetCursorVisible(aVisible);
-}

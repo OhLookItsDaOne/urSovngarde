@@ -35,6 +35,9 @@ struct Player
     void SetUsername(String aUsername) noexcept;
     void SetMods(Vector<String> aMods) noexcept;
     [[nodiscard]] const Vector<String>& GetMods() const noexcept { return m_mods; }
+    //! The plugins of its game that add or change NPCs (RequestNpcPlugins); empty until it says.
+    void SetNpcPlugins(Vector<String> aPlugins) noexcept { m_npcPlugins = std::move(aPlugins); }
+    [[nodiscard]] const Vector<String>& GetNpcPlugins() const noexcept { return m_npcPlugins; }
     void SetModIds(Vector<uint16_t> aModIds) noexcept;
     void SetCharacter(entt::entity aCharacter) noexcept;
     void SetStringCacheId(uint32_t aStringCacheId) noexcept;
@@ -48,6 +51,9 @@ struct Player
     void SetPlace(String aPlace) noexcept { m_place = std::move(aPlace); }
     [[nodiscard]] bool IsHiddenFromPublicPage() const noexcept { return m_hiddenFromPublicPage; }
     void SetHiddenFromPublicPage(bool aHidden) noexcept { m_hiddenFromPublicPage = aHidden; }
+    // Whether the player plays flat Skyrim rather than Skyrim VR, as its game said when connecting.
+    [[nodiscard]] bool IsFlat() const noexcept { return m_flat; }
+    void SetFlat(bool aFlat) noexcept { m_flat = aFlat; }
 
     void Send(const ServerMessage& acServerMessage, TiltedPhoques::EPacketFlags aFlags = TiltedPhoques::kReliable) const;
     // For voice: a lost packet is a short gap, never a delay behind a resend.
@@ -66,23 +72,31 @@ struct Player
     [[nodiscard]] std::chrono::steady_clock::time_point GetLastCellEnterAt() const noexcept { return m_lastCellEnterAt; }
     void MarkCellEnter() noexcept { m_lastCellEnterAt = std::chrono::steady_clock::now(); }
 
+    // The cell component's centre is that of the game's loaded cells, which trails the cell the player stands in by up to one.
+    // Something the player does happens here; whether another game has it loaded goes by that game's cell component.
+    [[nodiscard]] CellIdComponent GetStandingCell() const noexcept { return CellIdComponent{m_cell.Cell, m_cell.WorldSpaceId, m_standing}; }
+    void SetStandingCoords(const GridCellCoords& acCoords) noexcept { m_standing = acCoords; }
+
 private:
     uint32_t m_id{0};
     ConnectionId_t m_connectionId;
     std::optional<entt::entity> m_character;
     Vector<String> m_mods;
     Vector<uint16_t> m_modIds;
+    Vector<String> m_npcPlugins;
     uint64_t m_discordId{0};
     String m_endpoint;
     String m_username;
     PartyComponent m_party;
     QuestLogComponent m_questLog;
     CellIdComponent m_cell;
+    GridCellCoords m_standing{};
     uint32_t m_stringCacheId{0};
     uint16_t m_level{0};
     std::chrono::steady_clock::time_point m_lastMovementAt{};
     std::chrono::steady_clock::time_point m_lastCellEnterAt{};
     String m_place;
     bool m_hiddenFromPublicPage{false};
+    bool m_flat{false};
     bool m_voiceEnabled{false};
 };

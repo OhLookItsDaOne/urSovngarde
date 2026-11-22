@@ -1,5 +1,8 @@
 #pragma once
 
+#include <cstdint>
+#include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <istream>
 #include <string>
@@ -8,6 +11,23 @@
 // A player has their own, and a mod can ship the same file, which is how a mod list comes with its server.
 namespace ConnectFile
 {
+// The player's own folder in %LOCALAPPDATA%, for this file and the launcher's files.
+// One per game, so a flat and a VR game on one PC never read each other's.
+#ifdef SKYRIMVR
+constexpr const char* kFolderName = "SkyrimTogetherVR";
+#else
+constexpr const char* kFolderName = "SkyrimTogetherSE";
+#endif
+
+// The server's port when an address leaves it out.
+constexpr uint16_t kDefaultPort = 10578;
+
+inline std::filesystem::path PlayerFolder()
+{
+    const char* cpLocalAppData = std::getenv("LOCALAPPDATA");
+    return std::filesystem::path(cpLocalAppData ? cpLocalAppData : "") / kFolderName;
+}
+
 struct Contents
 {
     std::string Address;
@@ -47,7 +67,7 @@ inline bool Parse(std::istream& aText, Contents& aContents)
 
     // A hand-made file may leave the port out, and the network library's own default is not the server's.
     if (address.find(':') == std::string::npos)
-        address += ":10578";
+        address += ":" + std::to_string(kDefaultPort);
 
     // After the address: the password, then settings as "name=value" lines.
     // A file without a password may have the setting on the second line, so a setting is never taken for a password.
@@ -74,7 +94,7 @@ inline bool Parse(std::istream& aText, Contents& aContents)
 
 // The player's file comes first whenever it names a server.
 // Every join from the launcher writes it, a friend's code as a local tunnel, and a mod's file must not send that join elsewhere.
-inline bool Load(const std::string& acPlayerFile, const std::string& acModFile, Contents& aContents)
+inline bool Load(const std::filesystem::path& acPlayerFile, const std::filesystem::path& acModFile, Contents& aContents)
 {
     std::ifstream playerFile(acPlayerFile);
     if (playerFile && Parse(playerFile, aContents))

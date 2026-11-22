@@ -84,6 +84,13 @@ struct CharacterService
     void OnConnected(const ConnectedEvent& acConnectedEvent) const noexcept;
     void OnDisconnected(const DisconnectedEvent& acDisconnectedEvent) const noexcept;
     void OnAssignCharacter(const AssignCharacterResponse& acMessage) noexcept;
+    /**
+     * Make or update this game's copy of a character another game runs, from the server's spawn message.
+     * A character already known here is corrected where it went stale.
+     * Otherwise its copy is picked or made now (the reference itself, a stand-in or a new actor) and finished once it has its 3D.
+     *
+     * @param acMessage The spawn message.
+     */
     void OnCharacterSpawn(const CharacterSpawnRequest& acMessage) const noexcept;
     void OnReferencesMoveRequest(const ServerReferencesMoveRequest& acMessage) const noexcept;
     void OnNotifyActionEvents(const NotifyActionEvents& acMessage) const noexcept;
@@ -102,8 +109,19 @@ struct CharacterService
     void OnBeastFormChange(const BeastFormChangeEvent& acEvent) const noexcept;
     void OnAddExperienceEvent(const AddExperienceEvent& acEvent) noexcept;
     void OnNotifySyncExperience(const NotifySyncExperience& acMessage) noexcept;
+    /**
+     * Send a line a shared character speaks in this game to the other players, with its scene when it has one.
+     * The same line spoken twice within a second goes once.
+     *
+     * @param acEvent The spoken line.
+     */
     void OnDialogueEvent(const DialogueEvent& acEvent) noexcept;
     void OnNotifyDialogue(const NotifyDialogue& acMessage) noexcept;
+    /**
+     * Send a subtitle a shared character shows in this game to the other players, with its scene when it has one.
+     *
+     * @param acEvent The subtitle.
+     */
     void OnSubtitleEvent(const SubtitleEvent& acEvent) noexcept;
     void OnNotifySubtitle(const NotifySubtitle& acMessage) noexcept;
     void OnNotifyActorTeleport(const NotifyActorTeleport& acMessage) noexcept;
@@ -112,8 +130,30 @@ struct CharacterService
     void ProcessNewEntity(entt::entity aEntity) const noexcept;
 
 #ifdef SKYRIMVR
+    /**
+     * Take the health off the dead bodies near the player, and lay down one that has stood still over two looks.
+     * A dead body with health gets back up, and stands with no ragdoll while the game still lets a player search it; a save keeps it so.
+     * A body a spell is raising is left alone: it counts as dead for its first moments, with the health the spell gave it back.
+     * From the start of a frame on the main thread: no job is rebuilding a body then.
+     */
     void LayDownStandingBodies() noexcept;
 #endif
+    /**
+     * Switch off the copies queued since the last frame (FrameStartSwitchOff): removed copies, and copies whose ragdoll falls away under the ground (FallStop).
+     * Called on the main thread at the start of a frame.
+     */
+    static void DisableQueuedCopies() noexcept;
+    //! Draws or sheathes a remote copy's weapon in two passes, as for a copy that arrives (ApplyCachedWeaponDraws).
+    //! aForce: drawn even if the copy's state already says so, as on arrival, for a draw whose animation this game never played.
+    void QueueWeaponDraw(const uint32_t aFormId, const bool aDrawn, const bool aForce = false) noexcept
+    {
+        WeaponDrawData data(aDrawn);
+        data.m_correction = !aForce;
+        data.m_forced = aForce;
+        m_weaponDrawUpdates[aFormId] = data;
+    }
+    //! Whether a weapon draw or sheathe is queued for that copy.
+    [[nodiscard]] bool IsWeaponDrawQueued(const uint32_t aFormId) const noexcept { return m_weaponDrawUpdates.find(aFormId) != m_weaponDrawUpdates.end(); }
 
 private:
     //! False when the cell to move to could not be found.
@@ -127,6 +167,13 @@ private:
     void DeclineOwnership(uint32_t aServerId, uint32_t aOwnershipEpoch) const noexcept;
     void ReconcileActorData(entt::entity aEntity, Actor* apActor, uint32_t aOwnershipEpoch, const ActorData& acActorData, bool aApplyInventory, bool aIsLocalOwner) noexcept;
 
+    /**
+     * Make the copy for a character whose spawn waits for this game, from the spawn message it keeps.
+     * A placed reference whose stand-in copy is gone gets a new stand-in.
+     *
+     * @param aEntity The character's entity, waiting for its 3D.
+     * @return The copy, or null when it cannot be made yet; it is asked again every five seconds.
+     */
     Actor* CreateCharacterForEntity(entt::entity aEntity) const noexcept;
     ActorData BuildActorData(Actor* apActor) const noexcept;
     //! @param apOwnerEquipment The owner's equipment, put back on a copy once its rebuild completes; null when this game owns it.
@@ -138,8 +185,6 @@ private:
     void RunLeaderClaims() const noexcept;
     // Tells the server who became, or stopped being, this player's follower.
     void RunFollowerReports() const noexcept;
-    // Tells the server every 2 s which characters this game has loaded, and as what.
-    void RunPresenceReports() const noexcept;
     // Announces references that a stand-in stopped hiding, which discovery may not find again.
     void RunReleasedGhosts() const noexcept;
     void ProcessLeveledConforms() noexcept;
@@ -151,6 +196,10 @@ private:
     void RunWeaponTouch() noexcept;
 
 private:
+    /**
+     * Run the copies of other games' characters: their places, actions and faces, and the 3D step of the ones whose 3D just came.
+     * The 3D step gives a copy its inventory, factions and life as in its owner's game, and clears its wait for that step (ActorExtension::AwaitingFirst3D).
+     */
     void RunRemoteUpdates() noexcept;
     void RunFactionsUpdates() const noexcept;
     void RunSpawnUpdates() const noexcept;
@@ -180,6 +229,10 @@ private:
         double m_timer = 0.0;
         bool m_drawWeapon = false;
         bool m_isFirstPass = true;
+        // Asked for a copy already in view (QueueWeaponDraw), not one that just arrived: a copy already drawn is left as it is.
+        bool m_correction = false;
+        // Drawn even if its state says so; once that draw has started, the second pass only retries a draw that was undone.
+        bool m_forced = false;
     };
 
     Map<uint32_t, WeaponDrawData> m_weaponDrawUpdates{};

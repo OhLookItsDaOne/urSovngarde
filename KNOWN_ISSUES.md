@@ -148,7 +148,8 @@ entries below are under `#ifdef SKYRIMVR` with `static_assert`s.
     node's first bytes change), and the skeleton is resolved again when they differ.
   - Not posed: dead, dying or bleeding out actors (the ragdoll owns them), and actors outside a 50 degree
     view cone from the headset (`PlayerCharacter` +0x570, checked by name), because posing a culled actor
-    tears its skin.
+    tears its skin. A live copy is tested where it is drawn (its root and the pose's hips), not at its own
+    bones, and once in view it stays posed until 10 degrees past the cone.
   - Bones are found along the skeleton chain, because physics armour carries duplicate hand nodes.
 - **Send rate:** the local player 30 Hz, other actors 10 Hz. The VR pose plays back 100 ms late,
   movement 300 ms.
@@ -186,6 +187,10 @@ entries below are under `#ifdef SKYRIMVR` with `static_assert`s.
 
 ## 6. Open bugs
 
+- **A game that goes on from an older save misses the quest stages the party passed meanwhile** (`QuestService`, client and server). Stages are relayed as they happen, and the server keeps them only
+  to drop duplicates, so nothing replays them to a game that is behind, and a skipped stage's script never runs there. Seen on 2026-11-22: player 2's Helgen intro had skipped MQ101's stage 255,
+  the only one that switches waiting back on (the game's `SetInChargen`, kept in the save), so every wait and bed was refused with "You cannot wait in this location." `IntroWaitRepair` repairs
+  that one case after each load and after another game's intro stage; any other skipped stage stays skipped.
 - **PvP limits of the one damage rule** (`PvpProjectiles.h`, `HookDamageActor`, `OnHealthChangeBroadcast`). An arrow takes its shooter's number, so a raised shield in the target's game no
   longer lowers it: the copy in the shooter's game does not block, and the hook does not see the block. Three rarer cases cost at most one arrow's number: a second arrow's report within
   500 ms of the first arrow's hit counts as more of the first; a replayed hit higher than the report stays higher; a report after the flight window (a hitch over 300 ms) is held as a plain hit, on top of the replay's.

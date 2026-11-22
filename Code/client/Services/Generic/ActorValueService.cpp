@@ -1,14 +1,16 @@
 #include <TiltedOnlinePCH.h>
-#include <PerfScope.h>
+#include <Helpers/Throttle.h>
+#include <Helpers/PerfScope.h>
 
 #include <Services/ActorValueService.h>
+#include <Services/CombatService.h>
 #include <World.h>
 #include <Forms/ActorValueInfo.h>
 #include <Forms/TESNPC.h>
 #include <Games/References.h>
 #include <Components.h>
 #include <Systems/InterpolationSystem.h>
-#include <EpochMiss.h>
+#include <Copies/EpochMiss.h>
 
 #include <Events/UpdateEvent.h>
 #include <Events/ActorRemovedEvent.h>
@@ -17,8 +19,9 @@
 #include <Events/HealthChangeEvent.h>
 #include <Events/ClashEvent.h>
 #include <PlayerCharacter.h>
-#include <Games/Skyrim/DeathCause.h>
+#include <UI/Banner/DeathCause.h>
 #include <Services/PvpProjectiles.h>
+#include <Services/PvpRules.h>
 
 #include <Messages/NotifyActorValueChanges.h>
 #include <Messages/RequestActorValueChanges.h>
@@ -150,18 +153,8 @@ void ActorValueService::OnActorRemoved(const ActorRemovedEvent& acEvent) noexcep
         return;
 
     auto view = m_world.view<FormIdComponent>();
-    const uint32_t formId = acEvent.FormId;
-
-    const auto it = std::find_if(
-        std::begin(view), std::end(view),
-        [view, formId](auto entity)
-        {
-            const auto& formIdComponent = view.get<FormIdComponent>(entity);
-
-            return formIdComponent.Id == formId;
-        });
-
-    if (it != std::end(view))
+    const auto it = Utils::FindById<FormIdComponent>(view, acEvent.FormId);
+    if (it)
         m_world.remove<ActorValuesComponent>(*it);
 }
 
@@ -180,10 +173,14 @@ TiltedPhoques::Map<uint32_t, CopyRevival> s_copyRevivals;
 bool IsAliveAtOwner(const uint32_t aFormId) noexcept
 {
     auto view = World::Get().view<FormIdComponent, RemoteComponent>();
-    const auto it = std::find_if(view.begin(), view.end(), [&view, aFormId](entt::entity aEntity) { return view.get<FormIdComponent>(aEntity).Id == aFormId; });
-    return it != view.end() && !view.get<RemoteComponent>(*it).DeadAtOwner;
+    const auto it = Utils::FindByFormId(view, aFormId);
+    return it && !view.get<RemoteComponent>(*it).DeadAtOwner;
 }
 
+/**
+ * Look again at each copy revived in the last moments, and revive it again if it is dead while its owner has it alive.
+ * A copy stops being watched once it lives, its tries are used up, its owner has it dead, or a spell raises it (Actor::IsBeingRaised).
+ */
 void RunCopyRevivals() noexcept
 {
     const auto cNow = std::chrono::steady_clock::now();
@@ -197,7 +194,7 @@ void RunCopyRevivals() noexcept
 
         Actor* pActor = Cast<Actor>(TESForm::GetById(it->first));
         const ActorExtension* pExtension = pActor ? pActor->GetExtension() : nullptr;
-        if (!pExtension || !pExtension->IsRemote() || !pActor->IsDead() || it->second.TriesLeft == 0 || !IsAliveAtOwner(pActor->formID))
+        if (!pExtension || !pExtension->IsRemote() || !pActor->IsDead() || it->second.TriesLeft == 0 || !IsAliveAtOwner(pActor->formID) || pActor->IsBeingRaised())
         {
             it = s_copyRevivals.erase(it);
             continue;
@@ -206,7 +203,7 @@ void RunCopyRevivals() noexcept
         pActor->Respawn();
         it.value().CheckAt = cNow + 1s;
         --it.value().TriesLeft;
-        spdlog::info("Death sync: remote actor {:X} fell dead again after its revival; revived again, {} tries left", pActor->formID, it->second.TriesLeft);
+        spdlog::info("Death sync: remote actor {:X} is dead again after its revival; revival asked again, {} tries left", pActor->formID, it->second.TriesLeft);
         ++it;
     }
 }
@@ -337,9 +334,9 @@ void ActorValueService::OnHealthChange(const HealthChangeEvent& acEvent) noexcep
 
     auto view = m_world.view<FormIdComponent>();
 
-    const auto hitteeIt = std::find_if(std::begin(view), std::end(view), [id = acEvent.HitteeId, view](entt::entity entity) { return view.get<FormIdComponent>(entity).Id == id; });
+    const auto hitteeIt = Utils::FindByFormId(view, acEvent.HitteeId);
 
-    if (hitteeIt == std::end(view))
+    if (!hitteeIt)
     {
         spdlog::warn("Health change event form id component not found, form id: {:X}", acEvent.HitteeId);
         return;
@@ -400,14 +397,9 @@ void ActorValueService::OnHealthChange(const HealthChangeEvent& acEvent) noexcep
 
 void ActorValueService::RunSmallHealthUpdates() noexcept
 {
-    static std::chrono::steady_clock::time_point lastSendTimePoint;
-    constexpr auto cDelayBetweenUpdates = 250ms;
-
-    const auto now = std::chrono::steady_clock::now();
-    if (now - lastSendTimePoint < cDelayBetweenUpdates)
+    static Throttle s_sendThrottle(250ms);
+    if (!s_sendThrottle.TakeTurn())
         return;
-
-    lastSendTimePoint = now;
 
     if (!m_smallHealthChanges.empty())
     {
@@ -440,14 +432,9 @@ void ActorValueService::RunSmallHealthUpdates() noexcept
 
 void ActorValueService::RunDeathStateUpdates() noexcept
 {
-    static std::chrono::steady_clock::time_point lastSendTimePoint;
-    constexpr auto cDelayBetweenUpdates = 250ms;
-
-    const auto now = std::chrono::steady_clock::now();
-    if (now - lastSendTimePoint < cDelayBetweenUpdates)
+    static Throttle s_sendThrottle(250ms);
+    if (!s_sendThrottle.TakeTurn())
         return;
-
-    lastSendTimePoint = now;
 
     auto localView = m_world.view<FormIdComponent, LocalComponent>();
 
@@ -481,14 +468,9 @@ void ActorValueService::RunDeathStateUpdates() noexcept
 
 void ActorValueService::RunActorValuesUpdates() noexcept
 {
-    static std::chrono::steady_clock::time_point lastSendTimePoint;
-    constexpr auto cDelayBetweenUpdates = 1000ms;
-
-    const auto now = std::chrono::steady_clock::now();
-    if (now - lastSendTimePoint < cDelayBetweenUpdates)
+    static Throttle s_sendThrottle(1000ms);
+    if (!s_sendThrottle.TakeTurn())
         return;
-
-    lastSendTimePoint = now;
 
     BroadcastActorValues();
 }
@@ -566,6 +548,20 @@ void ActorValueService::RunHeldHits() noexcept
 
 void ActorValueService::OnHealthChangeBroadcast(const NotifyHealthChangeBroadcast& acMessage) noexcept
 {
+    // Another player's hit on this player counts only between players who may fight.
+    if (acMessage.DeltaHealth < 0.f && acMessage.AttackerPlayerId && !PvpRules::IsAllowedWithPlayer(acMessage.AttackerPlayerId) &&
+        Utils::GetByServerId<Actor>(acMessage.Id) == PlayerCharacter::Get())
+    {
+        static std::chrono::steady_clock::time_point s_nextSaid{};
+        if (const auto cNow = std::chrono::steady_clock::now(); cNow >= s_nextSaid)
+        {
+            s_nextSaid = cNow + std::chrono::seconds(5);
+            spdlog::info("PvP: a hit of {:.0f} from player {} not taken: the two may not fight here (PvP off, or one plays flat Skyrim and the other VR)", -acMessage.DeltaHealth,
+                         acMessage.AttackerPlayerId);
+        }
+        return;
+    }
+
 #ifdef SKYRIMVR
     // Another player's hit on this player waits for the defender's rule (RunHeldHits).
     // A spell's hit has no tick and goes straight on: no weapon can block it, and it is not an arrow's.
@@ -686,7 +682,7 @@ void ActorValueService::ApplyHealthChange(const NotifyHealthChangeBroadcast& acM
         }
     }
 
-    StartCombatWithAttacker(pActor, acMessage.AttackerPlayerId, acMessage.DeltaHealth);
+    m_world.GetCombatService().FightBack(pActor, acMessage.AttackerPlayerId, acMessage.DeltaHealth);
 
     // TODO(cosideci): find fix for player health sync so this can be used again
     /*
@@ -695,59 +691,14 @@ void ActorValueService::ApplyHealthChange(const NotifyHealthChangeBroadcast& acM
     */
 }
 
-void ActorValueService::StartCombatWithAttacker(Actor* apActor, uint32_t aAttackerPlayerId, float aDeltaHealth) const noexcept
-{
-    // An NPC's combat runs on its owner, so a hit from another player must put that player into it.
-    // Otherwise an NPC hostile to one player ignores the other, however hard they hit it.
-    if (!apActor || !aAttackerPlayerId)
-        return;
-
-    // Damage only. The client adds the delta, so a hit is negative; a heal or a buff must never start a fight.
-    if (aDeltaHealth >= 0.f)
-        return;
-
-    // Only the owner runs this actor's AI, and only it can usefully start combat. Players are never made to fight.
-    ActorExtension* pExtension = apActor->GetExtension();
-    if (!pExtension || !pExtension->IsLocal() || pExtension->IsPlayer())
-        return;
-
-    if (apActor->IsDead() || apActor->actorState.IsBleedingOut())
-        return;
-
-    auto view = m_world.view<FormIdComponent, PlayerComponent>();
-    const auto it = std::find_if(view.begin(), view.end(), [view, aAttackerPlayerId](auto aEntity)
-                                 { return view.get<PlayerComponent>(aEntity).Id == aAttackerPlayerId; });
-    if (it == view.end())
-        return;
-
-    Actor* pAttacker = Cast<Actor>(TESForm::GetById(view.get<FormIdComponent>(*it).Id));
-    if (!pAttacker || pAttacker == apActor)
-        return;
-
-    // A flurry of arrows would otherwise restart combat every frame.
-    static TiltedPhoques::Map<uint32_t, std::chrono::steady_clock::time_point> s_startedAt;
-    const auto now = std::chrono::steady_clock::now();
-    for (auto entry = s_startedAt.begin(); entry != s_startedAt.end();)
-        entry = now - entry->second > std::chrono::seconds(30) ? s_startedAt.erase(entry) : std::next(entry);
-
-    auto& startedAt = s_startedAt[apActor->formID];
-    if (startedAt.time_since_epoch().count() && now - startedAt < std::chrono::seconds(3))
-        return;
-    startedAt = now;
-
-    apActor->StartCombatEx(pAttacker);
-    spdlog::info("Combat: actor {:X} now also fights player {} (copy {:X}), which hit it for {:.0f}", apActor->formID, aAttackerPlayerId, pAttacker->formID, -aDeltaHealth);
-}
-
 void ActorValueService::OnActorValueChanges(const NotifyActorValueChanges& acMessage) const noexcept
 {
     auto view = m_world.view<FormIdComponent, RemoteComponent>();
 
     // Separated from the epoch test so a stale epoch can be told apart from a character we simply do not have.
-    const auto itor = std::find_if(std::begin(view), std::end(view), [&acMessage, view](entt::entity entity)
-    { return view.get<RemoteComponent>(entity).Id == acMessage.Id; });
+    const auto itor = Utils::FindById<RemoteComponent>(view, acMessage.Id);
 
-    if (itor != std::end(view))
+    if (itor)
     {
         const auto& remoteFound = view.get<RemoteComponent>(*itor);
         if (acMessage.OwnershipEpoch == 0 || remoteFound.OwnershipEpoch != acMessage.OwnershipEpoch)
@@ -757,7 +708,7 @@ void ActorValueService::OnActorValueChanges(const NotifyActorValueChanges& acMes
         }
     }
 
-    if (itor == std::end(view))
+    if (!itor)
         return;
 
     auto& formIdComponent = view.get<FormIdComponent>(*itor);
@@ -850,10 +801,9 @@ void ActorValueService::OnActorMaxValueChanges(const NotifyActorMaxValueChanges&
     auto view = m_world.view<FormIdComponent, RemoteComponent>();
 
     // Separated from the epoch test so a stale epoch can be told apart from a character we simply do not have.
-    const auto it = std::find_if(std::begin(view), std::end(view), [&acMessage, view](entt::entity entity)
-    { return view.get<RemoteComponent>(entity).Id == acMessage.Id; });
+    const auto it = Utils::FindById<RemoteComponent>(view, acMessage.Id);
 
-    if (it != std::end(view))
+    if (it)
     {
         const auto& remoteFound = view.get<RemoteComponent>(*it);
         if (acMessage.OwnershipEpoch == 0 || remoteFound.OwnershipEpoch != acMessage.OwnershipEpoch)
@@ -863,7 +813,7 @@ void ActorValueService::OnActorMaxValueChanges(const NotifyActorMaxValueChanges&
         }
     }
 
-    if (it == std::end(view))
+    if (!it)
         return;
 
     auto& formIdComponent = view.get<FormIdComponent>(*it);
@@ -889,10 +839,9 @@ void ActorValueService::OnDeathStateChange(const NotifyDeathStateChange& acMessa
     auto view = m_world.view<RemoteComponent>();
 
     // Separated from the epoch test so a stale epoch can be told apart from a character we simply do not have.
-    const auto it = std::find_if(std::begin(view), std::end(view), [&acMessage, view](entt::entity entity)
-    { return view.get<RemoteComponent>(entity).Id == acMessage.Id; });
+    const auto it = Utils::FindById<RemoteComponent>(view, acMessage.Id);
 
-    if (it != std::end(view))
+    if (it)
     {
         const auto& remoteFound = view.get<RemoteComponent>(*it);
         if (acMessage.OwnershipEpoch == 0 || remoteFound.OwnershipEpoch != acMessage.OwnershipEpoch)
@@ -914,7 +863,7 @@ void ActorValueService::OnDeathStateChange(const NotifyDeathStateChange& acMessa
         spdlog::info("Death sync: {} for server id {:X} arrived and was not applied: {}", acMessage.IsDead ? "a death" : "a revival", acMessage.Id, acpWhy);
     };
 
-    if (it == std::end(view))
+    if (!it)
     {
         say("no copy of that character here");
         return;

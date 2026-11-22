@@ -346,6 +346,7 @@ TEST_CASE("Packets", "[encoding.packets]")
         sendMessage.Version = "v1.8.1-104-g9da1af5c-dirty.f8f11b7";
         sendMessage.Protocol = "0a1b2c3d";
         sendMessage.HideFromPublicPage = true;
+        sendMessage.IsFlat = true;
         sendMessage.UserMods.ModList.push_back({"Hello", 42});
         sendMessage.UserMods.ModList.push_back({"Hi", 14});
         sendMessage.UserMods.ModList.push_back({"Test", 8});
@@ -594,6 +595,120 @@ TEST_CASE("Packets", "[encoding.packets]")
         }
     }
 
+    SECTION("RequestNpcPlugins and NotifyNpcPluginsDiffer")
+    {
+        {
+            RequestNpcPlugins sendMessage;
+            sendMessage.Plugins = {"Skyrim.esm", "Some Creatures.esp"};
+
+            uint8_t storage[1 << 12];
+            Buffer buffer(storage, sizeof(storage));
+            Buffer::Writer writer(&buffer);
+            sendMessage.Serialize(writer);
+
+            Buffer::Reader reader(&buffer);
+            const ClientMessageFactory factory;
+            auto pMessage = factory.Extract(reader);
+
+            REQUIRE(pMessage);
+            REQUIRE(*CastUnique<RequestNpcPlugins>(std::move(pMessage)) == sendMessage);
+        }
+        {
+            NotifyNpcPluginsDiffer sendMessage;
+            sendMessage.Username = "player 2";
+            sendMessage.OnlyHere = {"Some Creatures.esp"};
+            sendMessage.OnlyThere = {"Other Bandits.esp", "More Wolves.esl"};
+
+            uint8_t storage[1 << 12];
+            Buffer buffer(storage, sizeof(storage));
+            Buffer::Writer writer(&buffer);
+            sendMessage.Serialize(writer);
+
+            Buffer::Reader reader(&buffer);
+            const ServerMessageFactory factory;
+            auto pMessage = factory.Extract(reader);
+
+            REQUIRE(pMessage);
+            REQUIRE(*CastUnique<NotifyNpcPluginsDiffer>(std::move(pMessage)) == sendMessage);
+        }
+    }
+
+    SECTION("NotifyPlayerList with its flat players")
+    {
+        NotifyPlayerList sendMessage;
+        sendMessage.Players[1] = "player 1";
+        sendMessage.Players[2] = "player 2";
+        sendMessage.Players[7] = "player 3";
+        sendMessage.FlatPlayers = {2, 7};
+
+        uint8_t storage[1 << 12];
+        Buffer buffer(storage, sizeof(storage));
+        Buffer::Writer writer(&buffer);
+        sendMessage.Serialize(writer);
+
+        Buffer::Reader reader(&buffer);
+        const ServerMessageFactory factory;
+        auto pMessage = factory.Extract(reader);
+
+        REQUIRE(pMessage);
+        REQUIRE(*CastUnique<NotifyPlayerList>(std::move(pMessage)) == sendMessage);
+    }
+
+    SECTION("RequestRespawn with a look and a name, and NotifyPlayerName")
+    {
+        const auto roundTrip = [](const RequestRespawn& acSent)
+        {
+            uint8_t storage[1 << 12];
+            Buffer buffer(storage, sizeof(storage));
+            Buffer::Writer writer(&buffer);
+            acSent.Serialize(writer);
+
+            Buffer::Reader reader(&buffer);
+            const ClientMessageFactory factory;
+            auto pMessage = factory.Extract(reader);
+
+            REQUIRE(pMessage);
+            REQUIRE(*CastUnique<RequestRespawn>(std::move(pMessage)) == acSent);
+        };
+        {
+            RequestRespawn sendMessage;
+            sendMessage.ActorId = 0x200046;
+            sendMessage.AppearanceBuffer = String("\x01\x02\x00\x03", 4);
+            sendMessage.ChangeFlags = 0x3000A68;
+            Tints::Entry tint{};
+            tint.Name = R"(Actors\Character\Character Assets\TintMasks\SkinTone.dds)";
+            tint.Alpha = 0.5f;
+            tint.Color = 0xFF8040;
+            tint.Type = 6;
+            sendMessage.FaceTints.Entries = {tint, tint};
+            sendMessage.Username = "Witch Queen";
+            roundTrip(sendMessage);
+        }
+        {
+            // The bare request a game sends back after NotifyRespawn.
+            RequestRespawn sendMessage;
+            sendMessage.ActorId = 0x200046;
+            roundTrip(sendMessage);
+        }
+        {
+            NotifyPlayerName sendMessage;
+            sendMessage.PlayerId = 3;
+            sendMessage.Username = "Witch Queen";
+
+            uint8_t storage[1 << 12];
+            Buffer buffer(storage, sizeof(storage));
+            Buffer::Writer writer(&buffer);
+            sendMessage.Serialize(writer);
+
+            Buffer::Reader reader(&buffer);
+            const ServerMessageFactory factory;
+            auto pMessage = factory.Extract(reader);
+
+            REQUIRE(pMessage);
+            REQUIRE(*CastUnique<NotifyPlayerName>(std::move(pMessage)) == sendMessage);
+        }
+    }
+
     SECTION("RequestPartyValue and NotifyPartyValue")
     {
         {
@@ -635,7 +750,7 @@ TEST_CASE("Packets", "[encoding.packets]")
     SECTION("RequestActorPresence")
     {
         RequestActorPresence sendMessage;
-        sendMessage.Actors = {{0x900121, ActorPresenceKind::Own, false}, {0x1038B1, ActorPresenceKind::Copy, true}, {0x300090, ActorPresenceKind::StandIn, false}};
+        sendMessage.Actors = {{0x900121, ActorPresenceKind::Own, false, 0x100004}, {0x1038B1, ActorPresenceKind::Copy, true}, {0x300090, ActorPresenceKind::StandIn, false}};
 
         uint8_t storage[1 << 12];
         Buffer buffer(storage, sizeof(storage));
@@ -651,6 +766,31 @@ TEST_CASE("Packets", "[encoding.packets]")
         REQUIRE(*pRecv == sendMessage);
         REQUIRE(pRecv->Actors[2].Kind == ActorPresenceKind::StandIn);
         REQUIRE(pRecv->Actors[1].Dead);
+        REQUIRE(pRecv->Actors[0].CombatTarget == 0x100004);
+    }
+
+    SECTION("NotifyOwnershipTransfer")
+    {
+        NotifyOwnershipTransfer sendMessage;
+        sendMessage.ServerId = 0x200038;
+        sendMessage.OwnerPlayerId = 3;
+        sendMessage.OwnershipEpoch = 7;
+        sendMessage.CurrentActorData.IsWeaponDrawn = true;
+        sendMessage.CombatTarget = 0x100004;
+
+        uint8_t storage[1 << 12];
+        Buffer buffer(storage, sizeof(storage));
+        Buffer::Writer writer(&buffer);
+        sendMessage.Serialize(writer);
+
+        Buffer::Reader reader(&buffer);
+        const ServerMessageFactory factory;
+        auto pMessage = factory.Extract(reader);
+
+        REQUIRE(pMessage);
+        const auto pRecv = CastUnique<NotifyOwnershipTransfer>(std::move(pMessage));
+        REQUIRE(*pRecv == sendMessage);
+        REQUIRE(pRecv->CombatTarget == 0x100004);
     }
 
     SECTION("RequestReferenceEnable and NotifyReferenceEnable")

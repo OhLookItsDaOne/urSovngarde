@@ -9,6 +9,7 @@ import {
   faList,
   faPowerOff,
   faRotateRight,
+  faUserPlus,
   faUsers,
 } from '@fortawesome/free-solid-svg-icons';
 import { TranslocoService } from '@ngneat/transloco';
@@ -36,6 +37,7 @@ import { controlsAnimation } from './controls.animation';
 import { notificationsAnimation } from './notifications.animation';
 import { map } from 'rxjs/operators';
 import { VoiceService } from '../../services/voice.service';
+import { JoinService } from '../../services/join.service';
 
 const REVEAL_EFFECT_DURATION_MS = 10000 // todo: pass value from C++?
 
@@ -57,6 +59,7 @@ export class RootComponent implements OnInit {
   readonly PlayerManagerTab = PlayerManagerTab;
 
   readonly icons = {
+    join: faUserPlus,
     rejoin: faRotateRight,
     connect: faArrowRightToBracket,
     servers: faList,
@@ -74,9 +77,15 @@ export class RootComponent implements OnInit {
   menuOpen$ = this.client.openingMenuChange.asObservable();
   inGame$ = this.client.inGameStateChange.asObservable();
   active$ = this.client.activationStateChange.asObservable();
+  // Where the open menu is shown, for styles that differ per surface; null while closed.
+  openSurface$ = combineLatest([this.active$, this.client.surfaceChange]).pipe(
+    map(([active, surface]) => (active && surface ? surface : null)),
+  );
   connectionInProgress$ = this.client.isConnectionInProgressChange.asObservable();
   version$ = this.client.versionSet.asObservable();
   hasError$ = this.errorService.error$.pipe(map(error => !!error));
+  // While this player hosts from the launcher, the code friends need.
+  hostingCode$ = this.joinService.state.pipe(map(state => state?.hosting?.code ?? ''));
   revealing = false;
 
   playerCount$ = this.playerListService.playerList.pipe(
@@ -134,6 +143,7 @@ export class RootComponent implements OnInit {
     private readonly storeService: StoreService,
     public readonly overlay: Overlay, // used for mockup
     private readonly voiceService: VoiceService, // sends the voice settings to the game from the start
+    private readonly joinService: JoinService,
   ) {
     this.translocoService.setActiveLang(
       this.settingService.settings.language.getValue(),

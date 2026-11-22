@@ -18,6 +18,7 @@
 
 #include <Components.h>
 #include <World.h>
+#include <Copies/Takeover.h>
 
 #include <Forms/TESObjectCELL.h>
 #include <Forms/TESWorldSpace.h>
@@ -25,7 +26,7 @@
 
 #ifdef SKYRIMVR
 #include <PlayerCharacter.h>
-#include <Games/Skyrim/VRBodySync.h>
+#include <Games/Skyrim/VR/VRBodySync.h>
 #include <Interface/UI.h>
 #include <BSAnimationGraphManager.h>
 #include <Structs/AnimationGraphDescriptorManager.h>
@@ -141,9 +142,13 @@ void AnimationSystem::Update(World& aWorld, Actor* apActor, RemoteAnimationCompo
             // The copy's own state before the owner's was written over it: what the game judged the action on.
             spdlog::info("ReplayDiag: 'bleedOutStop' refused as an action on {:X}; sent to its graph instead ({}); before it the copy had life state {}, knock state {}, "
                          "health {:.0f}; the owner's life state {}",
-                         apActor->formID, cpOutcome, (cOwnStateBefore >> 21) & 0xF, (cOwnStateBefore >> 25) & 0x7,
-                         apActor->GetActorValue(ActorValueInfo::kHealth), (first.State1 >> 21) & 0xF);
+                         apActor->formID, cpOutcome, ActorState::LifeStateOf(cOwnStateBefore), (cOwnStateBefore >> 25) & 0x7,
+                         apActor->GetActorValue(ActorValueInfo::kHealth), ActorState::LifeStateOf(first.State1));
         }
+
+        // TEMPORARY: kept to show what state an NPC copy's graph was left in.
+        if (!cPlayerCopy)
+            Takeover::NoteReplay(apActor->formID, first.EventName.c_str(), result != 0);
 
         // TEMPORARY diagnostic for remote NPCs sliding while the game refuses most of their moveStart and turnStop replays.
         // For one refused replay per 10 s, it logs everything the refusal could depend on. Remove once understood.
@@ -305,10 +310,9 @@ void NoteBodyJump(const Actor* apActor, const glm::vec3& acSent, const bool aFro
     if (cJump > 300.f)
     {
         const auto* pPlayer = PlayerCharacter::Get();
-        spdlog::info("CorpseDiag: own body {:X} sent {:.0f} units from its last report, from ({:.0f}, {:.0f}, {:.0f}) to ({:.0f}, {:.0f}, {:.0f}), read from its {}; "
-                     "reference at ({:.0f}, {:.0f}, {:.0f}) in cell {:X}, attached {}, player at ({:.0f}, {:.0f}, {:.0f})",
-                     apActor->formID, cJump, it->second.x, it->second.y, it->second.z, acSent.x, acSent.y, acSent.z, aFromRoot ? "3D root" : "reference", apActor->position.x,
-                     apActor->position.y, apActor->position.z, apActor->parentCell ? apActor->parentCell->formID : 0, apActor->parentCell && apActor->parentCell->IsAttached(),
+        spdlog::info("CorpseDiag: own body {:X} sent {:.0f} units from its last report, from ({:.0f}) to ({:.0f}), read from its {}; "
+                     "reference at ({:.0f}) in cell {:X}, attached {}, player at ({:.0f}, {:.0f}, {:.0f})",
+                     apActor->formID, cJump, it->second, acSent, aFromRoot ? "3D root" : "reference", apActor->position, apActor->parentCell ? apActor->parentCell->formID : 0, apActor->parentCell && apActor->parentCell->IsAttached(),
                      pPlayer ? pPlayer->position.x : 0.f, pPlayer ? pPlayer->position.y : 0.f, pPlayer ? pPlayer->position.z : 0.f);
     }
     it->second = acSent;

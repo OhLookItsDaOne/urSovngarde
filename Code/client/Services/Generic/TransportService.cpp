@@ -1,7 +1,8 @@
 
 #include <Services/TransportService.h>
+#include <BuildVersion.h>
 #include <steam/isteamnetworkingutils.h>
-#include <PerfScope.h>
+#include <Helpers/PerfScope.h>
 
 #include <Events/ConnectedEvent.h>
 #include <Events/ConnectionErrorEvent.h>
@@ -156,16 +157,19 @@ void TransportService::OnConsume(const void* apData, uint32_t aSize)
     m_messageHandlers[pMessage->GetOpcode()](pMessage);
 }
 
+/**
+ * Send the authentication request once the connection to the server is up: version, protocol, player, mods, place, time and the server password.
+ * The password's text goes out once and is forgotten then; whether there was one stays known for this connection.
+ */
 void TransportService::OnConnected()
 {
     AuthenticationRequest request{};
-    request.Version = BUILD_COMMIT;
+    request.Version = BuildVersion::Commit();
     request.Protocol = BUILD_PROTOCOL;
     request.SKSEActive = IsScriptExtenderLoaded();
     request.MO2Active = GetModuleHandleW(kMO2DllName);
 
-    request.Token = m_serverPassword;
-    m_serverPassword = "";
+    request.Token = m_serverPassword.TakeText();
 
     PlayerCharacter* pPlayer = PlayerCharacter::Get();
 
@@ -205,6 +209,12 @@ void TransportService::OnConnected()
 
     request.Level = pPlayer->GetLevel();
 
+#ifdef SKYRIMVR
+    request.IsFlat = false;
+#else
+    request.IsFlat = true;
+#endif
+
     request.HideFromPublicPage = IsHiddenFromPublicPage();
     if (request.HideFromPublicPage)
         spdlog::info("Hidden from the public server page (launcher setting)");
@@ -225,6 +235,7 @@ bool TransportService::Connect(const std::string& acEndpoint) noexcept
     // The networking library keeps the old one alive, so the server sees a player who is there but never sends anything.
     // Close() does nothing when there is no connection.
     Close();
+    m_serverEndpoint = acEndpoint;
     return Client::Connect(acEndpoint);
 }
 
@@ -304,7 +315,7 @@ void TransportService::HandleAuthenticationResponse(const AuthenticationResponse
     {
     case AR::kWrongVersion:
         ErrorInfo += "\"error\": \"wrong_version\", \"data\": {";
-        ErrorInfo += fmt::format("\"expectedVersion\": \"{}\", \"version\": \"{}\"", acMessage.Version, BUILD_COMMIT " (protocol " BUILD_PROTOCOL ")");
+        ErrorInfo += fmt::format("\"expectedVersion\": \"{}\", \"version\": \"{}\"", acMessage.Version, fmt::format("{} (protocol " BUILD_PROTOCOL ")", BuildVersion::Commit()));
         ErrorInfo += "}";
         break;
     case AR::kModsMismatch:

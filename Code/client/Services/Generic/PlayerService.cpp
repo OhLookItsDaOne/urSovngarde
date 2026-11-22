@@ -1,5 +1,7 @@
 #include <Services/PlayerService.h>
-#include <PerfScope.h>
+#include <Helpers/Throttle.h>
+#include <Structs/PluginList.h>
+#include <Helpers/PerfScope.h>
 
 #include <World.h>
 
@@ -25,6 +27,12 @@
 #include <Messages/PlayerDialogueRequest.h>
 #include <Messages/PlayerLevelRequest.h>
 #include <Messages/PlayerPlaceRequest.h>
+#include <Messages/RequestNpcPlugins.h>
+#include <Messages/NotifyNpcPluginsDiffer.h>
+#include <Copies/NpcPlugins.h>
+#include <Services/OverlayService.h>
+#include <Services/CellLookup.h>
+#include <Interface/Menus/SleepWaitOk.h>
 
 #include <Structs/ServerSettings.h>
 
@@ -40,14 +48,31 @@
 #include <Forms/TESRace.h>
 #include <Interface/UI.h>
 #include <Services/PartyService.h>
-#include <Games/Skyrim/VRHaptics.h>
-#include <Games/Skyrim/VRBanner.h>
-#include <Games/Skyrim/DeathCause.h>
-#include <Games/Skyrim/DeathSentence.h>
+#include <Games/Skyrim/VR/VRHaptics.h>
+#include <UI/Banner/VRBanner.h>
+#include <UI/Banner/DeathCause.h>
+#include <UI/Banner/DeathSentence.h>
 #include <Components.h>
+#include <Forms/TESQuest.h>
+#include <Services/Generic/DownedHold.h>
 
 namespace
 {
+// The game's brawl (a fist fight for a favor, a bet or a job): losing one puts the player in bleedout, and the game stands them up again.
+// Skyrim.esm DGIntimidateQuest; it still runs when that bleedout ends, and stops a moment later.
+constexpr uint32_t cBrawlQuest = 0x47AE6;
+
+/**
+ * Tell whether the game's brawl quest runs: a fist fight, not combat in general.
+ *
+ * @return True while the brawl's quest runs.
+ */
+bool IsBrawlRunning() noexcept
+{
+    const auto* pQuest = Cast<TESQuest>(TESForm::GetById(cBrawlQuest));
+    return pQuest && pQuest->IsEnabled();
+}
+
 // A third of the health back: enough to get away, not enough to fight on as if nothing happened.
 constexpr float cRevivedHealthShare = 0.3f;
 
@@ -63,6 +88,18 @@ constexpr uint32_t cUnarmed = 0x1F4;
 constexpr float cFallDrop = 500.f;
 constexpr auto cFallWindow = 1200ms;
 constexpr auto cKillingBlow = 500ms;
+
+// Down in a brawl: the brawl runs and the last blow was a fist. A brawl quest left running by the game does not make a later armed down a brawl.
+bool IsBrawlDown(const std::chrono::steady_clock::time_point acNow) noexcept
+{
+    if (!IsBrawlRunning())
+        return false;
+    const auto cHit = DeathCause::LastBetween(acNow - 2s, acNow);
+    return cHit && cHit->SourceFormId == cUnarmed;
+}
+
+// Set while the player lies in a brawl's bleedout, which the game ends itself.
+bool s_brawlDown = false;
 // The blow that downed the player is the last one this long before it went down.
 constexpr auto cBlowsCounted = 10s;
 // The heartbeat felt in both hands: two beats, then a pause, about 55 a minute.
@@ -93,21 +130,6 @@ const char* PlaceNameOf(const PlayerCharacter* apPlayer) noexcept
     return pPlace;
 }
 
-// The cell of a safe point: the interior itself, or the exterior cell at its position in its worldspace, which may need loading.
-TESObjectCELL* FindSafePointCell(World& aWorld, const GameId& acCellId, const GameId& acWorldSpaceId, const glm::vec3& acPosition) noexcept
-{
-    auto& modSystem = aWorld.GetModSystem();
-    if (TESObjectCELL* pCell = Cast<TESObjectCELL>(TESForm::GetById(modSystem.GetGameId(acCellId))))
-        return pCell;
-    if (!acWorldSpaceId)
-        return nullptr;
-    TESWorldSpace* pWorldSpace = Cast<TESWorldSpace>(TESForm::GetById(modSystem.GetGameId(acWorldSpaceId)));
-    if (!pWorldSpace)
-        return nullptr;
-    const GridCellCoords cCoordinates = GridCellCoords::CalculateGridCellCoords(acPosition.x, acPosition.y);
-    return pWorldSpace->LoadCell(cCoordinates.X, cCoordinates.Y);
-}
-
 // The name a reviver goes by in the party, as the banner shows it.
 String ReviverName(const PartyService& acParty, const uint32_t aReviverId) noexcept
 {
@@ -133,6 +155,7 @@ PlayerService::PlayerService(World& aWorld, entt::dispatcher& aDispatcher, Trans
     m_settingsConnection = m_dispatcher.sink<ServerSettings>().connect<&PlayerService::OnServerSettingsReceived>(this);
     m_notifyRespawnConnection = m_dispatcher.sink<NotifyPlayerRespawn>().connect<&PlayerService::OnNotifyPlayerRespawn>(this);
     m_downedStateConnection = m_dispatcher.sink<NotifyDownedState>().connect<&PlayerService::OnNotifyDownedState>(this);
+    m_npcPluginsConnection = m_dispatcher.sink<NotifyNpcPluginsDiffer>().connect<&PlayerService::OnNotifyNpcPluginsDiffer>(this);
     EventDispatcherManager::Get()->loadGameEvent.RegisterSink(this);
     m_gridCellChangeConnection = m_dispatcher.sink<GridCellChangeEvent>().connect<&PlayerService::OnGridCellChangeEvent>(this);
     m_cellChangeConnection = m_dispatcher.sink<CellChangeEvent>().connect<&PlayerService::OnCellChangeEvent>(this);
@@ -158,9 +181,47 @@ void PlayerService::OnUpdate(const UpdateEvent&) noexcept
     RunBeastFormDetection();
     RunPlaceUpdates();
     RunCrashPlaceNote();
+    RunNpcPluginReport();
 #ifdef SKYRIMVR
     RunMapCloseUpdates();
 #endif
+}
+
+// Once a connection is accepted: the server compares the list with every other player's and warns both of a difference.
+// Sent only then, as the server kicks a connection that sends anything before.
+void PlayerService::RunNpcPluginReport() noexcept
+{
+    if (m_npcPluginsSent || !m_transport.IsOnline())
+        return;
+    m_npcPluginsSent = true;
+
+    const Vector<String>& acPlugins = NpcPlugins::Get();
+    if (acPlugins.empty())
+        return;
+
+    RequestNpcPlugins request{};
+    request.Plugins = acPlugins;
+    m_transport.Send(request);
+}
+
+void PlayerService::OnNotifyNpcPluginsDiffer(const NotifyNpcPluginsDiffer& acMessage) const noexcept
+{
+    const auto names = [](const Vector<String>& acList)
+    {
+        constexpr size_t cShown = 6;
+        return std::string(PluginList::Joined(acList, cShown).c_str());
+    };
+
+    const std::string cWho = acMessage.Username.c_str();
+    std::string message = "You and " + cWho + " don't have the same NPC mods, so you may see different people and creatures.";
+    if (!acMessage.OnlyThere.empty())
+        message += " Only " + cWho + " has: " + names(acMessage.OnlyThere) + ".";
+    if (!acMessage.OnlyHere.empty())
+        message += " Only you have: " + names(acMessage.OnlyHere) + ".";
+
+    spdlog::warn("NpcPlugins: {} has other NPC plugins: {} only there, {} only here. {}", cWho, acMessage.OnlyThere.size(), acMessage.OnlyHere.size(), message);
+    m_world.GetOverlayService().SendSystemMessage(message);
+    VRBanner::Show("Not the same NPC mods as " + cWho, cPlaceColour, 60, 8.f);
 }
 
 #ifdef SKYRIMVR
@@ -185,6 +246,8 @@ void PlayerService::RunMapCloseUpdates() noexcept
 
 void PlayerService::OnConnected(const ConnectedEvent& acEvent) noexcept
 {
+    m_npcPluginsSent = false;
+
     // Every connection starts with the place unknown to the server: send it at the next check.
     m_lastPlace.clear();
     m_nextPlaceCheck = {};
@@ -301,10 +364,10 @@ void PlayerService::OnNotifyDownedState(const NotifyDownedState& acMessage) noex
         spdlog::info("PlayerService: the server gives {} s to be revived", acMessage.SecondsLeft);
 #ifdef SKYRIMVR
         if (acMessage.SecondsLeft > 0)
-            Utils::ShowHudMessage(String(fmt::format("urSovngarde: you are down; your party has {} seconds to revive you, or hold both grips to give up", acMessage.SecondsLeft)));
+            Utils::ShowModHudMessage(String(fmt::format("you are down; your party has {} seconds to revive you, or hold both grips to give up", acMessage.SecondsLeft)));
 #else
         if (acMessage.SecondsLeft > 0)
-            Utils::ShowHudMessage(String(fmt::format("urSovngarde: you are down; your party has {} seconds to revive you", acMessage.SecondsLeft)));
+            Utils::ShowModHudMessage(String(fmt::format("you are down; your party has {} seconds to revive you", acMessage.SecondsLeft)));
 #endif
         break;
     case NotifyDownedState::kRevived:
@@ -319,14 +382,14 @@ void PlayerService::OnNotifyDownedState(const NotifyDownedState& acMessage) noex
         if (m_downState != DownState::kDown)
             return;
         spdlog::info("PlayerService: {}; respawning {}", cAlone ? "down alone" : "not revived in time", cpLogWhere);
-        Utils::ShowHudMessage(String(fmt::format("urSovngarde: {}; {}", cAlone ? "you died" : "nobody revived you in time", cpComeBack)));
+        Utils::ShowModHudMessage(String(fmt::format("{}; {}", cAlone ? "you died" : "nobody revived you in time", cpComeBack)));
         StartRespawn(where);
         break;
     case NotifyDownedState::kPartyFallen:
         if (m_downState != DownState::kDown)
             return;
         // A party that lost its standing members leaves this player alone: nobody is left, rather than a party fallen.
-        Utils::ShowHudMessage(String(fmt::format("urSovngarde: {}; {}", cAlone ? "nobody is left to revive you" : "your party has fallen", cpComeBack)));
+        Utils::ShowModHudMessage(String(fmt::format("{}; {}", cAlone ? "nobody is left to revive you" : "your party has fallen", cpComeBack)));
         spdlog::info("PlayerService: {}; respawning {}", cAlone ? "nobody is left to revive the player" : "the whole party is down", cpLogWhere);
         StartRespawn(where);
         break;
@@ -347,7 +410,7 @@ void PlayerService::OnNotifyDownedState(const NotifyDownedState& acMessage) noex
         const String cWho = ReviverName(cParty, acMessage.ReviverId);
         spdlog::info("PlayerService: player {} '{}' is reviving this player", acMessage.ReviverId, cWho.c_str());
         VRBanner::Show(std::string(cWho.c_str()) + " is reviving you", cPlaceColour, 72, 8.f);
-        Utils::ShowHudMessage(String("urSovngarde: ") + cWho + " is reviving you");
+        Utils::ShowModHudMessage(cWho + " is reviving you");
         break;
     }
     case NotifyDownedState::kReviveLetGo:
@@ -465,10 +528,15 @@ void PlayerService::OnPartyLeftEvent(const PartyLeftEvent& acEvent) noexcept
 void PlayerService::RunRespawnUpdates() noexcept
 {
     if (!m_isDeathSystemEnabled)
+    {
+        DownedHold::Set(false);
         return;
+    }
 
     PlayerCharacter* pPlayer = PlayerCharacter::Get();
     const auto cNow = std::chrono::steady_clock::now();
+    const bool cDownHeld = IsDownHeld();
+    DownedHold::Set(cDownHeld);
 
     if (m_downState == DownState::kUp)
     {
@@ -478,11 +546,31 @@ void PlayerService::RunRespawnUpdates() noexcept
 
         if (!pPlayer->actorState.IsBleedingOut())
         {
+            // The brawl's script cleared the setting that keeps the player down for a revive; put back, a later down waits for one again.
+            if (s_brawlDown)
+            {
+                s_brawlDown = false;
+                pPlayer->SetNoBleedoutRecovery(true);
+                spdlog::info("PlayerService: up again after the brawl");
+            }
             SampleHeight(cNow);
             m_cachedMainSpellId = pPlayer->magicItems[0] ? pPlayer->magicItems[0]->formID : 0;
             m_cachedSecondarySpellId = pPlayer->magicItems[1] ? pPlayer->magicItems[1]->formID : 0;
             m_cachedPowerId = pPlayer->equippedShout ? pPlayer->equippedShout->formID : 0;
             return;
+        }
+
+        // A brawl never kills: the game stands the player up when it is lost, so the down below is not started.
+        // With nobody near, the server would declare the death at once, before the game stands the player up.
+        // If the brawl quest stops while the player still lies there, the down below starts then.
+        if (s_brawlDown || IsBrawlDown(cNow))
+        {
+            if (!s_brawlDown)
+                spdlog::info("PlayerService: down in a brawl (DGIntimidateQuest, a fist); left to the game, which stands the player up");
+            s_brawlDown = IsBrawlRunning();
+            if (s_brawlDown)
+                return;
+            spdlog::info("PlayerService: the brawl ended with the player still down; the down starts");
         }
 
         // If a player dies not by its health reaching 0, getting it up from its bleedout state isn't possible
@@ -497,10 +585,14 @@ void PlayerService::RunRespawnUpdates() noexcept
         m_revivers.clear();
         m_downingCause.reset();
         m_downedAt = cNow;
+        m_healthTakenBackThisDown = false;
         m_respawnDeadline = cNow + 5s;
         m_standingUp = false;
         m_saveLoaded = false;
         m_giveUpSince = {};
+        // The hold starts in the same frame as the down.
+        // The game's next update already stands the player up if its health climbs back above zero.
+        DownedHold::Set(IsDownHeld());
         m_transport.Send(PlayerDownedRequest());
         float highest = pPlayer->position.z;
         for (const auto& [cAt, cHeight] : m_heights)
@@ -520,13 +612,20 @@ void PlayerService::RunRespawnUpdates() noexcept
         if (!m_downingCause && cNow >= m_downedAt + cKillingBlow)
             m_downingCause = DowningCause();
 
+        if (cDownHeld)
+            KeepDownedHealthAtZero(pPlayer);
         if (!pPlayer->actorState.IsBleedingOut())
         {
-            // After a loaded save the player is up in it: no respawn, as when playing alone.
-            if (m_saveLoaded)
+            // After a loaded save the player is up in it, and a lost brawl stands the player up: no respawn, as when playing alone.
+            const bool cBrawl = IsBrawlRunning();
+            if (m_saveLoaded || cBrawl)
             {
-                spdlog::info("PlayerService: a save was loaded while down; up again without a respawn");
+                spdlog::info("PlayerService: {} {} ms after going down; up again without a respawn", m_saveLoaded ? "a save was loaded while down" : "the brawl stood the player up",
+                             std::chrono::duration_cast<std::chrono::milliseconds>(cNow - m_downedAt).count());
                 StopHeartbeat();
+                VRBanner::Hide();
+                if (cBrawl)
+                    pPlayer->SetNoBleedoutRecovery(true);
                 m_downState = DownState::kUp;
                 PlayerDownedRequest up{};
                 up.IsDown = false;
@@ -535,8 +634,10 @@ void PlayerService::RunRespawnUpdates() noexcept
             }
 
             // A bleedout that ends by itself cannot be revived any more; the player respawns as it always did.
-            spdlog::info("PlayerService: the bleedout ended by itself {} ms after going down; respawning",
-                         std::chrono::duration_cast<std::chrono::milliseconds>(cNow - m_downedAt).count());
+            // The life state says how it ended: 0 stood up, 1 or 2 killed.
+            spdlog::info("PlayerService: the bleedout ended by itself {} ms after going down (life state {}, health {:.0f}); respawning",
+                         std::chrono::duration_cast<std::chrono::milliseconds>(cNow - m_downedAt).count(), pPlayer->actorState.LifeState(),
+                         pPlayer->GetActorValue(ActorValueInfo::kHealth));
             StartRespawn(m_ownSafePoint);
         }
         else if (HeldToGiveUp(cNow))
@@ -573,7 +674,7 @@ void PlayerService::RunRespawnUpdates() noexcept
         TESObjectCELL* pSafeCell = nullptr;
         if (m_respawnPoint.Known)
         {
-            pSafeCell = FindSafePointCell(m_world, m_respawnPoint.CellId, m_respawnPoint.WorldSpaceId, m_respawnPoint.Position);
+            pSafeCell = CellLookup::FindOrLoad(m_world, m_respawnPoint.CellId, m_respawnPoint.WorldSpaceId, m_respawnPoint.Position);
             if (!pSafeCell)
                 spdlog::warn("PlayerService: the safe point's cell is not in this game; respawning at the game's own spot");
         }
@@ -604,6 +705,8 @@ void PlayerService::RunRespawnUpdates() noexcept
 
 void PlayerService::StartRespawn(const SafePoint& acWhere) noexcept
 {
+    // The respawn stands the player up, which the down's hold would refuse.
+    DownedHold::Set(false);
     StopHeartbeat();
     m_giveUpSince = {};
     // Held through the fade and the respawn; the place's name replaces it as the screen comes back (RunPostDeathUpdates).
@@ -643,7 +746,7 @@ void PlayerService::RunSafePointUpdates() noexcept
     const uint32_t cLoadingScreens = UI::LoadingScreensQueued();
     const bool cLoading = cLoadingScreens != m_loadingScreens || pUI->GetMenuOpen(BSFixedString("Loading Menu"));
     m_loadingScreens = cLoadingScreens;
-    const bool cResting = pUI->GetMenuOpen(BSFixedString("Sleep/Wait Menu"));
+    const bool cResting = SleepWaitOk::FindOpenMenu() != nullptr;
     // The game autosaves as a loading screen or a sleep or wait ends; two seconds after the last sign of one, the player stands where it was placed.
     if (cLoading)
         m_safePointAt = cNow + 2s;
@@ -660,6 +763,8 @@ void PlayerService::RunSafePointUpdates() noexcept
 BSTEventResult PlayerService::OnEvent(const TESLoadGameEvent*, const EventDispatcher<TESLoadGameEvent>*)
 {
     m_saveLoaded = true;
+    // The player is in the save now, up or down as it has it.
+    DownedHold::Set(false);
     return BSTEventResult::kOk;
 }
 
@@ -693,12 +798,13 @@ void PlayerService::RecordSafePoint() noexcept
     m_ownSafePoint.WorldSpaceId = request.WorldSpaceId;
     m_ownSafePoint.Position = pPlayer->position;
     const char* cpEditorId = pCell->GetFormEditorID();
-    spdlog::info("PlayerService: safe point in cell {:X} '{}' at ({:.0f}, {:.0f}, {:.0f})", pCell->formID, cpEditorId ? cpEditorId : "", pPlayer->position.x, pPlayer->position.y,
-                 pPlayer->position.z);
+    spdlog::info("PlayerService: safe point in cell {:X} '{}' at ({:.0f})", pCell->formID, cpEditorId ? cpEditorId : "", pPlayer->position);
 }
 
 void PlayerService::StandUp(const uint32_t aReviverId) noexcept
 {
+    // The game stands the player up from here, which the down's hold would refuse.
+    DownedHold::Set(false);
     PlayerCharacter* pPlayer = PlayerCharacter::Get();
     const auto cNow = std::chrono::steady_clock::now();
 
@@ -729,8 +835,45 @@ void PlayerService::StandUp(const uint32_t aReviverId) noexcept
     const String who = name != players.end() ? name->second : String("A party member");
     spdlog::info("PlayerService: revived by player {} '{}' after {} ms down; health {:.0f}", aReviverId, who.c_str(),
                  std::chrono::duration_cast<std::chrono::milliseconds>(cNow - m_downedAt).count(), pPlayer->GetActorValue(ActorValueInfo::kHealth));
-    Utils::ShowHudMessage(String("urSovngarde: ") + who + " revived you");
+    Utils::ShowModHudMessage(who + " revived you");
     VRBanner::Hide();
+}
+
+/**
+ * Tell whether the player's down holds: it lasts until a revive, giving up, the end of the wait or a fallen party.
+ * It does not hold after a loaded save or during a brawl, where the game stands the player up on purpose.
+ *
+ * @return True while the down holds.
+ */
+bool PlayerService::IsDownHeld() const noexcept
+{
+    const bool cGameStandsPlayerUp = m_saveLoaded || IsBrawlRunning();
+    return m_downState == DownState::kDown && !cGameStandsPlayerUp;
+}
+
+/**
+ * Take back any health the player gets while down: a level-up, a potion or a healing spell.
+ * The game's stand-up that health asks for is refused while the down holds (DownedHold); taken back, the health no longer asks for it.
+ * Only a revive, giving up, the end of the wait or a fallen party may end a down; a revive leaves the down first (StandUp), so it is not taken back.
+ * Called only while the down holds (not after a loaded save or in a brawl, where the game stands the player up on purpose), and acts only while the game still has the player bleeding out.
+ * Logged once per down.
+ *
+ * @param apPlayer This game's player, down.
+ */
+void PlayerService::KeepDownedHealthAtZero(PlayerCharacter* apPlayer) noexcept
+{
+    if (!apPlayer->actorState.IsBleedingOut())
+        return;
+
+    const float cHealth = apPlayer->GetActorValue(ActorValueInfo::kHealth);
+    if (cHealth <= 0.f)
+        return;
+
+    apPlayer->ForceActorValue(ActorValueOwner::ForceMode::DAMAGE, ActorValueInfo::kHealth, 0.f);
+    if (m_healthTakenBackThisDown)
+        return;
+    m_healthTakenBackThisDown = true;
+    spdlog::info("PlayerService: health came back while down ({:.0f}, from a level-up, a potion or a spell); taken back, as only a revive gets the player up", cHealth);
 }
 
 void PlayerService::RunDownedCues() noexcept
@@ -943,14 +1086,9 @@ void PlayerService::RunLevelUpdates() const noexcept
 {
     // The LevelUp hook is kinda weird, so ehh, just check periodically, doesn't really cost anything.
 
-    static std::chrono::steady_clock::time_point lastSendTimePoint;
-    constexpr auto cDelayBetweenUpdates = 1000ms;
-
-    const auto now = std::chrono::steady_clock::now();
-    if (now - lastSendTimePoint < cDelayBetweenUpdates)
+    static Throttle s_sendThrottle(1000ms);
+    if (!s_sendThrottle.TakeTurn())
         return;
-
-    lastSendTimePoint = now;
 
     static uint16_t oldLevel = PlayerCharacter::Get()->GetLevel();
 
@@ -1042,14 +1180,9 @@ void PlayerService::RunCrashPlaceNote() noexcept
 void PlayerService::RunBeastFormDetection() const noexcept
 {
     static uint32_t lastRaceFormID = 0;
-    static std::chrono::steady_clock::time_point lastSendTimePoint;
-    constexpr auto cDelayBetweenUpdates = 250ms;
-
-    const auto now = std::chrono::steady_clock::now();
-    if (now - lastSendTimePoint < cDelayBetweenUpdates)
+    static Throttle s_sendThrottle(250ms);
+    if (!s_sendThrottle.TakeTurn())
         return;
-
-    lastSendTimePoint = now;
 
     PlayerCharacter* pPlayer = PlayerCharacter::Get();
     if (!pPlayer->race)
@@ -1067,6 +1200,8 @@ void PlayerService::RunBeastFormDetection() const noexcept
 void PlayerService::ToggleDeathSystem(bool aSet) noexcept
 {
     m_isDeathSystemEnabled = aSet;
+    if (!aSet)
+        DownedHold::Set(false);
 
     PlayerCharacter::Get()->SetPlayerRespawnMode(aSet);
 }

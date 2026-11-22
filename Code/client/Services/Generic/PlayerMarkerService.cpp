@@ -1,6 +1,6 @@
 #include <Services/PlayerMarkerService.h>
 
-#include <PerfScope.h>
+#include <Helpers/PerfScope.h>
 #include <World.h>
 #include <Components.h>
 
@@ -9,20 +9,19 @@
 #include <Events/UpdateEvent.h>
 
 #include <Messages/NotifyPlayerJoined.h>
+#include <Messages/NotifyPlayerName.h>
 #include <Messages/NotifyPlayerLeft.h>
 #include <Messages/NotifyPlayerWhereabouts.h>
 
 #include <Services/PapyrusService.h>
 #include <Services/TransportService.h>
-
-#include <Structs/GridCellCoords.h>
+#include <Services/CellLookup.h>
 
 #include <Actor.h>
 #include <PlayerCharacter.h>
 #include <ExtraData/ExtraData.h>
 #include <Forms/TESObjectCELL.h>
 #include <Forms/TESQuest.h>
-#include <Forms/TESWorldSpace.h>
 #include <Games/Overrides.h>
 #include <Games/TES.h>
 
@@ -74,22 +73,6 @@ Actor* FindPlayerActor(World& aWorld, uint32_t aPlayerId) noexcept
     return nullptr;
 }
 
-// The cell for a position: an interior by its id, outdoors the cell under it, loaded as "teleport to player" does.
-TESObjectCELL* ResolveCell(World& aWorld, const GameId& acWorldSpaceId, const GameId& acCellId, const glm::vec3& acPosition) noexcept
-{
-    auto& modSystem = aWorld.GetModSystem();
-    if (TESObjectCELL* pCell = Cast<TESObjectCELL>(TESForm::GetById(modSystem.GetGameId(acCellId))))
-        return pCell;
-
-    if (!acWorldSpaceId)
-        return nullptr;
-    TESWorldSpace* pWorldSpace = Cast<TESWorldSpace>(TESForm::GetById(modSystem.GetGameId(acWorldSpaceId)));
-    if (!pWorldSpace)
-        return nullptr;
-    const GridCellCoords cGrid = GridCellCoords::CalculateGridCellCoords(acPosition.x, acPosition.y);
-    return pWorldSpace->LoadCell(cGrid.X, cGrid.Y);
-}
-
 NiPoint3 ToNiPoint(const glm::vec3& acPosition) noexcept
 {
     NiPoint3 point;
@@ -112,6 +95,7 @@ PlayerMarkerService::PlayerMarkerService(World& aWorld, entt::dispatcher& aDispa
     m_connectedConnection = aDispatcher.sink<ConnectedEvent>().connect<&PlayerMarkerService::OnConnected>(this);
     m_disconnectedConnection = aDispatcher.sink<DisconnectedEvent>().connect<&PlayerMarkerService::OnDisconnected>(this);
     m_joinedConnection = aDispatcher.sink<NotifyPlayerJoined>().connect<&PlayerMarkerService::OnPlayerJoined>(this);
+    m_nameConnection = aDispatcher.sink<NotifyPlayerName>().connect<&PlayerMarkerService::OnPlayerName>(this);
     m_leftConnection = aDispatcher.sink<NotifyPlayerLeft>().connect<&PlayerMarkerService::OnPlayerLeft>(this);
     m_whereaboutsConnection = aDispatcher.sink<NotifyPlayerWhereabouts>().connect<&PlayerMarkerService::OnWhereabouts>(this);
     m_updateConnection = aDispatcher.sink<UpdateEvent>().connect<&PlayerMarkerService::OnUpdate>(this);
@@ -178,6 +162,11 @@ void PlayerMarkerService::OnDisconnected(const DisconnectedEvent&) noexcept
 }
 
 void PlayerMarkerService::OnPlayerJoined(const NotifyPlayerJoined& acMessage) noexcept
+{
+    m_names[acMessage.PlayerId] = acMessage.Username;
+}
+
+void PlayerMarkerService::OnPlayerName(const NotifyPlayerName& acMessage) noexcept
 {
     m_names[acMessage.PlayerId] = acMessage.Username;
 }
@@ -316,14 +305,13 @@ void PlayerMarkerService::FollowServerPosition(Slot& aSlot, size_t aIndex, const
     if (!aSlot.Parked && aSlot.BodyCellId == 0 && aSlot.CellId == acCellId && glm::distance(aSlot.Position, acPosition) < kFollowDistance)
         return;
 
-    TESObjectCELL* pCell = ResolveCell(m_world, acWorldSpaceId, acCellId, acPosition);
+    TESObjectCELL* pCell = CellLookup::FindOrLoad(m_world, acCellId, acWorldSpaceId, acPosition);
     if (!pCell)
         return;
 
     aSlot.pMarker->MoveTo(pCell, ToNiPoint(acPosition));
     if (aSlot.Parked)
-        spdlog::info("Player markers: {:X} follows player {} ({}) to ({:.0f}, {:.0f}, {:.0f}) in cell {:X}", aSlot.pMarker->formID, aSlot.PlayerId, aSlot.Text.c_str(), acPosition.x,
-                     acPosition.y, acPosition.z, pCell->formID);
+        spdlog::info("Player markers: {:X} follows player {} ({}) to ({:.0f}) in cell {:X}", aSlot.pMarker->formID, aSlot.PlayerId, aSlot.Text.c_str(), acPosition, pCell->formID);
     aSlot.Parked = false;
     aSlot.CellId = acCellId;
     aSlot.BodyCellId = 0;
@@ -342,8 +330,7 @@ void PlayerMarkerService::FollowBody(Slot& aSlot, Actor* apActor) noexcept
 
     aSlot.pMarker->MoveTo(pCell, ToNiPoint(cBody));
     if (aSlot.Parked)
-        spdlog::info("Player markers: {:X} follows player {} ({}), whose body is here, to ({:.0f}, {:.0f}, {:.0f})", aSlot.pMarker->formID, aSlot.PlayerId, aSlot.Text.c_str(), cBody.x,
-                     cBody.y, cBody.z);
+        spdlog::info("Player markers: {:X} follows player {} ({}), whose body is here, to ({:.0f})", aSlot.pMarker->formID, aSlot.PlayerId, aSlot.Text.c_str(), cBody);
     aSlot.Parked = false;
     aSlot.CellId = GameId{};
     aSlot.BodyCellId = pCell->formID;

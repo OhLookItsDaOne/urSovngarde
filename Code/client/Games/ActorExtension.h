@@ -10,6 +10,7 @@ struct ActorExtension
         kPlayer = 1 << 1,
         kFollowerCopy = 1 << 2,
         kHiddenHere = 1 << 3,
+        kOtherGame = 1 << 4,
     };
 
     enum class ReconciliationStage
@@ -28,10 +29,13 @@ struct ActorExtension
     bool IsFollowerCopy() const noexcept;
     //! A reference of this game's own disabled while a copy stands in for it; a save still has it enabled.
     bool IsHiddenHere() const noexcept;
+    //! Another player's copy whose player plays the other game: flat Skyrim against Skyrim VR (PvpRules).
+    bool IsOtherGame() const noexcept;
     void SetRemote(bool aSet) noexcept;
     void SetPlayer(bool aSet) noexcept;
     void SetFollowerCopy(bool aSet) noexcept;
     void SetHiddenHere(bool aSet) noexcept;
+    void SetOtherGame(bool aSet) noexcept;
 
     ActionEvent LatestAnimation{};
     size_t GraphDescriptorHash = 0;
@@ -41,6 +45,11 @@ struct ActorExtension
     //! Its owner's game, this one or another, revived it since its last death, as this game last heard.
     //! An announcement from here carries it (CharacterService::BuildActorData).
     bool RevivedSinceDeath = false;
+    //! An NPC copy made from a spawn whose 3D step has not run yet (CharacterService::RunRemoteUpdates); a death in between is logged (SpawnDeathDiag).
+    bool AwaitingFirst3D = false;
+    //! A copy of another player's summon, marked here as commanded by this game's player so it turns on no one.
+    //! That mark is ours, not a spell's, so it does not mean a spell is raising the body (Actor::IsBeingRaised).
+    bool CommandedAsSummonCopy = false;
 
     // TODO: atomic? bool instead? maybe simplify to `IsReenabling()` ?
     // Protects discovery while rebuilding a leveled NPC.

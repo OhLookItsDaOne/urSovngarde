@@ -2,11 +2,12 @@
 
 #include <Structs/GameId.h>
 #include <Events/EventDispatcher.h>
-#include <Games/Skyrim/DeathSentence.h>
+#include <UI/Banner/DeathSentence.h>
 #include <Games/Skyrim/GameSound.h>
 
 struct World;
 struct TransportService;
+struct PlayerCharacter;
 
 struct UpdateEvent;
 struct ConnectedEvent;
@@ -21,6 +22,7 @@ struct PartyLeftEvent;
 
 struct NotifyPlayerRespawn;
 struct NotifyDownedState;
+struct NotifyNpcPluginsDiffer;
 
 /**
  * @brief Handles logic related to the local player.
@@ -39,6 +41,7 @@ protected:
     void OnServerSettingsReceived(const ServerSettings& acSettings) noexcept;
     void OnNotifyPlayerRespawn(const NotifyPlayerRespawn& acMessage) const noexcept;
     void OnNotifyDownedState(const NotifyDownedState& acMessage) noexcept;
+    void OnNotifyNpcPluginsDiffer(const NotifyNpcPluginsDiffer& acMessage) const noexcept;
     void OnGridCellChangeEvent(const GridCellChangeEvent& acEvent) const noexcept;
     void OnCellChangeEvent(const CellChangeEvent& acEvent) const noexcept;
     void OnPlayerDialogueEvent(const PlayerDialogueEvent& acEvent) const noexcept;
@@ -73,6 +76,23 @@ private:
     void StartRespawn(const SafePoint& acWhere) noexcept;
     //! A party member revived the player: back on its feet where it lies, with part of its health.
     void StandUp(uint32_t aReviverId) noexcept;
+    /**
+     * Tell whether the player's down holds: it lasts until a revive, giving up, the end of the wait or a fallen party.
+     * It does not hold after a loaded save or during a brawl, where the game stands the player up on purpose.
+     *
+     * @return True while the down holds.
+     */
+    [[nodiscard]] bool IsDownHeld() const noexcept;
+    /**
+     * Take back any health the player gets while down: a level-up, a potion or a healing spell.
+     * The game's stand-up that health asks for is refused while the down holds (DownedHold); taken back, the health no longer asks for it.
+     * Only a revive, giving up, the end of the wait or a fallen party may end a down; a revive leaves the down first (StandUp), so it is not taken back.
+     * Called only while the down holds (not after a loaded save or in a brawl, where the game stands the player up on purpose), and acts only while the game still has the player bleeding out.
+     * Logged once per down.
+     *
+     * @param apPlayer This game's player, down.
+     */
+    void KeepDownedHealthAtZero(PlayerCharacter* apPlayer) noexcept;
     //! Every frame: while down, the heartbeat in both hands, or a rising buzz while both grips are held; after a revive, one strong pulse.
     void RunDownedCues() noexcept;
     //! While down: both grips held long enough to give up the wait.
@@ -94,6 +114,7 @@ private:
     void RunBeastFormDetection() const noexcept;
     void RunPlaceUpdates() noexcept;
     void RunCrashPlaceNote() noexcept;
+    void RunNpcPluginReport() noexcept;
 #ifdef SKYRIMVR
     /**
      * @brief Take the world map away from a player who is losing health.
@@ -117,6 +138,8 @@ private:
     // The party members holding this downed player now, the newest last: the banner names the newest.
     TiltedPhoques::Vector<uint32_t> m_revivers;
     std::chrono::steady_clock::time_point m_downedAt{};
+    // Whether health given while down was taken back yet in this down (KeepDownedHealthAtZero), for its one log line.
+    bool m_healthTakenBackThisDown = false;
     std::chrono::steady_clock::time_point m_respawnDeadline{};
     std::chrono::steady_clock::time_point m_respawnAt{};
     SafePoint m_respawnPoint{};
@@ -164,6 +187,9 @@ private:
     float m_lastHealth = -1.f;
 #endif
 
+    //! This connection has sent the plugins adding or changing NPCs (RequestNpcPlugins).
+    bool m_npcPluginsSent = false;
+
     // The last place sent for the public server page, and when to check again.
     String m_lastPlace;
     std::chrono::steady_clock::time_point m_nextPlaceCheck{};
@@ -180,6 +206,7 @@ private:
     entt::scoped_connection m_settingsConnection;
     entt::scoped_connection m_notifyRespawnConnection;
     entt::scoped_connection m_downedStateConnection;
+    entt::scoped_connection m_npcPluginsConnection;
     entt::scoped_connection m_gridCellChangeConnection;
     entt::scoped_connection m_cellChangeConnection;
     entt::scoped_connection m_playerDialogueConnection;

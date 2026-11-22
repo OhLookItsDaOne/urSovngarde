@@ -13,6 +13,8 @@ name: Create GitHub Release
 # The Linux server (linux.yml, x64 and arm64) is published beside the zips as urSovngardeServer-<version>-linux-<arch>.tar.gz.
 # It holds urSovngardeServer and libSTServer.so from one build, checked there by starting it.
 # The public server builds or takes release tags, so a Linux fix reaches it only through a release.
+#
+# Before anything is published, the tests and the bot pairs must pass, and the tag must be newer than every earlier one.
 
 on:
   push:
@@ -44,6 +46,18 @@ jobs:
           test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
           git checkout -B main HEAD
 
+      # The launcher updates only to a version above the installed one, comparing the three numbers as numbers.
+      # A tag at or below an earlier one would publish a release that no launcher ever takes.
+      - name: The tag is newer than every earlier one
+        if: github.ref_type == 'tag'
+        run: |
+          newest=$(git tag --list | grep -Ex 'v[0-9]+\.[0-9]+\.[0-9]+' | grep -Fvx "$GITHUB_REF_NAME" | sort -V | tail -1 || true)
+          echo "This tag: $GITHUB_REF_NAME; the newest earlier one: ${newest:-none}"
+          if [ -n "$newest" ] && [ "$(printf '%s\n%s\n' "$newest" "$GITHUB_REF_NAME" | sort -V | tail -1)" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::$GITHUB_REF_NAME is not newer than $newest, so no launcher would update to it"
+            exit 1
+          fi
+
       - name: Cache xmake dependencies
         uses: actions/cache@v6
         with:
@@ -66,6 +80,7 @@ jobs:
       - name: Build the client, the server and the menu's process
         run: |
           xmake build SkyrimImmersiveLauncherVR
+          xmake build SkyrimImmersiveLauncher
           xmake build SkyrimServerRunner
           xmake build TPProcess
 
@@ -75,6 +90,23 @@ jobs:
         run: |
           xmake build TPTests
           xmake run TPTests
+
+      # Two headless players per sync check, against a real server (Tools/VR/run-all-pairs.ps1), about 20 minutes.
+      # They catch what the unit tests cannot, such as a relay or ownership change that breaks every game.
+      - name: Run the bot pairs
+        shell: pwsh
+        run: |
+          xmake build STBot
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ./Tools/VR/run-all-pairs.ps1
+
+      - name: Keep the bot logs of a failed run
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bot-pair-logs
+          path: build/windows/x64/release/logs/
+          if-no-files-found: ignore
 
       - name: Gather the client's run-time files
         run: |
@@ -102,6 +134,17 @@ jobs:
       - name: Package the release
         shell: pwsh
         run: ./Tools/VR/make-release.ps1 -ClientFolder distrib/bin
+
+      # Flat Skyrim's client, beside VR's: the same browser files and menu, its own program and folders.
+      - name: Gather flat Skyrim's run-time files
+        run: |
+          xmake install -o distrib-se SkyrimTogetherClient
+          xmake install -o distrib-se TPProcess
+          cp -r Code/skyrim_ui/dist/UI distrib-se/bin/
+
+      - name: Package flat Skyrim's release
+        shell: pwsh
+        run: ./Tools/VR/make-release.ps1 -Flat -ClientFolder distrib-se/bin
 
       - uses: actions/upload-artifact@v7
         with:
@@ -140,6 +183,16 @@ jobs:
           for suffix in "" "-update" "-server"; do
             test -f "release-files/urSovngarde-${GITHUB_REF_NAME}${suffix}.zip"
           done
+          for suffix in "" "-update"; do
+            test -f "release-files/urSovngarde-SE-${GITHUB_REF_NAME}${suffix}.zip"
+          done
+          # Launchers before cross-play take the biggest full zip, so flat Skyrim's must stay smaller than VR's.
+          vr_size=$(stat -c %s "release-files/urSovngarde-${GITHUB_REF_NAME}.zip")
+          se_size=$(stat -c %s "release-files/urSovngarde-SE-${GITHUB_REF_NAME}.zip")
+          if [ "$se_size" -ge "$vr_size" ]; then
+            echo "Flat Skyrim's zip ($se_size bytes) is not smaller than VR's ($vr_size bytes): older launchers would download it."
+            exit 1
+          fi
           for arch in amd64 arm64; do
             archive="release-files/urSovngardeServer-${GITHUB_REF_NAME#v}-linux-${arch}.tar.gz"
             tar -tzf "$archive" | grep -Eq '(^|/)urSovngardeServer$'

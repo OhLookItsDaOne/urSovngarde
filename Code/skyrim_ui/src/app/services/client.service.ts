@@ -20,6 +20,9 @@ export class ClientService implements OnDestroy {
   /** Activation state change. */
   public activationStateChange = new BehaviorSubject(false);
 
+  /** Where the menu is shown: 'dashboard', 'panel' or 'screen'; empty until the game says. */
+  public surfaceChange = new BehaviorSubject<string>('');
+
   /** InGame state change. */
   public inGameStateChange = new BehaviorSubject(!environment.game);
 
@@ -118,6 +121,7 @@ export class ClientService implements OnDestroy {
     skyrimtogether.on('init', this.onInit.bind(this));
     skyrimtogether.on('activate', this.onActivate.bind(this));
     skyrimtogether.on('deactivate', this.onDeactivate.bind(this));
+    skyrimtogether.on('setSurface', this.onSetSurface.bind(this));
     skyrimtogether.on('enterGame', this.onEnterGame.bind(this));
     skyrimtogether.on('exitGame', this.onExitGame.bind(this));
     skyrimtogether.on('openingMenu', this.onOpeningMenu.bind(this));
@@ -160,6 +164,7 @@ export class ClientService implements OnDestroy {
     skyrimtogether.off('init');
     skyrimtogether.off('activate');
     skyrimtogether.off('deactivate');
+    skyrimtogether.off('setSurface');
     skyrimtogether.off('enterGame');
     skyrimtogether.off('exitGame');
     skyrimtogether.off('openingMenu');
@@ -199,6 +204,14 @@ export class ClientService implements OnDestroy {
     this._host = host;
     this._port = port;
     this._password = password;
+  }
+
+  /** The launcher set a friend's server and the game connects to it by itself; the menu names the friend meanwhile. */
+  public joiningFriend(name: string): void {
+    this.isConnectionInProgressChange.next(true);
+    this._host = name;
+    this._port = 0;
+    this._password = '';
   }
 
   /** The address of the last connection this menu started. */
@@ -294,6 +307,10 @@ export class ClientService implements OnDestroy {
     skyrimtogether.setVoiceVolume(volume);
   }
 
+  public setVoicePartyNearbyOnly(nearbyOnly: boolean): void {
+    skyrimtogether.setVoicePartyNearbyOnly(nearbyOnly);
+  }
+
   public setPlayerVoiceMuted(playerId: number, muted: boolean): void {
     skyrimtogether.setPlayerVoiceMuted(playerId, muted);
   }
@@ -324,6 +341,15 @@ export class ClientService implements OnDestroy {
   private onDeactivate(): void {
     this.zone.run(() => {
       this.activationStateChange.next(false);
+    });
+  }
+
+  /**
+   * Called with where the menu is shown, before it is activated there.
+   */
+  private onSetSurface(surface: string): void {
+    this.zone.run(() => {
+      this.surfaceChange.next(surface);
     });
   }
 
@@ -374,8 +400,9 @@ export class ClientService implements OnDestroy {
   private onDisconnect(isError: boolean): void {
     void this.zone.run(async () => {
       this.localPlayerId = undefined;
-      this.connectionStateChange.next(false);
+      // In this order: a launcher join going on sets "in progress" again when told of the disconnection.
       this.isConnectionInProgressChange.next(false);
+      this.connectionStateChange.next(false);
 
       if (isError && this._remainingReconnectionAttempt > 0) {
         this._remainingReconnectionAttempt--;
